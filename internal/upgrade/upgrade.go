@@ -1,7 +1,6 @@
-// Package upgrade wraps github.com/cloudflare/tableflip behind a small
-// interface so ShinyHub can perform zero-downtime, listener-preserving restarts
-// (SIGHUP handoff) and unit-test the wiring with a fake. *tableflip.Upgrader
-// satisfies Upgrader directly.
+// Package upgrade provides listener-preserving process handoffs and negotiated
+// control-plane retirement for session relays. The descriptor protocol remains
+// compatible with tableflip for the first upgrade from older binaries.
 package upgrade
 
 import (
@@ -13,11 +12,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/cloudflare/tableflip"
 )
 
-// Upgrader is the subset of *tableflip.Upgrader the server uses.
+// Upgrader is the listener handoff contract used by the server.
 type Upgrader interface {
 	// Listen returns a listener whose underlying socket survives an upgrade
 	// (inherited by the successor process). All Listen calls must precede Ready.
@@ -37,20 +34,18 @@ type Upgrader interface {
 	// HasParent reports whether this process was started by an upgrade handoff
 	// and therefore inherits its listeners from a parent that is still bound.
 	HasParent() bool
-	// WaitForParent returns once a handoff parent's process has exited.
+	// WaitForParent returns when the parent retires its control plane. Legacy
+	// parents signal only at process exit.
 	WaitForParent(context.Context) error
 	// Stop disables further upgrades and closes Exit.
 	Stop()
 }
 
-// New returns a tableflip-backed Upgrader. timeout bounds the wait for a
+// New returns a listener-preserving Upgrader. timeout bounds the wait for a
 // successor to become Ready during an upgrade; pidFile, when non-empty, receives
 // the ready process's PID (systemd MAINPID tracking).
 func New(timeout time.Duration, pidFile string) (Upgrader, error) {
-	return tableflip.New(tableflip.Options{
-		UpgradeTimeout: timeout,
-		PIDFile:        pidFile,
-	})
+	return NewRepeatable(timeout, pidFile)
 }
 
 // SignalState records whether shutdown follows a successful upgrade.
@@ -108,6 +103,7 @@ func WireSignals(ctx context.Context, upg Upgrader, sighup <-chan os.Signal, log
 					continue
 				}
 				log.Info("zero-downtime upgrade succeeded; successor is ready")
+				return // A retiring relay must never handle another upgrade signal.
 			}
 		}
 	}()

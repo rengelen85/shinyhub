@@ -2860,7 +2860,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "working version preserved: "+unsupportedReason+"; retry the CLI command with --allow-downtime (or send X-ShinyHub-Allow-Downtime: 1 via the API) to permit a stop-first deployment")
 		return
 	}
-	if !generationHandoff && s.proxy != nil && s.proxy.HasDrainingGeneration(slug) {
+	if !generationHandoff && s.proxy != nil && (s.proxy.HasDrainingGeneration(slug) || s.proxy.HasRelaySessions(slug, 0)) {
 		_ = s.store.FailDeploymentWithReason(pendingDep.ID, "stop-first deploy cannot replace independently draining generations")
 		writeError(w, http.StatusConflict, "working versions preserved: a stop-first deploy must wait for all previous generations to retire")
 		return

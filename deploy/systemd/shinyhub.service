@@ -20,6 +20,7 @@ Group=shinyhub
 # when it contains other secrets. Native apps still share this service's UID;
 # private files and environment files do not isolate them from the server.
 RuntimeDirectory=shinyhub
+RuntimeDirectoryMode=0700
 # shinyhub.yaml must set: server.pid_file: /run/shinyhub/shinyhub.pid
 ExecStart=/usr/local/bin/shinyhub serve --config /etc/shinyhub/shinyhub.yaml
 # Zero-downtime upgrade: drop a new /usr/local/bin/shinyhub binary, then

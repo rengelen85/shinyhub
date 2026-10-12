@@ -211,3 +211,25 @@ func TestRecorderUsesBoundedOverflowAndReportsLoss(t *testing.T) {
 		t.Fatalf("metric events=%v", metrics.events)
 	}
 }
+
+func TestRecorderRelayPersistenceMovesPendingLifecycleToOwner(t *testing.T) {
+	old := &recorderStore{}
+	remote := &recorderStore{}
+	recorder := NewRecorder(old, "retiring-proxy")
+	id := recorder.StartSession(proxy.UsageSessionStart{Slug: "dashboard", DeploymentID: 7, StartedAt: time.Now()})
+	if id == "" {
+		t.Fatal("start not queued")
+	}
+	// Switch before processing the queued start; end must follow it remotely.
+	recorder.RelayPersistence(remote)
+	recorder.EndSession(id)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder.Run(ctx)
+	if len(old.starts) != 0 || len(old.ends) != 0 {
+		t.Fatal("retired database was used after persistence handoff")
+	}
+	if len(remote.starts) != 1 || len(remote.ends) != 1 || remote.starts[0].ID != id || remote.ends[0] != id {
+		t.Fatal("queued start and end did not reach new owner in order")
+	}
+}

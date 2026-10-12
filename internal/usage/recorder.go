@@ -63,6 +63,8 @@ type Metrics interface {
 // drops analytics rather than applying backpressure to the live connection.
 type Recorder struct {
 	store         store
+	storeMu       sync.RWMutex
+	relay         bool
 	instanceID    string
 	events        chan event
 	overflow      chan event
@@ -73,6 +75,21 @@ type Recorder struct {
 	failedStarts  sync.Map // session id -> struct{}; prevents retrying an end for a rejected start
 	metrics       atomic.Pointer[metricsCallbacks]
 	policy        *Policy
+}
+
+// RelayPersistence switches all later persistence to the current owner and
+// joins an in-flight database operation before returning. No new sessions may
+// be admitted after this switch; only pending starts, ends and heartbeats remain.
+func (r *Recorder) RelayPersistence(remote interface {
+	BeginUsageSession(db.UsageSessionStart) error
+	BeginUsageSessionWithPolicy(db.UsageSessionStart) (bool, error)
+	HeartbeatUsageSessions([]string) error
+	EndUsageSession(string, time.Time) error
+}) {
+	r.storeMu.Lock()
+	defer r.storeMu.Unlock()
+	r.store = remote
+	r.relay = true
 }
 
 type metricsCallbacks struct{ record func(string) }
@@ -199,11 +216,13 @@ func (r *Recorder) handle(ev event, active map[string]struct{}) {
 		}
 		stored := true
 		var err error
+		r.storeMu.RLock()
 		if r.policy != nil {
 			stored, err = r.store.BeginUsageSessionWithPolicy(start)
 		} else {
 			err = r.store.BeginUsageSession(start)
 		}
+		r.storeMu.RUnlock()
 		if err != nil {
 			r.retryOrFailStart(ev, err)
 			return
@@ -271,7 +290,10 @@ func (r *Recorder) finish(id string, ended time.Time, active map[string]struct{}
 	}
 	_, wasActive := active[id]
 	delete(active, id) // a closed socket must never receive another heartbeat
-	if err := r.store.EndUsageSession(id, ended); err != nil {
+	r.storeMu.RLock()
+	err := r.store.EndUsageSession(id, ended)
+	r.storeMu.RUnlock()
+	if err != nil {
 		// If an accepted start once existed but its row has since disappeared
 		// (for example, its app was deleted), there is nothing left to close.
 		if wasActive && errors.Is(err, db.ErrNotFound) {
@@ -300,12 +322,14 @@ func (r *Recorder) flushPendingEnds(active map[string]struct{}) {
 }
 
 func (r *Recorder) heartbeat(active map[string]struct{}) {
-	if r.policy != nil {
+	r.storeMu.RLock()
+	if r.policy != nil && !r.relay {
 		if err := r.policy.Refresh(); err != nil {
 			r.record("policy_refresh_failed")
 			slog.Warn("usage_policy_refresh_failed", "err", err)
 		}
 	}
+	r.storeMu.RUnlock()
 	r.flushPendingStarts(active)
 	r.flushPendingEnds(active)
 	if dropped := r.dropped.Swap(0); dropped > 0 {
@@ -319,7 +343,10 @@ func (r *Recorder) heartbeat(active map[string]struct{}) {
 		if len(batch) == 0 {
 			return
 		}
-		if err := r.store.HeartbeatUsageSessions(batch); err != nil {
+		r.storeMu.RLock()
+		err := r.store.HeartbeatUsageSessions(batch)
+		r.storeMu.RUnlock()
+		if err != nil {
 			slog.Warn("usage_session_heartbeat_failed", "count", len(batch), "err", err)
 		}
 		batch = batch[:0]

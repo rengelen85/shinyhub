@@ -475,7 +475,7 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 // Once stopping begins every failure is repair-required: recovery must keep
 // retrying until a complete current pool is serving again.
 func (s *Server) restartActivationPool(ctx context.Context, app *db.App, current *db.Deployment, a *db.ScheduleActivation, capacityErr error) error {
-	if s.proxy.HasDrainingGeneration(app.Slug) {
+	if s.proxy.HasDrainingGeneration(app.Slug) || s.proxy.HasRelaySessions(app.Slug, 0) {
 		return &activation.WaitingError{Reason: "stop-first fallback must wait for retained generations", RetryAfter: 5 * time.Second}
 	}
 

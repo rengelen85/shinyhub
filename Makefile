@@ -281,6 +281,15 @@ test-browser-lifecycle-e2e:
 	cd loadtest/render/driver && npx --no-install playwright install chromium
 	PYTHON_VERSION='$(PYTHON_VERSION)' node scripts/browser-lifecycle-e2e.mjs
 
+.PHONY: test-browser-session-relays-e2e
+
+# Real Shiny reload relay, admission, revocation and bookmark restore contract.
+test-browser-session-relays-e2e:
+	@command -v uv >/dev/null 2>&1 || { echo "uv is required"; exit 1; }
+	cd loadtest/render/driver && npm ci --no-audit --no-fund --silent
+	cd loadtest/render/driver && npx --no-install playwright install chromium
+	SHINYHUB_E2E_SESSION_RELAYS=1 PYTHON_VERSION='$(PYTHON_VERSION)' node scripts/browser-lifecycle-e2e.mjs
+
 # test-cli-compatibility-e2e downloads the checksum-pinned previous release and
 # proves both supported upgrade directions with real servers: current CLI ->
 # released server (connect, doctor, deploy, credential recovery) and released

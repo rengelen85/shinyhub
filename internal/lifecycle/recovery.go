@@ -677,7 +677,17 @@ func reconcileDeploymentGenerationProjection(store *db.Store, app *db.App) bool 
 // deleted as a unit only when every recorded native identity is confirmed gone;
 // failures remain durable and block another handoff until a later recovery.
 func CleanupObsoleteDeploymentGenerations(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, app *db.App) {
-	if prx != nil && prx.RetiringParentAlive() {
+	cleanupObsoleteDeploymentGenerations(store, mgr, prx, app, false)
+}
+
+// CleanupObsoleteDeploymentGenerationsAfterParent runs after the inherited
+// control-plane retirement signal, retaining exact backend leases from relays.
+func CleanupObsoleteDeploymentGenerationsAfterParent(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, app *db.App) {
+	cleanupObsoleteDeploymentGenerations(store, mgr, prx, app, true)
+}
+
+func cleanupObsoleteDeploymentGenerations(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, app *db.App, parentConfirmed bool) {
+	if !parentConfirmed && prx != nil && prx.RetiringParentAlive() {
 		return
 	}
 	rows, err := store.ListDeploymentReplicas(app.ID)
@@ -699,6 +709,9 @@ func CleanupObsoleteDeploymentGenerations(store *db.Store, mgr *process.Manager,
 		}
 	}
 	for deploymentID, replicas := range byDeployment {
+		if prx != nil && prx.HasRelaySessions(app.Slug, deploymentID) {
+			continue
+		}
 		allStopped := true
 		for _, replica := range replicas {
 			id := deploymentID

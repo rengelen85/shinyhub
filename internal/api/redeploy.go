@@ -65,12 +65,21 @@ func (s *Server) acquireAppOperation(slug string, nonblocking bool) (release fun
 func (s *Server) acquireAppOperationWithFleetFence(slug string, nonblocking, joinFleetFence bool) (release func(), err error) {
 	releaseFleet := func() {}
 	if joinFleetFence {
+		s.operationAdmissionMu.RLock()
+		if s.operationsPaused {
+			s.operationAdmissionMu.RUnlock()
+			if nonblocking {
+				return nil, nil
+			}
+			return nil, errors.New("control plane is preparing a session-preserving reload")
+		}
 		mode := unix.LOCK_SH
 		if nonblocking {
 			mode |= unix.LOCK_NB
 		}
 		var fleetErr error
 		releaseFleet, fleetErr = s.acquireFleetMutationFence(mode)
+		s.operationAdmissionMu.RUnlock()
 		if fleetErr != nil {
 			if nonblocking && (errors.Is(fleetErr, unix.EWOULDBLOCK) || errors.Is(fleetErr, unix.EAGAIN)) {
 				return nil, nil
@@ -165,6 +174,41 @@ func (s *Server) TryAcquireFleetReconciliation() (release func(), ok bool) {
 	return release, true
 }
 
+// TryPauseAppOperations atomically excludes new mutations and proves there is
+// no admitted app operation. The successor may serve from durable routes while
+// its destructive recovery waits for this fleet fence to be released.
+func (s *Server) TryPauseAppOperations() (func(), bool) {
+	if !s.operationAdmissionMu.TryLock() {
+		return nil, false
+	}
+	defer s.operationAdmissionMu.Unlock()
+	if s.operationsPaused {
+		return nil, false
+	}
+	release, ok := s.TryAcquireFleetReconciliation()
+	if !ok {
+		return nil, false
+	}
+	s.operationsPaused = true
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.operationAdmissionMu.Lock()
+			defer s.operationAdmissionMu.Unlock()
+			s.operationsPaused = false
+			release()
+		})
+	}, true
+}
+
+// AppOperationsPaused lets foreground ownership gates reject mutations before
+// they enter a paused lifecycle operation, while app serving remains available.
+func (s *Server) AppOperationsPaused() bool {
+	s.operationAdmissionMu.RLock()
+	defer s.operationAdmissionMu.RUnlock()
+	return s.operationsPaused
+}
+
 // AcquireAppOperation serializes a foreground demand operation with every
 // deploy, rollback, scale, stop, and activation for the same app. Unlike the
 // watcher-oriented Try form, demand paths may wait because they already run in
@@ -193,6 +237,19 @@ func (s *Server) WaitForAppOperations(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// AcquireFleetHandoffBarrier reuses a reload pause already held by this server.
+// Only the joined ownership shutdown may use this method: trying to reacquire
+// its own exclusive kernel lock would deadlock the retiring process.
+func (s *Server) AcquireFleetHandoffBarrier() (func(), error) {
+	s.operationAdmissionMu.RLock()
+	paused := s.operationsPaused
+	s.operationAdmissionMu.RUnlock()
+	if paused {
+		return func() {}, nil
+	}
+	return s.AcquireFleetAppOperations()
 }
 
 // AcquireFleetAppOperations forms a startup barrier across every catalogued

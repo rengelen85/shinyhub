@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -91,6 +92,37 @@ func TestLoad_ReloadDrainTimeoutEnv(t *testing.T) {
 			}
 			if cfg.Server.EffectiveReloadDrainTimeout() != 2*time.Hour || cfg.Server.DrainTimeout != time.Minute {
 				t.Fatal("reload override must leave app timeout unchanged")
+			}
+		})
+	}
+}
+
+func TestLoadReloadSessionPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		policy string
+		limit  int
+		valid  bool
+	}{
+		{"drain", 4, true}, {"preserve", 2, true}, {"preserve", 32, true}, {"invalid", 4, false}, {"preserve", -1, false}, {"preserve", 33, false},
+	} {
+		t.Run(tc.policy+fmt.Sprint(tc.limit), func(t *testing.T) {
+			t.Setenv("SHINYHUB_AUTH_SECRET", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+			path := filepath.Join(t.TempDir(), "hub.yaml")
+			if err := os.WriteFile(path, []byte(fmt.Sprintf("server:\n  reload_sessions: %s\n  reload_relay_limit: %d\n", tc.policy, tc.limit)), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(path)
+			if !tc.valid {
+				if err == nil {
+					t.Fatal("invalid policy accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Server.ReloadSessions != tc.policy || cfg.Server.ReloadRelayLimit != tc.limit {
+				t.Fatal("reload policy not loaded")
 			}
 		})
 	}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/rvben/shinyhub/internal/safego"
+	"github.com/rvben/shinyhub/internal/upgrade"
 )
 
 // connTracker is the registry of live hijacked (upgraded / WebSocket)
@@ -16,8 +17,9 @@ import (
 // counter (which serves hibernation) - this set tracks individual long-lived
 // connections, which activeConns cannot.
 type connTracker struct {
-	mu    sync.Mutex
-	conns map[*trackedConn]struct{}
+	mu     sync.Mutex
+	conns  map[*trackedConn]struct{}
+	sealed bool
 }
 
 func newConnTracker() *connTracker {
@@ -37,8 +39,11 @@ func (t *connTracker) trackWithClose(c net.Conn, principal ConnPrincipal, onClos
 	return t.trackWithSession(c, principal, onClose, nil)
 }
 
-func (t *connTracker) trackWithSession(c net.Conn, principal ConnPrincipal, onClose func(), session *wsSession) net.Conn {
+func (t *connTracker) trackWithSession(c net.Conn, principal ConnPrincipal, onClose func(), session *wsSession, backend ...upgrade.RelayBackend) net.Conn {
 	tc := &trackedConn{Conn: c, tracker: t, principal: principal, onClose: onClose, session: session}
+	if len(backend) == 1 {
+		tc.backend = backend[0]
+	}
 	delay := time.Duration(0)
 	deadline := principal.SessionExpiresAt
 	reason := "session_expired"
@@ -51,6 +56,11 @@ func (t *connTracker) trackWithSession(c net.Conn, principal ConnPrincipal, onCl
 		delay = time.Until(deadline)
 	}
 	t.mu.Lock()
+	if t.sealed {
+		t.mu.Unlock()
+		_ = tc.closeWithReason("relay_sealed")
+		return tc
+	}
 	t.conns[tc] = struct{}{}
 	if hasDeadline && delay > 0 {
 		// Publish the timer while holding its dedicated lock. A near-zero timer
@@ -112,6 +122,7 @@ type trackedConn struct {
 	// principal is fixed at the upgrade and never mutated, so the recheck sweep
 	// reads it without holding the tracker lock.
 	principal     ConnPrincipal
+	backend       upgrade.RelayBackend
 	onClose       func()
 	session       *wsSession
 	once          sync.Once
@@ -185,6 +196,11 @@ func (p *Proxy) Draining() bool { return p.instanceDraining.Load() }
 func (p *Proxy) SetRetiringParent(done <-chan struct{}) { p.retiringParent = done }
 
 func (p *Proxy) RetiringParentAlive() bool {
+	if p.relayLeases != nil {
+		if p.relayLeases.Unknown() {
+			return true
+		}
+	}
 	if p.retiringParent == nil {
 		return false
 	}
@@ -196,8 +212,132 @@ func (p *Proxy) RetiringParentAlive() bool {
 	}
 }
 
+// SetRelayLeases must precede recovery and serving. A relay's sealed snapshot
+// cannot gain sessions, so stale counts conservatively protect its backend.
+func (p *Proxy) SetRelayLeases(leases *upgrade.RelayLeases) { p.relayLeases = leases }
+
+func (p *Proxy) relaySessions(slug string, deploymentID int64, index int, target string) int64 {
+	if p.relayLeases == nil {
+		return 0
+	}
+	n, unknown := p.relayLeases.Sessions(slug, deploymentID, index, target)
+	if unknown {
+		return 1 << 31
+	}
+	return n
+}
+
+func (p *Proxy) HasRelaySessions(slug string, deploymentID int64) bool {
+	return p.relaySessions(slug, deploymentID, -1, "") > 0
+}
+
+// RelaySnapshot returns exact upgraded-connection identities. Only multiplex
+// pools with a stable active generation can enter indefinite relay mode;
+// transitions keep the ordinary bounded retirement protocol.
+func (p *Proxy) RelaySnapshot() ([]upgrade.RelayBackend, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, pool := range p.pools {
+		if poolIsElastic(pool) || len(pool.drainingGenerations) > 0 || len(pool.candidates) > 0 {
+			return nil, false
+		}
+	}
+	counts := make(map[upgrade.RelayBackend]int64)
+	for _, conn := range p.conns.snapshot() {
+		key := conn.backend
+		if key.Slug == "" || key.TargetURL == "" || key.DeploymentID <= 0 || key.Index < 0 {
+			return nil, false
+		}
+		pool := p.pools[key.Slug]
+		if pool == nil || key.Index >= len(pool.replicas) {
+			return nil, false
+		}
+		replica := pool.replicas[key.Index]
+		if replica == nil || replica.draining.Load() || replica.deploymentID != key.DeploymentID || replica.targetURL != key.TargetURL {
+			return nil, false
+		}
+		counts[key]++
+	}
+	out := make([]upgrade.RelayBackend, 0, len(counts))
+	for key, count := range counts {
+		key.Sessions = count
+		out = append(out, key)
+	}
+	return out, true
+}
+
+// SealRelay atomically prevents any later hijack from enlarging the lease.
+// HTTP must already be quiescent: an unexpected late hijack is closed instead
+// of admitting unprotected work. Subsequent snapshots use immutable conn keys.
+func (p *Proxy) SealRelay() ([]upgrade.RelayBackend, bool) {
+	_, stable := p.RelaySnapshot()
+	if !stable {
+		return nil, false
+	}
+	p.conns.mu.Lock()
+	p.conns.sealed = true
+	p.conns.mu.Unlock()
+	return p.sealedRelaySnapshot(), true
+}
+func (p *Proxy) sealedRelaySnapshot() []upgrade.RelayBackend {
+	counts := make(map[upgrade.RelayBackend]int64)
+	for _, conn := range p.conns.snapshot() {
+		counts[conn.backend]++
+	}
+	out := make([]upgrade.RelayBackend, 0, len(counts))
+	for backend, count := range counts {
+		backend.Sessions = count
+		out = append(out, backend)
+	}
+	return out
+}
+
+// PreserveUpgraded has no reload deadline. Service shutdown still applies the
+// ordinary bounded drain, and access rechecks continue independently.
+func (p *Proxy) PreserveUpgraded(ctx context.Context, lease *upgrade.RelayLease, shutdownGrace time.Duration) int {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for p.ActiveUpgradedConns() > 0 {
+		select {
+		case <-ctx.Done():
+			return p.DrainUpgraded(shutdownGrace)
+		case <-ticker.C:
+			backends := p.sealedRelaySnapshot()
+			if lease.Publish(backends) != nil {
+				// Keep the last conservative snapshot; never revoke backend
+				// protection merely because a snapshot update failed.
+				continue
+			}
+		}
+	}
+	return 0
+}
+
 // ActiveUpgradedConns is the number of live hijacked (WebSocket) connections.
 func (p *Proxy) ActiveUpgradedConns() int { return p.conns.count() }
+
+func (p *Proxy) UpgradedPrincipals() []ConnPrincipal {
+	set := make(map[ConnPrincipal]bool)
+	for _, conn := range p.conns.snapshot() {
+		set[conn.principal] = true
+	}
+	out := make([]ConnPrincipal, 0, len(set))
+	for principal := range set {
+		out = append(out, principal)
+	}
+	return out
+}
+
+// CloseUnverifiedUpgraded ends sessions whose retiring proxy can no longer
+// renew authorization through the current owner. It does not bypass ordinary
+// service-shutdown grace or a session's immutable login deadline.
+func (p *Proxy) CloseUnverifiedUpgraded() int {
+	open := p.conns.snapshot()
+	for _, conn := range open {
+		_ = conn.closeWithReason("authorization_unverifiable")
+	}
+	return len(open)
+}
 
 // DrainUpgraded waits for all tracked upgraded connections to close on their
 // own, up to timeout, then force-closes any that remain. It returns the number

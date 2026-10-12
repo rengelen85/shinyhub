@@ -242,6 +242,9 @@ jobs:
       - name: Real Shiny browser lifecycle E2E
         run: make test-browser-lifecycle-e2e
 
+      - name: Repeated reload and bookmark continuity E2E
+        run: make test-browser-session-relays-e2e
+
       - name: App-detail logs browser E2E
         run: make test-browser-logs-e2e
 

@@ -664,3 +664,37 @@ func TestRedeployInFlight_RefcountedAcrossCoalescedMarks(t *testing.T) {
 		t.Fatal("after the last clear the pool is idle and must report not in flight")
 	}
 }
+
+func TestSessionReloadPauseExcludesAdmittedAndNewOperations(t *testing.T) {
+	s := &Server{cfg: &config.Config{}, appOperationLockDir: t.TempDir()}
+	active := s.acquireDeployLock("dashboard")
+	if release, ok := s.TryPauseAppOperations(); ok {
+		release()
+		t.Fatal("reload crossed an admitted operation")
+	}
+	active()
+	release, ok := s.TryPauseAppOperations()
+	if !ok {
+		t.Fatal("idle fleet could not pause")
+	}
+	defer release()
+	if operation, ok := s.TryAcquireAppOperation("dashboard"); ok {
+		operation()
+		t.Fatal("background mutation admitted during reload")
+	}
+	if _, err := s.AcquireAppOperation("dashboard"); err == nil {
+		t.Fatal("foreground mutation admitted during reload")
+	}
+	// Another process instance must see the kernel fleet fence as well.
+	peer := &Server{cfg: &config.Config{}, appOperationLockDir: s.appOperationLockDir}
+	if operation, ok := peer.TryAcquireAppOperation("dashboard"); ok {
+		operation()
+		t.Fatal("peer crossed reload fence")
+	}
+	release()
+	operation, ok := s.TryAcquireAppOperation("dashboard")
+	if !ok {
+		t.Fatal("failed reload did not restore admission")
+	}
+	operation()
+}

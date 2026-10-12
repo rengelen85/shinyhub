@@ -29,7 +29,7 @@ func (s *Server) guardActivationLifecycleWithDrain(appID int64, operation string
 		if err != nil {
 			return fmt.Errorf("%s: inspect generation drain: %w", operation, err)
 		}
-		if !allowDrain && s.proxy.HasDrainingGeneration(app.Slug) {
+		if !allowDrain && (s.proxy.HasDrainingGeneration(app.Slug) || s.proxy.HasRelaySessions(app.Slug, 0)) {
 			return fmt.Errorf("%s: %w; retry after retirement completes", operation, errGenerationDraining)
 		}
 	}

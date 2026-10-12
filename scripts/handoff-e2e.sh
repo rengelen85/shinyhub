@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Zero-downtime handoff e2e: build the binary, start it, hammer both listeners
 # while sending SIGHUP, and assert zero request failures + a new process takeover.
-# tableflip requires a built binary (not `go run`) for graceful reloads.
+# Handoff requires a built binary (not `go run`) for graceful reloads.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,8 +22,16 @@ trap cleanup EXIT
 
 BIN="$WORK/shinyhub"
 PIDFILE="$WORK/shinyhub.pid"
-PORT=18080
-METRICS_PORT=19090
+read -r PORT METRICS_PORT < <(python3 - <<'PYPORT'
+import socket
+sockets = [socket.socket(), socket.socket()]
+for listener in sockets:
+    listener.bind(("127.0.0.1", 0))
+print(*(listener.getsockname()[1] for listener in sockets))
+for listener in sockets:
+    listener.close()
+PYPORT
+)
 
 echo "==> building binary"
 GOWORK=off go build -o "$BIN" "$ROOT/cmd/shinyhub"
@@ -59,7 +67,7 @@ PATH="/usr/bin:/bin" bash -c "exec -a shinyhub '$BIN' serve --config '$WORK/shin
 BARE_PID=$!
 ready=0
 for _ in $(seq 1 100); do
-  if curl -fsS "http://127.0.0.1:${PORT}/readyz" >/dev/null 2>&1; then ready=1; break; fi
+  if curl --max-time 5 -fsS "http://127.0.0.1:${PORT}/readyz" >/dev/null 2>&1; then ready=1; break; fi
   sleep 0.2
 done
 [ "$ready" = "1" ] || { echo "FAIL: bare-argv0 server never became ready"; tail -20 "$BARELOG"; exit 1; }
@@ -73,7 +81,7 @@ for _ in $(seq 1 50); do
 done
 [ "$hupfail" = "1" ] \
   || { echo "FAIL: SIGHUP with bare argv[0] did not fail (or failure not logged)"; tail -20 "$BARELOG"; exit 1; }
-curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null \
+curl --max-time 5 -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null \
   || { echo "FAIL: bare-argv0 server stopped serving after the failed upgrade"; exit 1; }
 kill "$BARE_PID"
 wait "$BARE_PID" 2>/dev/null || true
@@ -87,7 +95,7 @@ SERVER_PID=$!
 echo "==> waiting for readiness"
 ready=0
 for _ in $(seq 1 100); do
-  if curl -fsS "http://127.0.0.1:${PORT}/readyz" >/dev/null 2>&1; then ready=1; break; fi
+  if curl --max-time 5 -fsS "http://127.0.0.1:${PORT}/readyz" >/dev/null 2>&1; then ready=1; break; fi
   sleep 0.2
 done
 [ "$ready" = "1" ] || { echo "FAIL: server never became ready"; exit 1; }
@@ -102,19 +110,18 @@ done
 [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
   || { echo "FAIL: PID file never written with a live PID"; exit 1; }
 
-# Connection-refused (curl exit 7) means the listener was momentarily down = a
-# real handoff gap. Other non-zero exits (e.g. a single in-flight request cut at
-# the exact handoff instant) are reported but not treated as a listener gap.
+# Every failed HTTP request is a continuity failure, including resets and
+# non-2xx responses. Keep refusal counts separately for diagnosis.
 REFUSED="$WORK/refused"; OTHER="$WORK/other"
 : > "$REFUSED"; : > "$OTHER"
 echo "==> starting continuous client against both listeners"
 (
   end=$((SECONDS + 8))
   while [ $SECONDS -lt $end ]; do
-    code=0; curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/healthz"       || code=$?
+    code=0; curl --max-time 5 -fsS -o /dev/null "http://127.0.0.1:${PORT}/healthz"       || code=$?
     if   [ "$code" = "7" ]; then echo "main"      >> "$REFUSED"
     elif [ "$code" != "0" ]; then echo "main:$code" >> "$OTHER"; fi
-    code=0; curl -fsS -o /dev/null "http://127.0.0.1:${METRICS_PORT}/metrics" || code=$?
+    code=0; curl --max-time 5 -fsS -o /dev/null "http://127.0.0.1:${METRICS_PORT}/metrics" || code=$?
     if   [ "$code" = "7" ]; then echo "metrics"      >> "$REFUSED"
     elif [ "$code" != "0" ]; then echo "metrics:$code" >> "$OTHER"; fi
     sleep 0.05
@@ -153,8 +160,9 @@ NEW_PID="$(cat "$PIDFILE")"
 echo "==> old pid=${OLD_PID} new pid=${NEW_PID}"
 
 if [ -s "$OTHER" ]; then
-  echo "WARN: non-refused transient failures during handoff (not a listener gap):"
+  echo "FAIL: HTTP failures during handoff:"
   sort "$OTHER" | uniq -c
+  exit 1
 fi
 if [ -s "$REFUSED" ]; then
   echo "FAIL: $(wc -l < "$REFUSED" | tr -d ' ') connection-refused failures (HTTP, listener gap) during handoff:"

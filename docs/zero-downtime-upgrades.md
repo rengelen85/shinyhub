@@ -110,6 +110,67 @@ to the successor. The retiring proxy continues checking session authorization
 throughout its drain. A SIGINT/SIGTERM shortens a reload drain to at most the
 ordinary `drain_timeout`; it does not reset an earlier reload deadline.
 
+For stable single-host **native multiplex** apps, session relays can remove the
+reload deadline entirely:
+
+```yaml
+server:
+  drain_timeout: 10m
+  reload_sessions: preserve
+  reload_relay_limit: 4
+```
+
+This is opt-in. Configure it before starting the process whose sessions you want
+to retain; the already-running parent's settings govern that handoff. The old
+process keeps its existing WebSocket tunnels, closes its database and lifecycle
+control plane, and retires its session lease when its final session closes. If it launched
+native backends, it keeps only their stdout/stderr readers and process reapers
+alive until those backends exit, preserving logs without database access.
+Adopted backends do not create another output reader on each reload. A ready successor reads
+sealed leases for the exact backend processes, counts them for admission and
+hibernation, and performs authorization and usage persistence for the relays.
+Later reloads can proceed while earlier relays remain alive. Login expiration,
+access revocation and ordinary service stop still close sessions as usual.
+
+A preserving reload is refused while an app operation, candidate or previous
+generation is still draining, or when any pool uses elastic isolation. The
+current process keeps serving; inspect the upgrade log and retry after the
+transition finishes. At the relay limit, another preserving reload is refused
+instead of disconnecting older sessions, reserving capacity even if a new session
+arrives during handoff. Close old tabs to
+reclaim capacity. The limit bounds retained session relays, not their age or output-only
+processes still needed by native backends. Retained tunnels continue running the old proxy code, so use an ordinary
+service restart when a security fix must replace every running proxy immediately.
+
+Compatible app deployments and rolling restarts may run after the control plane
+has retired. Their own `drain_timeout` still applies to retained backend sessions;
+preserving a hub reload does not preserve a session across replacement of its
+app process. Stop-first changes remain fenced while relayed sessions exist.
+Reloading during an app-generation drain is intentionally unsupported. This
+mode preserves WebSocket transport; XHR fallback transport and recovery after
+an owner crash are outside its continuity guarantee.
+
+Relay IPC uses the private app-data registry when its path fits the Unix socket
+limit, then a short private `RUNTIME_DIRECTORY` if available. For unusually long
+paths it falls back to private `/tmp/shinyhub-relay-*` directories; exclude those
+live directories from age-based temporary-file cleanup. Removing a live socket
+interrupts authorization checks and closes retained sessions after the verification
+grace period.
+
+Do not replace the binary with a legacy build while relays are alive. The
+side-effect-free relay-protocol preflight refuses a handoff to a binary lacking
+relay support. Auth-secret rotation invalidates relay RPC authentication and
+ends retained sessions after the fail-closed authorization grace (at least 90s).
+Runtime leases live in the private `.reload-relays` directory beneath app-data;
+a private, uid-scoped local Unix socket carries owner RPCs. Relay protocols use
+frozen versioned identity and usage fields, so future upgrades must retain that
+compatibility while older relays remain alive.
+
+Run the real Shiny acceptance test with
+`SHINYHUB_E2E_SESSION_RELAYS=1 node scripts/browser-lifecycle-e2e.mjs`. It holds
+reactive sessions across repeated reloads, probes page loads, checks the relay
+limit, deploys a replacement, and revokes access to a relayed session.
+
 ## Tunables (`shinyhub.yaml`)
 
 | Key | Default | Meaning |
@@ -117,11 +178,13 @@ ordinary `drain_timeout`; it does not reset an earlier reload deadline.
 | `server.pid_file` | (empty) | PID file the ready process writes; required for systemd MAINPID tracking. |
 | `server.upgrade_timeout` | `60s` | How long the old process waits for the successor to become ready before aborting the upgrade and continuing to serve. |
 | `server.drain_timeout` | `60s` | App-generation retirement, replica removal, and ordinary service shutdown session drain. |
+| `server.reload_sessions` | `drain` | Opt-in `preserve` for stable single-host native multiplex WebSockets. Environment: `SHINYHUB_RELOAD_SESSIONS`. |
+| `server.reload_relay_limit` | `4` | Maximum retained relay processes, from 1 to 32. Environment: `SHINYHUB_RELOAD_RELAY_LIMIT`. |
 | `server.reload_drain_timeout` | `server.drain_timeout` | Positive duration for established WebSockets on a retiring proxy after a successful reload. Environment override: `SHINYHUB_RELOAD_DRAIN_TIMEOUT`. |
 
 ## Notes & limits
 
-- **Repeated upgrades.** The listener handoff library refuses another upgrade
+- **Repeated upgrades in drain mode.** The handoff refuses another upgrade
   while the successor's parent is still alive. A long reload drain therefore
   delays the next upgrade; wait for the retiring proxy to exit before reloading
   again. It also retains that process's memory and database connection.
@@ -130,7 +193,7 @@ ordinary `drain_timeout`; it does not reset an earlier reload deadline.
   hibernation and lifecycle mutations such as deploy, stop, resize and
   non-rolling restart are fenced until the parent exits and recovery cleanup
   finishes. Rolling restarts are accepted into the durable queue and wait. This deliberately trades lifecycle availability for session
-  continuity until cross-process session accounting is available.
+  continuity in drain mode. Session-preserving relays supply cross-process accounting after their control plane retires.
 - **Multiplex scope.** Multiplex workers can be re-adopted. Elastic workers
   (`grouped` and `per_session`) have process-local client bindings and are
   rebuilt during recovery; a longer proxy drain does not preserve their

@@ -312,6 +312,7 @@ type entry struct {
 	// must retry the persist first. Guarded by Manager.mu.
 	finishFailed bool
 	done         chan struct{}
+	ownsOutput   bool
 	stopped      bool
 	startupGuard io.WriteCloser
 	// incarnation identifies this exact occupancy of the slot, assigned
@@ -441,6 +442,40 @@ func (m *Manager) SetConsumerLifetimeResolver(resolver ConsumerLifetimeResolver)
 // can be reconciled from the immutable file plus current replica state.
 func (m *Manager) SetLogRunRecorder(recorder LogRunRecorder) {
 	m.logRunRecorder = recorder
+}
+
+// RetireControlPlane prevents exit monitors on a retiring relay from writing
+// through its old database. The successor owns durable process reconciliation.
+// Call only after launches and lifecycle operations have quiesced.
+func (m *Manager) RetireControlPlane() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logRunRecorder = LogRunRecorder{}
+}
+
+// WaitOwnedOutput keeps native stdout/stderr pipe readers alive after the
+// session relay finishes. Adopted backends still write into their launching
+// process's pipes; exiting that process would break logs or trigger SIGPIPE.
+// No database or lifecycle work runs during this wait. Adopted entries are not
+// owned, so repeated reloads without new launches do not accumulate log pumps.
+func (m *Manager) WaitOwnedOutput(ctx context.Context) {
+	m.mu.Lock()
+	var done []<-chan struct{}
+	for _, pool := range m.entries {
+		for _, entry := range pool {
+			if entry != nil && entry.ownsOutput && entry.done != nil {
+				done = append(done, entry.done)
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, finished := range done {
+		select {
+		case <-finished:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // SetLogRunSinkFactory installs the shared per-run output sink. Factory
@@ -1063,7 +1098,7 @@ func (m *Manager) Start(p StartParams) (*ProcessInfo, error) {
 	}
 	done := make(chan struct{})
 	pool[p.Index] = &entry{
-		info: info, handle: handle, tier: tier, logRun: &run, done: done,
+		info: info, handle: handle, tier: tier, logRun: &run, done: done, ownsOutput: true,
 		startupGuard: ep.StartupGuard, incarnation: m.nextIncarnation.Add(1),
 	}
 	m.entries[poolKey] = pool

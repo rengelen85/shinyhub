@@ -14,6 +14,9 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { checkBrowserScaling } from './browser-scaling-checks.mjs';
 import { checkBrowserSettings } from './browser-settings-checks.mjs';
+import { checkSessionRelays } from './browser-session-relay-checks.mjs';
+import { checkBookmarkContinuity } from './browser-bookmark-continuity-checks.mjs';
+const relayMode = process.env.SHINYHUB_E2E_SESSION_RELAYS === '1';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(new URL('../loadtest/render/driver/package.json', import.meta.url));
@@ -72,7 +75,7 @@ async function poll(fn, description, timeout = 30_000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) {
     abort.signal.throwIfAborted();
-    if (server && (server.exitCode !== null || server.signalCode !== null)) throw new Error('isolated server exited');
+    if (!relayMode && server && (server.exitCode !== null || server.signalCode !== null)) throw new Error('isolated server exited');
     if (await fn()) return;
     await delay(100, undefined, { signal: abort.signal });
   }
@@ -131,7 +134,7 @@ try {
   await new Promise(resolve => reservation.close(resolve));
   const host = `http://127.0.0.1:${port}`;
   await writeFile(passwordFile, password, { mode: 0o600 });
-  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: 4\n  drain_timeout: 5s\n  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
+  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: 4\n  drain_timeout: 5s\n${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
   await command([binary, 'init', '--config', config, '--admin-user', username, '--admin-password-file', passwordFile], 'init', { cwd: state });
   const log = createWriteStream(join(work, 'server.log'), { mode: 0o600 });
   server = spawn(binary, ['serve', '--config', config, '--no-browser'], { cwd: state, env, detached: true });
@@ -168,7 +171,8 @@ try {
   // Confirm the deployed interpreter, not merely the Python used by this test.
   const expectedPython = (await command([python, '-c', 'import sys; print(repr(sys.version_info[:2]))'], 'python-version')).trim();
   assert.match(expectedPython, /^\(3, \d+\)$/);
-  const appSource = await readFile(join(app, 'app.py'), 'utf8');
+  let appSource = await readFile(join(app, 'app.py'), 'utf8');
+  if (relayMode) appSource = appSource.replace('    def result():', '    def result():\n        print(f"RELAYLOG:{session_label}:{input.calculate()}", flush=True)');
   await writeFile(join(app, 'app.py'), `import sys\nassert sys.version_info[:2] == ${expectedPython}, sys.version\n` + appSource);
   report.python_version = expectedPython;
   // Exercise the helper built from this exact tree, including packaging. The
@@ -188,7 +192,7 @@ try {
   const deploy = (slug = 'browser') => command([binary, 'deploy', app, '--config', clientConfig, '--slug', slug, '--visibility', 'private', '--output', 'json'], 'deploy',
     { env: { ...env, SHINYHUB_HOST: host, SHINYHUB_TOKEN: token } });
   await check('deploy real Shiny v1', deploy);
-  await request('POST', '/api/users', { username: viewer, password: viewerPassword, role: 'viewer' }, 201);
+  const viewerRecord = await request('POST', '/api/users', { username: viewer, password: viewerPassword, role: 'viewer' }, 201);
   await request('POST', '/api/apps/browser/members', { username: viewer, role: 'viewer' }, 204);
 
   browser = await chromium.launch({ headless: true,
@@ -228,6 +232,13 @@ try {
     await page.getByRole('button', { name: 'Recalculate' }).click();
     await output(page, 'v1', 2, 500, original);
   });
+  if (relayMode) {
+    await checkSessionRelays({ context, page, original, appURL, host, state, app, work,
+      api, request, deploy, check, poll, output, assertDisconnected, sockets, viewerID: viewerRecord.id, viewer });
+    await checkBookmarkContinuity({ root, state, binary, clientConfig, host, token, env, command, context, check, poll, report });
+    report.status = 'passed';
+    console.log('BROWSER SESSION RELAY E2E PASS');
+  } else {
   const scalingCalculations = await checkBrowserScaling({ browser, context, page, host, username, password,
     api, request, check, poll, output, original, sockets });
   const originalCalculations = await checkBrowserSettings({ browser, page, host, username, password,
@@ -391,6 +402,7 @@ try {
   });
   report.status = 'passed';
   console.log('BROWSER LIFECYCLE E2E PASS');
+  }
 } catch (error) {
   report.error = String(error);
   if (context) {

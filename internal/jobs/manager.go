@@ -549,11 +549,11 @@ func (m *Manager) ResumeAdmissions() {
 // Stop returns, Run rejects new admissions with ErrManagerStopped. ctx
 // bounds how long shutdown waits; on expiry the still-running goroutines
 // are abandoned (their next startup reconciliation marks them interrupted).
-func (m *Manager) Stop(ctx context.Context) {
+func (m *Manager) Stop(ctx context.Context) bool {
 	m.mu.Lock()
 	if m.stopped {
 		m.mu.Unlock()
-		return
+		return false // A prior timed-out stop does not prove all runs joined.
 	}
 	m.stopped = true
 	cancels := make([]context.CancelFunc, 0, len(m.active))
@@ -574,9 +574,11 @@ func (m *Manager) Stop(ctx context.Context) {
 	select {
 	case <-done:
 		m.terminalCancel()
+		return true
 	case <-ctx.Done():
 		m.terminalCancel()
 		slog.Warn("jobs: shutdown timeout; abandoning in-flight runs")
+		return false
 	}
 }
 

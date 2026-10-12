@@ -459,7 +459,7 @@ var buildRootOnce sync.Once
 // tests to call; registration happens exactly once per process.
 func buildRoot() *cobra.Command {
 	buildRootOnce.Do(func() {
-		rootCmd.AddCommand(newInitCmd(), serveCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd, newHealthcheckCmd(), newWorkerCmd(), newSandboxCmd())
+		rootCmd.AddCommand(newRelayProtocolCmd(), newInitCmd(), serveCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd, newHealthcheckCmd(), newWorkerCmd(), newSandboxCmd())
 		cli.AddCommandsTo(rootCmd)
 	})
 	return rootCmd
@@ -554,12 +554,14 @@ func startMetricsListener(listen listenFunc, addr string, reg *metrics.Registry)
 		slog.Warn("pprof disabled: metrics listener is not bound to loopback", "addr", ln.Addr().String())
 	}
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	handoffLn := newHandoffListener(ln, srv)
 	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		defer handoffLn.ServeDone()
+		if err := srv.Serve(handoffLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !handoffLn.Closing() {
 			slog.Error("metrics server", "err", err)
 		}
 	}()
-	return srv, ln, nil
+	return srv, handoffLn, nil
 }
 
 // probeWritable confirms dir is writable by creating and removing a temp file.
@@ -1096,7 +1098,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	if err != nil {
 		return fmt.Errorf("init upgrader: %w", err)
 	}
-	defer upg.Stop()
+	defer upg.(*upgrade.RepeatableUpgrader).Close()
 	// Preflight the handoff's re-exec target now: a SIGHUP re-execs argv[0], and
 	// an unresolvable argv[0] fails every upgrade attempt (the process keeps
 	// serving, so the failure is safe but silent until upgrade time).
@@ -1486,6 +1488,21 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	// is a dead end: it fills the tab and links nowhere else in the fleet.
 	prx.SetAppNav(cfg.Server.AppNavEnabled(), appNavHomeURL(cfg))
 	prx.SetBrowserSessions(cfg.Auth.BrowserSessionMaxAge(), cfg.Server.BaseURL)
+	relayDir := filepath.Join(absAppDataDir, ".reload-relays")
+	relayLeases := &upgrade.RelayLeases{Dir: relayDir}
+	_, liveRelays, unknownRelays := relayLeases.Snapshot()
+	relaySupported := !isClustered(cfg) && cfg.Runtime.Mode == "native"
+	if (liveRelays > 0 || unknownRelays || cfg.Server.ReloadSessions == "preserve") && !relaySupported {
+		return fmt.Errorf("session-preserving reloads require single-host native runtime")
+	}
+	relayEnabled := relaySupported && (cfg.Server.ReloadSessions == "preserve" || liveRelays > 0 || unknownRelays || upg.HasParent())
+	var stopRelayWatch func()
+	if relayEnabled {
+		stopRelayWatch = relayLeases.Watch(ctx)
+		defer stopRelayWatch()
+		prx.SetRelayLeases(relayLeases)
+	}
+
 	prx.SetAnnouncements(true)
 	// Give every app a stable tab identity without overriding a favicon the app
 	// authored itself. The proxy only injects the fallback into HTML pages that
@@ -1604,6 +1621,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 				}
 				return
 			}
+			relayLeases.Refresh()
 			close(done)
 		}()
 	}
@@ -1686,6 +1704,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	// Server self-telemetry: when enabled, instrument the API router and serve
 	// the Prometheus scrape endpoint on its own loopback-by-default listener.
 	var metricsSrv *http.Server
+	var metricsLn net.Listener
 	var metricsReg *metrics.Registry
 	if cfg.Metrics.Enabled {
 		reg := metrics.New(version)
@@ -1771,12 +1790,11 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		// Shared-log writers capture this recorder when they are created. Keep
 		// persistence health observable without importing Prometheus from db.
 		store.SetAppLogMetrics(reg)
-		var mln net.Listener
-		metricsSrv, mln, err = startMetricsListener(upg.Listen, cfg.Metrics.Addr, reg)
+		metricsSrv, metricsLn, err = startMetricsListener(upg.Listen, cfg.Metrics.Addr, reg)
 		if err != nil {
 			return err
 		}
-		slog.Info("metrics listening", "addr", mln.Addr().String())
+		slog.Info("metrics listening", "addr", metricsLn.Addr().String())
 		// Tear down the metrics server on any early error return below. Idempotent
 		// with the ordered shutdown path (Close after Shutdown is a no-op), so it
 		// only matters when runServe returns before reaching that path.
@@ -2779,7 +2797,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 						}
 						// Parent exit is confirmed; the separate lifecycle fence
 						// stays held until every app in this pass is processed.
-						lifecycle.CleanupObsoleteDeploymentGenerations(store, mgr, nil, app)
+						lifecycle.CleanupObsoleteDeploymentGenerationsAfterParent(store, mgr, prx, app)
 						return nil
 					}, func() {
 						releaseRetiringParentFence()
@@ -2846,7 +2864,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		// released, so a successor never overlaps goroutines still writing.
 		drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainBudget)
 		defer cancelDrain()
-		if !drainOwnershipHandoff(drainCtx, jobsMgr.InterruptAndDrain, srv.AcquireFleetAppOperations, registryRefreshBackoff, slog.Default()) {
+		if !drainOwnershipHandoff(drainCtx, jobsMgr.InterruptAndDrain, srv.AcquireFleetHandoffBarrier, registryRefreshBackoff, slog.Default()) {
 			handoffIncomplete.Store(true)
 		}
 	}
@@ -2874,7 +2892,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	// ownerWork refreshes the registry, so admitting owner-only mutations (main-API
 	// deploy/placement, worker register/heartbeat) must wait for the fresh index.
 	ownerAndReady := ownerAndReadyPredicate(elector.IsOwner, &ownerReady)
-	srv.SetOwnership(ownerAndReady)
+	srv.SetOwnership(func() bool { return ownerAndReady() && !srv.AppOperationsPaused() })
 	srv.SetOwnerLease(func() *db.OwnerLease {
 		return &db.OwnerLease{Instance: cfg.Server.InstanceID, Epoch: elector.Epoch()}
 	})
@@ -2941,33 +2959,34 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	if !recheckAppSessions {
 		every = 30 * time.Second // business permission snapshots must always be revocable
 	}
+	reauthorize := func(c proxy.ConnPrincipal) (bool, string, error) {
+		principal := access.Principal{
+			Slug:                   c.Slug,
+			EntitlementAppID:       c.EntitlementAppID,
+			EntitlementFingerprint: c.EntitlementFingerprint,
+			UserID:                 c.UserID,
+			Role:                   c.Role,
+			SessionEpoch:           c.SessionEpoch,
+			JTI:                    c.JTI,
+			ActorID:                c.ActorID,
+			ActorRole:              c.ActorRole,
+			ActorSessionEpoch:      c.ActorSessionEpoch,
+			SupportAppID:           c.SupportAppID,
+			RoutedAppID:            c.RoutedAppID,
+			SupportExpiresAt:       c.SupportExpiresAt,
+		}
+		if !recheckAppSessions {
+			return access.RecheckEntitlements(store, principal)
+		}
+		return access.Recheck(store, appUserLookup, store.IsTokenRevoked, principal)
+	}
 	{
 		recheckCtx, cancelRecheck := context.WithCancel(context.Background())
 		recheckCancel = cancelRecheck
 		recheckWG.Add(1)
 		go func() {
 			defer recheckWG.Done()
-			prx.StartSessionRecheck(recheckCtx, every, func(c proxy.ConnPrincipal) (bool, string, error) {
-				principal := access.Principal{
-					Slug:                   c.Slug,
-					EntitlementAppID:       c.EntitlementAppID,
-					EntitlementFingerprint: c.EntitlementFingerprint,
-					UserID:                 c.UserID,
-					Role:                   c.Role,
-					SessionEpoch:           c.SessionEpoch,
-					JTI:                    c.JTI,
-					ActorID:                c.ActorID,
-					ActorRole:              c.ActorRole,
-					ActorSessionEpoch:      c.ActorSessionEpoch,
-					SupportAppID:           c.SupportAppID,
-					RoutedAppID:            c.RoutedAppID,
-					SupportExpiresAt:       c.SupportExpiresAt,
-				}
-				if !recheckAppSessions {
-					return access.RecheckEntitlements(store, principal)
-				}
-				return access.Recheck(store, appUserLookup, store.IsTokenRevoked, principal)
-			})
+			prx.StartSessionRecheck(recheckCtx, every, reauthorize)
 		}()
 		slog.Info("session recheck started", "interval", every, "entitlements_only", !recheckAppSessions)
 	}
@@ -3204,11 +3223,13 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		slog.Info("startup pool adoption complete (single-node)")
 	}
 
+	httpListener := newHandoffListener(ln, httpSrv)
 	serveErr := make(chan error, 1)
 	go func() {
 		slog.Info("listening", "version", version, "addr", addr)
 		close(readyCh)
-		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		defer httpListener.ServeDone()
+		if err := httpSrv.Serve(httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) && !httpListener.Closing() {
 			serveErr <- err
 		}
 		close(serveErr)
@@ -3218,6 +3239,79 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	// (when this is an upgrade child) tells the old process it may begin draining.
 	// On error, close the servers we just started so we do not leak listeners and
 	// goroutines, then return.
+
+	var relayRPC *relayOwner
+	if relayEnabled {
+		relayRPC, err = startRelayOwner(relayDir, cfg.Auth.Secret, store, reauthorize)
+		if err != nil {
+			return fmt.Errorf("start relay owner: %w", err)
+		}
+		defer relayRPC.Close()
+		upg.(*upgrade.RepeatableUpgrader).SetBeforeReady(relayRPC.Activate)
+		upg.(*upgrade.RepeatableUpgrader).SetUpgradeFailure(func(error) {
+			if err := relayRPC.Activate(); err != nil {
+				slog.Error("restore relay owner after failed upgrade", "err", err)
+			}
+		})
+		upg.(*upgrade.RepeatableUpgrader).EnableRelayHandoff()
+	}
+	checkRelayUpgrade := func() error {
+		_, live, unknown := relayLeases.Snapshot()
+		if unknown {
+			return errors.New("cannot verify retained relay leases; upgrade refused")
+		}
+		if cfg.Server.ReloadSessions == "preserve" && live >= cfg.Server.ReloadRelayLimit {
+			return errors.New("reload relay limit reached; wait for retained sessions to finish")
+		}
+		if live > 0 || cfg.Server.ReloadSessions == "preserve" {
+			probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := upgrade.CheckRelaySuccessor(probeCtx)
+			cancel()
+			if err != nil {
+				return err
+			}
+		}
+		if cfg.Server.ReloadSessions != "preserve" {
+			return nil
+		}
+		if serveOpts.FirstRun != nil {
+			return errors.New("session-preserving reload requires first-run setup to finish")
+		}
+		if _, stable := prx.RelaySnapshot(); !stable {
+			return errors.New("session-preserving reload waits for app transitions to finish")
+		}
+		apps, err := store.ListAppsLean(0, 0)
+		if err != nil {
+			return err
+		}
+		for _, app := range apps {
+			inFlight, err := store.ScheduleActivationInFlight(app.ID)
+			if err != nil {
+				return err
+			}
+			if inFlight {
+				return errors.New("session-preserving reload waits for serving activations to finish")
+			}
+		}
+		return nil
+	}
+	upg.(*upgrade.RepeatableUpgrader).SetUpgradeGuard(func() (func(), error) {
+		if cfg.Server.ReloadSessions != "preserve" {
+			_, live, unknown := relayLeases.Snapshot()
+			if live == 0 && !unknown {
+				return nil, checkRelayUpgrade()
+			}
+		}
+		release, ok := srv.TryPauseAppOperations()
+		if !ok {
+			return nil, errors.New("session-preserving reload waits for admitted app operations")
+		}
+		if err := checkRelayUpgrade(); err != nil {
+			release()
+			return nil, err
+		}
+		return release, nil
+	})
 	if err := upg.Ready(); err != nil {
 		_ = httpSrv.Close()
 		if metricsSrv != nil {
@@ -3241,6 +3335,9 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		return fmt.Errorf("sd_notify: %w", err)
 	}
 
+	if relayRPC != nil {
+		relayRPC.Commit()
+	}
 	startFirstRunExperience(ctx, logger, srv.Router(), store, cfg, ownerAndReady, serveOpts)
 
 	select {
@@ -3258,7 +3355,20 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelShutdown()
+	httpQuiesced := true
+	if handedOff && ctx.Err() == nil {
+		if err := httpListener.Quiesce(shutdownCtx); err != nil {
+			httpQuiesced = false
+			slog.Warn("HTTP accept drain", "err", err)
+		}
+		if metricsLn != nil {
+			if err := metricsLn.(*handoffListener).Quiesce(shutdownCtx); err != nil {
+				slog.Warn("metrics accept drain", "err", err)
+			}
+		}
+	}
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		httpQuiesced = false
 		slog.Warn("http shutdown", "err", err)
 	}
 	if metricsSrv != nil {
@@ -3294,12 +3404,82 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		historyWG.Wait()
 	}
 	// Drain in-flight scheduled job runs before the store closes.
-	jobsMgr.Stop(shutdownCtx)
+	jobsDrained := jobsMgr.Stop(shutdownCtx)
 
+	if relayRPC != nil {
+		relayRPC.Close()
+	}
+	preservingReload := false
+	var relayLease *upgrade.RelayLease
+	if handedOff && httpQuiesced && jobsDrained && !handoffIncomplete.Load() && ctx.Err() == nil && cfg.Server.ReloadSessions == "preserve" {
+		backends, stable := prx.SealRelay()
+		if stable {
+			relayLease, err = upgrade.NewRelayLease(relayDir)
+			if err == nil {
+				err = relayLease.Publish(backends)
+			}
+			if err != nil {
+				if relayLease != nil {
+					_ = relayLease.Close()
+					relayLease = nil
+				}
+				slog.Warn("cannot publish relay lease; using bounded reload drain", "err", err)
+			}
+		}
+		if relayLease != nil {
+			// Only an explicitly capable child can release this parent early.
+			// Legacy successors retain the process-exit fence and bounded drain.
+			if upg.(*upgrade.RepeatableUpgrader).SuccessorRelayAware() {
+				srv.Close()
+				if recheckCancel != nil {
+					recheckCancel()
+					recheckWG.Wait()
+					recheckCancel = nil
+				}
+				client := newRelayClient(relayDir, cfg.Auth.Secret)
+				if usageRecorder != nil {
+					usageRecorder.RelayPersistence(client)
+				}
+				mgr.RetireControlPlane()
+				if stopRelayWatch != nil {
+					stopRelayWatch()
+				}
+				if stopWorkloadMetrics != nil {
+					stopWorkloadMetrics()
+				}
+				if err := store.Close(); err != nil {
+					return fmt.Errorf("close retiring database: %w", err)
+				}
+				authCtx, cancelAuth := context.WithCancel(context.Background())
+				recheckCancel = cancelAuth
+				recheckWG.Add(1)
+				go func() {
+					defer recheckWG.Done()
+					runRelayAuthorization(authCtx, prx, client, every, max(90*time.Second, 3*every))
+				}()
+				upg.(*upgrade.RepeatableUpgrader).ReleaseUpgradeFence()
+				preservingReload = upg.(*upgrade.RepeatableUpgrader).RetireControlPlane()
+			}
+			if !preservingReload {
+				_ = relayLease.Close()
+				relayLease = nil
+			} else {
+				defer relayLease.Close()
+			}
+		}
+	}
 	// Drain live WebSocket (hijacked) app sessions: http.Server.Shutdown does
 	// not wait for hijacked connections, so wait here up to drain_timeout, then
 	// force-close stragglers. App backends (separate processes) remain alive
 	// during this window, so sessions keep flowing until drained or force-closed.
+	if !preservingReload {
+		if jobsDrained && !handoffIncomplete.Load() {
+			upg.(*upgrade.RepeatableUpgrader).ReleaseUpgradeFence()
+		}
+		if handedOff && cfg.Server.ReloadSessions == "preserve" {
+			slog.Warn("session-preserving reload fell back to bounded drain", "http_quiesced", httpQuiesced)
+		}
+	}
 	if n := prx.ActiveUpgradedConns(); n > 0 {
 		drainCtx := context.Background()
 		drainTimeout := cfg.Server.DrainTimeout
@@ -3310,7 +3490,16 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 			drainCtx = ctx
 		}
 		slog.Info("draining upgraded connections", "count", n, "timeout", drainTimeout)
-		if forced := prx.DrainUpgradedForReload(drainCtx, drainTimeout, cfg.Server.DrainTimeout); forced > 0 {
+
+		forced := 0
+		if preservingReload {
+			slog.Info("control plane retired; preserving established multiplex sessions", "count", n)
+			forced = prx.PreserveUpgraded(ctx, relayLease, cfg.Server.DrainTimeout)
+		} else {
+			forced = prx.DrainUpgradedForReload(drainCtx, drainTimeout, cfg.Server.DrainTimeout)
+		}
+		if forced > 0 {
+
 			slog.Warn("drain timeout reached, force-closed upgraded connections", "count", forced)
 		} else {
 			slog.Info("upgraded connections drained cleanly")
@@ -3335,6 +3524,11 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	}
 	if stopUsage != nil {
 		stopUsage()
+	}
+	if preservingReload {
+		// Session accounting can retire independently of the native log pipes.
+		_ = relayLease.Close()
+		mgr.WaitOwnedOutput(ctx)
 	}
 
 	switch cfg.Server.ShutdownApps {

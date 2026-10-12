@@ -35,6 +35,7 @@ import (
 	"github.com/rvben/shinyhub/internal/spanerr"
 	"github.com/rvben/shinyhub/internal/supportui"
 	"github.com/rvben/shinyhub/internal/tracing"
+	"github.com/rvben/shinyhub/internal/upgrade"
 )
 
 // recorderCtxKey carries the request's *statusRecorder through the transport so
@@ -450,6 +451,7 @@ type Proxy struct {
 	// retiringParent is wired once before startup recovery. Until it exits,
 	// local counters cannot prove that adopted workers have no sessions.
 	retiringParent <-chan struct{}
+	relayLeases    *upgrade.RelayLeases
 	// cancelElasticLifetime only cancels a timer; called under mu and must not
 	// call back into the proxy or wait for an app operation.
 	cancelElasticLifetime func(string, int)
@@ -2308,7 +2310,7 @@ func (p *Proxy) TryRetireGeneration(slug string, deploymentID int64) bool {
 		return false
 	}
 	for _, replica := range replicas {
-		if replica != nil && (replica.activeConns.Load() > 0 || (pool.generationPolicies[deploymentID].Mode == config.IsolationGrouped && replica.assignedClients > 0)) {
+		if replica != nil && (replica.activeConns.Load()+p.relaySessions(slug, deploymentID, replica.index, replica.targetURL) > 0 || (pool.generationPolicies[deploymentID].Mode == config.IsolationGrouped && replica.assignedClients > 0)) {
 			return false
 		}
 	}
@@ -2348,7 +2350,7 @@ func (p *Proxy) GenerationDrainingSessions(slug string, deploymentID int64) (int
 	total := 0
 	for _, replica := range replicas {
 		if replica != nil {
-			total += int(replica.activeConns.Load())
+			total += int(replica.activeConns.Load() + p.relaySessions(slug, deploymentID, replica.index, replica.targetURL))
 		}
 	}
 	return total, true
@@ -2633,7 +2635,7 @@ func (p *Proxy) DetachDrainedReplica(slug string, index int, expectURL string, f
 	if rb == nil || rb.targetURL != expectURL || !rb.draining.Load() {
 		return DetachResult{}
 	}
-	result := DetachResult{Matched: true, ActiveConns: rb.activeConns.Load()}
+	result := DetachResult{Matched: true, ActiveConns: rb.activeConns.Load() + p.relaySessions(slug, rb.deploymentID, rb.index, rb.targetURL)}
 	if result.ActiveConns > 0 && !force {
 		return result
 	}
@@ -2808,7 +2810,7 @@ func (p *Proxy) RegisteredSlugs() map[string]struct{} {
 // while activeConns catches a request that has already picked a replica but
 // has not yet completed.
 func (p *Proxy) BeginHibernate(slug string, since time.Time) bool {
-	if p.RetiringParentAlive() {
+	if p.RetiringParentAlive() || p.HasRelaySessions(slug, 0) {
 		return false
 	}
 	p.mu.Lock()
@@ -2891,7 +2893,7 @@ func (p *Proxy) ReplicaSessionCounts(slug string) []int64 {
 			out[i] = -1
 			continue
 		}
-		out[i] = rep.activeConns.Load()
+		out[i] = rep.activeConns.Load() + p.relaySessions(slug, rep.deploymentID, rep.index, rep.targetURL)
 	}
 	return out
 }
@@ -2922,7 +2924,7 @@ func (p *Proxy) PoolSessionSnapshot() map[string]PoolSessionStat {
 		sessions, admitting := 0, 0
 		for _, rep := range activeGenerationBackends(pool) {
 			if rep != nil {
-				sessions += int(rep.activeConns.Load())
+				sessions += int(rep.activeConns.Load() + p.relaySessions(slug, rep.deploymentID, rep.index, rep.targetURL))
 				if !rep.draining.Load() && (!poolIsElastic(pool) || rep.status == workerRunning) {
 					admitting++
 				}
@@ -2931,7 +2933,7 @@ func (p *Proxy) PoolSessionSnapshot() map[string]PoolSessionStat {
 		for _, generation := range pool.drainingGenerations {
 			for _, rep := range generation {
 				if rep != nil {
-					sessions += int(rep.activeConns.Load())
+					sessions += int(rep.activeConns.Load() + p.relaySessions(slug, rep.deploymentID, rep.index, rep.targetURL))
 				}
 			}
 		}
@@ -3041,6 +3043,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	replicaIndex := -1
 	deploymentID := int64(0)
+	var relayBackend upgrade.RelayBackend
 	routedAppID := int64(0)
 	sticky := false
 	// Mark this slug ready the instant the reverse proxy completes a WS
@@ -3082,7 +3085,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if u := auth.UserFromContext(r.Context()); u != nil && u.SupportSession != nil {
 				// Troubleshooting traffic is administrative activity, not product
 				// usage by either the administrator or the represented user.
-				return p.conns.trackWithSession(c, principal, onClose, ws)
+				return p.conns.trackWithSession(c, principal, onClose, ws, relayBackend)
 			}
 			// Service credentials are automation, not people. Keep their live
 			// connection visible while classifying them separately from anonymous
@@ -3111,7 +3114,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		return p.conns.trackWithSession(c, principal, onClose, ws)
+		return p.conns.trackWithSession(c, principal, onClose, ws, relayBackend)
 	}
 
 	// Trace context derivation: if tracing is enabled, parse the incoming
@@ -3677,6 +3680,7 @@ routeLookup:
 	}
 	replicaIndex = picked.index
 	deploymentID = picked.deploymentID
+	relayBackend = upgrade.RelayBackend{Slug: slug, DeploymentID: deploymentID, Index: replicaIndex, TargetURL: picked.targetURL}
 	routedAppID = picked.ownerAppID
 	sticky = isStickyHit
 	if support := auth.UserFromContext(r.Context()); support != nil && support.SupportSession != nil &&
@@ -4088,7 +4092,7 @@ func (p *Proxy) pickReplicaLocked(pool *backendPool, slug string, r *http.Reques
 		if rep == nil || rep.draining.Load() {
 			continue
 		}
-		c := rep.activeConns.Load()
+		c := rep.activeConns.Load() + p.relaySessions(slug, rep.deploymentID, rep.index, rep.targetURL)
 		if best == nil || c < bestConns {
 			best = rep
 			bestConns = c

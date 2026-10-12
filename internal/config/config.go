@@ -548,6 +548,10 @@ type ServerConfig struct {
 	// after a successful SIGHUP handoff. Omitted means DrainTimeout, preserving
 	// existing shutdown behavior without extending app-generation retirement.
 	ReloadDrainTimeout *time.Duration `yaml:"reload_drain_timeout"`
+	// ReloadSessions preserves stable single-host native multiplex sessions in
+	// relay-only processes when explicitly enabled. The default remains drain.
+	ReloadSessions   string `yaml:"reload_sessions"`
+	ReloadRelayLimit int    `yaml:"reload_relay_limit"`
 
 	// UpgradeTimeout bounds how long the old process waits for a new one to
 	// signal Ready during a zero-downtime upgrade (SIGHUP) before aborting the
@@ -1827,6 +1831,21 @@ func loadRaw(path string) (*Config, error) {
 	if cfg.Server.ReloadDrainTimeout != nil && *cfg.Server.ReloadDrainTimeout <= 0 {
 		return nil, fmt.Errorf("server.reload_drain_timeout must be positive")
 	}
+	if cfg.Server.ReloadSessions == "" {
+		cfg.Server.ReloadSessions = "drain"
+	}
+	if cfg.Server.ReloadSessions != "drain" && cfg.Server.ReloadSessions != "preserve" {
+		return nil, fmt.Errorf("server.reload_sessions must be drain or preserve")
+	}
+	if cfg.Server.ReloadSessions == "preserve" && cfg.SessionRecheckInterval() <= 0 {
+		return nil, fmt.Errorf("server.reload_sessions preserve requires a positive server.session_recheck_interval")
+	}
+	if cfg.Server.ReloadRelayLimit == 0 {
+		cfg.Server.ReloadRelayLimit = 4
+	}
+	if cfg.Server.ReloadRelayLimit < 1 || cfg.Server.ReloadRelayLimit > 32 {
+		return nil, fmt.Errorf("server.reload_relay_limit must be between 1 and 32")
+	}
 	if cfg.Server.StopGrace <= 0 {
 		cfg.Server.StopGrace = 10 * time.Second
 	}
@@ -3056,6 +3075,16 @@ func applyEnv(cfg *Config) error {
 			return fmt.Errorf("SHINYHUB_UPGRADE_TIMEOUT must be positive, got %q", v)
 		}
 		cfg.Server.UpgradeTimeout = d
+	}
+	if v := os.Getenv("SHINYHUB_RELOAD_SESSIONS"); v != "" {
+		cfg.Server.ReloadSessions = v
+	}
+	if v := os.Getenv("SHINYHUB_RELOAD_RELAY_LIMIT"); v != "" {
+		limit, err := strconv.Atoi(v)
+		if err != nil || limit < 1 || limit > 32 {
+			return fmt.Errorf("SHINYHUB_RELOAD_RELAY_LIMIT must be between 1 and 32")
+		}
+		cfg.Server.ReloadRelayLimit = limit
 	}
 	if v := os.Getenv("SHINYHUB_RELOAD_DRAIN_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)

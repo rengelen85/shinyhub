@@ -158,9 +158,11 @@ type Server struct {
 	// restart on the same slug. Different slugs are independent. The async
 	// redeployApp goroutine waits for this lock so a replica change is always
 	// applied even when an HTTP-driven deploy is already running.
-	deployLocksMu       sync.Mutex
-	deployLocks         map[string]*sync.Mutex
-	appOperationLockDir string
+	deployLocksMu        sync.Mutex
+	deployLocks          map[string]*sync.Mutex
+	appOperationLockDir  string
+	operationAdmissionMu sync.RWMutex
+	operationsPaused     bool
 	// deployInFlight tracks slugs whose deploy lock is currently held, so
 	// DeployInFlight can answer without a try-lock. Guarded by deployLocksMu.
 	deployInFlight map[string]struct{}
