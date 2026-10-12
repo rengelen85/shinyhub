@@ -68,6 +68,21 @@ func hasBlockingGenerationRows(rows []*db.DeploymentReplica, activeID int64, gro
 	return false
 }
 
+// Known routing generations already have their own retirement owner and deadline.
+// Unpublished candidates and unconfirmed physical cleanup still fence new launches.
+func (s *Server) hasUnownedGenerationRows(slug string, rows []*db.DeploymentReplica, activeID int64, grouped bool) bool {
+	for _, row := range rows {
+		if grouped && row.DeploymentID == activeID {
+			continue
+		}
+		if s.proxy != nil && s.proxy.IsGenerationDraining(slug, row.DeploymentID) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (s *Server) groupedHandoffRuntimeReason(app *db.App) string {
 	if len(app.PlacementMap()) > 0 {
 		return "grouped parallel handoff requires the default native tier; explicit placement requires a stop-first deploy"

@@ -184,15 +184,6 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 		}
 	}
 
-	if s.proxy.HasDrainingGeneration(app.Slug) {
-		linked, linkErr := s.store.ActivationDeploymentID(a.ID)
-		if linkErr != nil {
-			return linkErr
-		}
-		if app.WorkerIsolation != "grouped" || linked != current.ID {
-			return &activation.WaitingError{Reason: "previous generation is still draining", RetryAfter: 5 * time.Second}
-		}
-	}
 	if app.WorkerIsolation == "grouped" {
 		publication, err := s.store.GetAppDataPublication(app.ID)
 		if err != nil && !errors.Is(err, db.ErrNotFound) {
@@ -484,6 +475,10 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 // Once stopping begins every failure is repair-required: recovery must keep
 // retrying until a complete current pool is serving again.
 func (s *Server) restartActivationPool(ctx context.Context, app *db.App, current *db.Deployment, a *db.ScheduleActivation, capacityErr error) error {
+	if s.proxy.HasDrainingGeneration(app.Slug) {
+		return &activation.WaitingError{Reason: "stop-first fallback must wait for retained generations", RetryAfter: 5 * time.Second}
+	}
+
 	if err := ctx.Err(); err != nil {
 		return &activation.RetryableError{Reason: "restart fallback interrupted before stop: " + err.Error(), RetryAfter: time.Second}
 	}

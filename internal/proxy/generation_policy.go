@@ -60,7 +60,7 @@ func (p *Proxy) StageGenerationWithPolicy(slug string, deploymentID int64, size 
 	if pool == nil {
 		return -1, fmt.Errorf("stage %s: pool not found", slug)
 	}
-	if pool.mode == config.IsolationPerSession || deploymentID == pool.activeDeploymentID || len(pool.candidates) > 0 || len(pool.drainingGenerations) > 0 {
+	if pool.mode == config.IsolationPerSession || deploymentID == pool.activeDeploymentID || len(pool.candidates) > 0 || pool.drainingGenerations[deploymentID] != nil {
 		return -1, fmt.Errorf("stage %s: unsupported pool or generation already active, staged or draining", slug)
 	}
 	if pool.candidates == nil {

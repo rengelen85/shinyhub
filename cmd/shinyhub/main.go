@@ -2283,6 +2283,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	srv.SetRenderPacingCores(renderCores, coreSource)
 	prx.SetRenderParkBudget(cfg.RenderParkMaxPerApp(), cfg.RenderParkMaxTotal())
 	prx.SetRenderParkTTL(cfg.RenderParkTTL())
+	prx.SetRenderPageWait(cfg.RenderParkTTL())
 
 	// Let the proxy render a clear status page (instead of the endless loading
 	// spinner) when a request hits an app that is crashed or stopped, and the

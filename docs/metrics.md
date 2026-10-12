@@ -242,6 +242,10 @@ return 200; an unreachable previously ready upstream is identified by
 `fallback_reason: "upstream-error"` rather than appearing as an unqualified
 success.
 
+Page loads that recover during the bounded inline queue return normally and do
+not increment `render-deferred`. The `render_park_*` settings bound page-load and WebSocket waiters
+independently.
+
 `render-deferred` counts **page loads deferred**, not sessions refused, and it is
 inflated by design: one waiting browser re-polls roughly every 1.75 s until
 capacity frees, so a single user can contribute dozens of increments. Use it to

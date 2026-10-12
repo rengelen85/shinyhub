@@ -517,3 +517,209 @@ func TestServeHTTP_GateRecordsRejectForOperators(t *testing.T) {
 			counts[ReasonRenderDeferred], counts)
 	}
 }
+
+func TestRenderPageWaitServesInlineAfterCapacityRecovers(t *testing.T) {
+	p, hits := registerGatedApp(t, "demo")
+	p.SetRenderParkBudget(2, 2)
+	p.SetRenderPageWait(time.Second)
+	p.SetAppLimiter("demo", emptyLimiter())
+	done := make(chan struct{})
+	w := httptest.NewRecorder()
+	go func() { p.ServeHTTP(w, pageLoadRequest("/app/demo/")); close(done) }()
+	deadline := time.After(time.Second)
+	for {
+		b := p.renderPagePark.Load()
+		b.mu.Lock()
+		parked := b.inUse
+		b.mu.Unlock()
+		if parked == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("page never queued")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatal("queued page reached backend")
+	}
+	p.SetAppLimiter("demo", admission.NewAppLimiter(0, 1, 1, 3, 4096))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued page did not resume")
+	}
+	if w.Code != http.StatusOK || hits.Load() != 1 {
+		t.Fatalf("page = %d, hits %d", w.Code, hits.Load())
+	}
+	if p.renderGateBlocks(pageLoadRequest("/app/demo/"), "demo") {
+		t.Fatal("page consumed the WebSocket render token")
+	}
+}
+
+func TestRenderPageWaitBoundsBudgetAndReleasesCancelledRequest(t *testing.T) {
+	p, _ := registerGatedApp(t, "demo")
+	p.SetAppLimiter("demo", emptyLimiter())
+	p.SetRenderParkBudget(1, 1)
+	p.SetRenderPageWait(time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.ServeHTTP(httptest.NewRecorder(), pageLoadRequest("/app/demo/").WithContext(ctx))
+		close(done)
+	}()
+	deadline := time.After(time.Second)
+	for {
+		b := p.renderPagePark.Load()
+		b.mu.Lock()
+		n := b.inUse
+		b.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("not queued")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	w := httptest.NewRecorder()
+	started := time.Now()
+	p.ServeHTTP(w, pageLoadRequest("/app/demo/"))
+	if w.Code != http.StatusServiceUnavailable || time.Since(started) > 500*time.Millisecond {
+		t.Fatal("full queue did not reject promptly")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not release page")
+	}
+	b := p.renderPagePark.Load()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.inUse != 0 || len(b.byApp) != 0 {
+		t.Fatal("park budget leaked")
+	}
+}
+
+func TestRenderPageWaitTimesOutWithoutConsumingCapacity(t *testing.T) {
+	p, hits := registerGatedApp(t, "demo")
+	p.SetRenderParkBudget(1, 1)
+	p.SetRenderPageWait(30 * time.Millisecond)
+	p.SetAppLimiter("demo", emptyLimiter())
+	w := httptest.NewRecorder()
+	started := time.Now()
+	p.ServeHTTP(w, pageLoadRequest("/app/demo/"))
+	if elapsed := time.Since(started); elapsed < 25*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("wait = %v", elapsed)
+	}
+	if w.Code != 503 || hits.Load() != 0 {
+		t.Fatalf("timeout = %d, hits=%d", w.Code, hits.Load())
+	}
+	b := p.renderPagePark.Load()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.inUse != 0 {
+		t.Fatal("timeout retained budget")
+	}
+}
+
+func TestRenderPageWaitReselectsGenerationAfterCutover(t *testing.T) {
+	p, oldHits := registerGatedApp(t, "demo")
+	p.SetRenderParkBudget(1, 1)
+	p.SetRenderPageWait(time.Second)
+	p.SetAppLimiter("demo", emptyLimiter())
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("new")) }))
+	defer backend.Close()
+	done := make(chan struct{})
+	w := httptest.NewRecorder()
+	go func() { p.ServeHTTP(w, pageLoadRequest("/app/demo/")); close(done) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		b := p.renderPagePark.Load()
+		b.mu.Lock()
+		n := b.inUse
+		b.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	p.Deregister("demo")
+	p.SetPoolSize("demo", 1)
+	if err := p.RegisterReplica("demo", 0, backend.URL, nil, 202); err != nil {
+		t.Fatal(err)
+	}
+	p.SetAppLimiter("demo", admission.NewAppLimiter(0, 1, 1, 3, 4096))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not resume")
+	}
+	if w.Code != 200 || w.Body.String() != "new" || oldHits.Load() != 0 {
+		t.Fatalf("stale route: %d %q old hits=%d", w.Code, w.Body.String(), oldHits.Load())
+	}
+}
+
+func TestRenderPageWaitDoesNotOccupyWebSocketBudget(t *testing.T) {
+	p, _ := registerGatedApp(t, "demo")
+	p.SetRenderParkBudget(1, 1)
+	p.SetAppLimiter("demo", emptyLimiter())
+	p.SetRenderPageWait(time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		p.ServeHTTP(httptest.NewRecorder(), pageLoadRequest("/app/demo/").WithContext(ctx))
+		close(done)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		b := p.renderPagePark.Load()
+		b.mu.Lock()
+		n := b.inUse
+		b.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	wsBudget := p.renderPark.Load()
+	if !wsBudget.acquire("demo") {
+		t.Fatal("page displaced WebSocket waiter")
+	}
+	wsBudget.release("demo")
+	p.SetDraining(true)
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("shutdown did not release parked page")
+	}
+}
+
+func TestRenderPageWaitDoesNotQueueExhaustedPrincipal(t *testing.T) {
+	p, hits := registerGatedApp(t, "demo")
+	p.SetRenderParkBudget(1, 1)
+	p.SetRenderPageWait(time.Second)
+	p.SetAppLimiter("demo", admission.NewAppLimiter(0, 10, 1, 1, 16))
+	ws := renderWSUpgradeRequest("/app/demo/")
+	if !p.chargeRenderAdmission(httptest.NewRecorder(), ws, "demo") {
+		t.Fatal("first session not admitted")
+	}
+	w := httptest.NewRecorder()
+	started := time.Now()
+	p.ServeHTTP(w, pageLoadRequest("/app/demo/"))
+	if w.Code != 503 || time.Since(started) > 100*time.Millisecond || hits.Load() != 0 {
+		t.Fatalf("exhausted principal queued: %d", w.Code)
+	}
+}

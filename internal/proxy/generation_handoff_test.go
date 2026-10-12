@@ -76,9 +76,10 @@ func TestGenerationHandoffPreservesOpenRequestAndRepinsNewRequests(t *testing.T)
 }
 
 func TestGenerationHandoffKeepsOpenWebSocketWhileNewWorkUsesActive(t *testing.T) {
-	for _, modes := range [][2]bool{{false, false}, {true, true}, {false, true}, {true, false}} {
-		grouped, targetGrouped := modes[0], modes[1]
-		t.Run(fmt.Sprintf("grouped=%t,targetGrouped=%t", grouped, targetGrouped), func(t *testing.T) {
+	for _, modes := range [][3]bool{{false, false, false}, {true, true, true}, {false, true, true}, {true, false, false}, {false, false, true}, {false, true, false}, {true, false, true}, {true, true, false}} {
+		grouped, targetGrouped, thirdGrouped := modes[0], modes[1], modes[2]
+		t.Run(fmt.Sprintf("grouped=%t,targetGrouped=%t,thirdGrouped=%t", grouped, targetGrouped, thirdGrouped), func(t *testing.T) {
+			t.Parallel()
 			backend := func(version string) *httptest.Server {
 				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
@@ -102,9 +103,10 @@ func TestGenerationHandoffKeepsOpenWebSocketWhileNewWorkUsesActive(t *testing.T)
 					}
 				}))
 			}
-			v1, v2 := backend("v1"), backend("v2")
+			v1, v2, v3 := backend("v1"), backend("v2"), backend("v3")
 			defer v1.Close()
 			defer v2.Close()
+			defer v3.Close()
 			p := proxy.New()
 			p.SetPoolSize("dashboard", 1)
 			if grouped {
@@ -169,9 +171,37 @@ func TestGenerationHandoffKeepsOpenWebSocketWhileNewWorkUsesActive(t *testing.T)
 			if err := p.RegisterGenerationReplica("dashboard", 202, slot, v2.URL, nil); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := p.ActivateGeneration("dashboard", 202); err != nil {
+			if previous, err := p.ActivateGeneration("dashboard", 202); err != nil || previous != 101 {
+				t.Fatalf("second activation: previous=%d, err=%v", previous, err)
+			}
+			middleCookies := generationRequestCookies(t, p, nil, "v2")
+			middleConn, middleReader := openWS(middleCookies)
+			defer middleConn.Close()
+			thirdPolicy := proxy.GenerationPolicy{Mode: config.IsolationMultiplex}
+			if thirdGrouped {
+				thirdPolicy = proxy.GenerationPolicy{Mode: config.IsolationGrouped, GroupedSize: 8, MaxWorkers: 2}
+			}
+			thirdSlot, err := p.StageGenerationWithPolicy("dashboard", 303, 1, thirdPolicy, 2)
+			if err != nil {
 				t.Fatal(err)
 			}
+			if !thirdGrouped {
+				thirdSlot = 0
+			}
+			if err := p.RegisterGenerationReplica("dashboard", 303, thirdSlot, v3.URL, nil); err != nil {
+				t.Fatal(err)
+			}
+			if previous, err := p.ActivateGeneration("dashboard", 303); err != nil || previous != 202 {
+				t.Fatalf("third activation: previous=%d, err=%v", previous, err)
+			}
+			_, _ = io.WriteString(middleConn, "middle-still-here\n")
+			if got, err := middleReader.ReadString('\n'); err != nil || got != "v2:middle-still-here\n" {
+				t.Fatalf("middle websocket after third activation = %q, err=%v", got, err)
+			}
+			if p.TryRetireGeneration("dashboard", 202) {
+				t.Fatal("retired open middle generation")
+			}
+			_ = middleConn.Close()
 			_, _ = io.WriteString(oldConn, "still-here\n")
 			if got, err := oldReader.ReadString('\n'); err != nil || got != "v1:still-here\n" {
 				t.Fatalf("old websocket after cutover = %q, err=%v", got, err)
@@ -179,7 +209,7 @@ func TestGenerationHandoffKeepsOpenWebSocketWhileNewWorkUsesActive(t *testing.T)
 			if p.TryRetireGeneration("dashboard", 101) {
 				t.Fatal("retired generation with an open websocket")
 			}
-			oldClientVersion := "v2"
+			oldClientVersion := "v3"
 			if grouped {
 				oldClientVersion = "v1"
 			}
@@ -193,40 +223,98 @@ func TestGenerationHandoffKeepsOpenWebSocketWhileNewWorkUsesActive(t *testing.T)
 			if got, err := reconnectedReader.ReadString('\n'); err != nil || got != oldClientVersion+":reconnected\n" {
 				t.Fatalf("reconnected websocket = %q, err=%v", got, err)
 			}
-			generationRequestCookies(t, p, nil, "v2")
+			generationRequestCookies(t, p, nil, "v3")
 			newConn, newReader := openWS(nil)
+			defer newConn.Close()
 			_, _ = io.WriteString(newConn, "new\n")
-			if got, err := newReader.ReadString('\n'); err != nil || got != "v2:new\n" {
+			if got, err := newReader.ReadString('\n'); err != nil || got != "v3:new\n" {
 				t.Fatalf("new websocket after cutover = %q, err=%v", got, err)
 			}
 			_ = newConn.Close()
 			_ = reconnected.Close()
-			// Wait until reverse-proxy accounting observes the socket closes,
-			// then confirm grouped bindings still protect the reconnect window.
+			// Both retained generations must independently release their sockets
+			// and client bindings, irrespective of the third generation's mode.
 			closedDeadline := time.Now().Add(2 * time.Second)
-			for {
-				sessions, _ := p.GenerationDrainingSessions("dashboard", 101)
-				if sessions == 0 {
-					break
+			for _, id := range []int64{101, 202} {
+				for {
+					sessions, exists := p.GenerationDrainingSessions("dashboard", id)
+					if !exists {
+						t.Fatalf("generation %d disappeared before idle retirement", id)
+					}
+					if sessions == 0 {
+						break
+					}
+					if time.Now().After(closedDeadline) {
+						t.Fatalf("closed generation %d retained an active connection", id)
+					}
+					time.Sleep(10 * time.Millisecond)
 				}
-				if time.Now().After(closedDeadline) {
-					t.Fatal("closed websocket retained an active connection")
+			}
+			for _, old := range []struct {
+				id      int64
+				grouped bool
+			}{{101, grouped}, {202, targetGrouped}} {
+				retired := p.TryRetireGeneration("dashboard", old.id)
+				if old.grouped && retired {
+					t.Fatalf("retired grouped generation %d before reconnect grace", old.id)
 				}
-				time.Sleep(10 * time.Millisecond)
+				if !old.grouped && !retired {
+					t.Fatalf("idle multiplex generation %d did not retire immediately", old.id)
+				}
 			}
-			if grouped && p.TryRetireGeneration("dashboard", 101) {
-				t.Fatal("retired grouped clients before their reconnect grace expired")
+			// Reconnect after accounting reaches zero, not just immediately after
+			// Close: real grouped affinity must survive throughout that window.
+			for _, old := range []struct {
+				id      int64
+				grouped bool
+				cookies []*http.Cookie
+				version string
+			}{{101, grouped, oldCookies, "v1"}, {202, targetGrouped, middleCookies, "v2"}} {
+				if !old.grouped {
+					continue
+				}
+				generationRequestCookies(t, p, old.cookies, old.version)
+				conn, reader := openWS(old.cookies)
+				defer conn.Close()
+				_, _ = io.WriteString(conn, "grace-reconnect\n")
+				if got, err := reader.ReadString('\n'); err != nil || got != old.version+":grace-reconnect\n" {
+					t.Fatalf("generation %d grace reconnect = %q, err=%v", old.id, got, err)
+				}
+				if sessions, exists := p.GenerationDrainingSessions("dashboard", old.id); !exists || sessions < 1 {
+					t.Fatalf("generation %d live reconnect not counted: sessions=%d exists=%t", old.id, sessions, exists)
+				}
+				_ = conn.Close()
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					sessions, exists := p.GenerationDrainingSessions("dashboard", old.id)
+					if !exists {
+						t.Fatalf("generation %d lost its reconnect binding", old.id)
+					}
+					if sessions == 0 {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("reconnect close was not accounted")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
-			// Exercise the real 15-second client grace timer. No manual worker
-			// deregistration: idle retirement must follow natural binding expiry.
 			deadline := time.Now().Add(20 * time.Second)
-			for !p.TryRetireGeneration("dashboard", 101) && time.Now().Before(deadline) {
+			for p.HasDrainingGeneration("dashboard") && time.Now().Before(deadline) {
+				for _, id := range []int64{101, 202} {
+					if p.IsGenerationDraining("dashboard", id) {
+						p.TryRetireGeneration("dashboard", id)
+					}
+				}
 				time.Sleep(10 * time.Millisecond)
 			}
-			if p.IsGenerationDraining("dashboard", 101) {
-				t.Fatal("old generation did not retire after its client grace expired")
+			for _, id := range []int64{101, 202} {
+				if p.IsGenerationDraining("dashboard", id) {
+					t.Fatalf("generation %d did not retire after client grace", id)
+				}
 			}
-			generationRequestCookies(t, p, oldCookies, "v2")
+			generationRequestCookies(t, p, oldCookies, "v3")
+			generationRequestCookies(t, p, middleCookies, "v3")
 
 		})
 	}

@@ -302,3 +302,42 @@ func (p *Proxy) serveRenderWaitPage(rec http.ResponseWriter, r *http.Request, sl
 	rec.Header().Set("Retry-After", renderRetryAfter())
 	writeWaitPage(rec, http.StatusServiceUnavailable, p.decorateAppPage(waitingPage, slug, r))
 }
+
+// SetRenderPageWait enables a short capacity wait for document requests. The
+// page budget uses the same ceilings independently of WebSocket waiters.
+// Zero disables the wait; startup configures it alongside the park budget.
+func (p *Proxy) SetRenderPageWait(ttl time.Duration) { p.renderPageWait.Store(int64(max(0, ttl))) }
+
+func (p *Proxy) waitForRenderPage(r *http.Request, slug string) bool {
+	ttl := time.Duration(p.renderPageWait.Load())
+	if lim := p.appLimiter(slug); lim != nil && !lim.PrincipalAvailable(p.renderPrincipal(r, slug)) {
+		return false
+	}
+	budget := p.renderPagePark.Load()
+	if ttl <= 0 || budget == nil || !budget.acquire(slug) {
+		return false
+	}
+	defer budget.release(slug)
+	deadline := time.NewTimer(ttl)
+	defer deadline.Stop()
+	tick := time.NewTicker(max(time.Millisecond, min(renderParkInterval, ttl/10)))
+	defer tick.Stop()
+	for {
+		if r.Context().Err() != nil || p.Draining() {
+			return false
+		}
+		if lim := p.appLimiter(slug); lim != nil && !lim.PrincipalAvailable(p.renderPrincipal(r, slug)) {
+			return false
+		}
+		if !p.renderGateBlocks(r, slug) {
+			return true
+		}
+		select {
+		case <-r.Context().Done():
+			return false
+		case <-deadline.C:
+			return false
+		case <-tick.C:
+		}
+	}
+}

@@ -2472,8 +2472,9 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Wait outside the app operation lock and before recording a pending row:
-	// grouped spawn must remain available while the prior generation retires.
+	// Wait outside the app operation lock only for unowned or unconfirmed
+	// process cleanup. Known generations retain independent retirement owners;
+	// grouped spawn must remain available throughout these waits.
 	if s.proxy != nil {
 		if active, err := s.store.GetActiveDeploymentGeneration(app.ID); err == nil {
 			rows, err := s.store.ListDeploymentReplicas(app.ID)
@@ -2487,7 +2488,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, "inspect generation cleanup: "+err.Error())
 				return
 			}
-			if s.proxy.HasDrainingGeneration(slug) || hasBlockingGenerationRows(rows, active.DeploymentID, grouped) {
+			if s.hasUnownedGenerationRows(slug, rows, active.DeploymentID, grouped) {
 				if pending, err := s.store.HasPendingDeployment(app.ID); err != nil || pending {
 					writeError(w, http.StatusConflict, "another deployment is pending; working version preserved")
 					return
@@ -2507,7 +2508,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 	// a superseded activation, or a candidate that failed and was confirmed
 	// stopped, no longer needs its result cache.
 	defer s.pruneAppCache(slug, app.ID)
-	if err := s.guardActivationLifecycle(app.ID, "deploy "+slug); err != nil {
+	if err := s.guardActivationLifecycleWithDrain(app.ID, "deploy "+slug, true); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -2790,9 +2791,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 			unsupportedReason = "parallel generation handoff is not yet supported in clustered mode"
 		case s.proxy == nil || s.manager == nil:
 			unsupportedReason = "parallel generation handoff is unavailable"
-		case s.proxy.HasDrainingGeneration(slug):
-			unsupportedReason = "the previous generation is still draining; switch or close its remaining sessions before deploying again"
-		case hasBlockingGenerationRows(durableGenerationRows, prevActive.ID, previousGrouped):
+		case s.hasUnownedGenerationRows(slug, durableGenerationRows, prevActive.ID, previousGrouped):
 			unsupportedReason = "a previous generation still has pending process cleanup"
 		case producerBarrierEntered || prestartPlan.deploymentRepairRequired || len(prestartPlan.producers) > 0:
 			unsupportedReason = "this deployment changes shared producer state and requires an explicit stop-first deploy"
@@ -2859,6 +2858,11 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.FailDeploymentWithReason(pendingDep.ID, "no-downtime deployment deferred: "+unsupportedReason)
 		w.Header().Set("X-ShinyHub-Conflict", "generation-handoff-deferred")
 		writeError(w, http.StatusConflict, "working version preserved: "+unsupportedReason+"; retry the CLI command with --allow-downtime (or send X-ShinyHub-Allow-Downtime: 1 via the API) to permit a stop-first deployment")
+		return
+	}
+	if !generationHandoff && s.proxy != nil && s.proxy.HasDrainingGeneration(slug) {
+		_ = s.store.FailDeploymentWithReason(pendingDep.ID, "stop-first deploy cannot replace independently draining generations")
+		writeError(w, http.StatusConflict, "working versions preserved: a stop-first deploy must wait for all previous generations to retire")
 		return
 	}
 	if liveUpgrade && !generationHandoff {

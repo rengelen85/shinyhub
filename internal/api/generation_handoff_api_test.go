@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -155,6 +156,77 @@ func TestDeploy_GenerationHandoffServesOldTrafficUntilCandidateReadyAndDrainsOpe
 	case <-time.After(time.Second):
 		t.Fatal("held old-version request did not complete")
 	}
+}
+
+func TestDeploy_ThirdGenerationDoesNotWaitForOpenFirstAndSecond(t *testing.T) {
+	srv, store, token, mgr, _, runtime := buildManifestE2EServer(t, config.RuntimeConfig{})
+	defer srv.Close()
+	runtime.serveTraffic = true
+	runtime.holdStarted = make(chan struct{}, 2)
+	runtime.holdRelease = make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHeld := func() { releaseOnce.Do(func() { close(runtime.holdRelease) }) }
+	defer releaseHeld()
+	app := createGenerationTestApp(t, store, "handoff-three", 1, 16)
+	var held []chan string
+	var heldVersions []string
+	var generations []int64
+	for n := 1; n <= 3; n++ {
+		if rec := deployBareGeneration(t, srv, token, app.Slug, fmt.Sprintf("print('v%d')", n), false); rec.Code != http.StatusOK {
+			t.Fatalf("deploy %d: %d %s", n, rec.Code, rec.Body.String())
+		}
+		active, err := store.GetActiveDeploymentGeneration(app.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		generations = append(generations, active.DeploymentID)
+		if n < 3 {
+			result := make(chan string, 1)
+			held = append(held, result)
+			deployment, _ := store.GetDeploymentByID(active.DeploymentID)
+			heldVersions = append(heldVersions, deployment.Version)
+			go func() {
+				status, body := proxyGenerationBody(srv, app.Slug, "?hold=1")
+				result <- fmt.Sprintf("%d:%s", status, body)
+			}()
+			select {
+			case <-runtime.holdStarted:
+			case <-time.After(time.Second):
+				t.Fatal("request not held")
+			}
+		}
+	}
+	for _, id := range generations[:2] {
+		if !srv.proxy.IsGenerationDraining(app.Slug, id) {
+			t.Fatalf("generation %d no longer draining", id)
+		}
+		if info, ok := mgr.GetGenerationReplica(app.Slug, id, 0); !ok || info.Status != "running" {
+			t.Fatalf("held backend %d stopped: %+v", id, info)
+		}
+	}
+	latest, _ := store.GetDeploymentByID(generations[2])
+	if status, body := proxyGenerationBody(srv, app.Slug, ""); status != 200 || body != latest.Version {
+		t.Fatalf("fresh response = %d %q", status, body)
+	}
+	for _, result := range held {
+		select {
+		case got := <-result:
+			t.Fatalf("old request ended prematurely: %s", got)
+		default:
+		}
+	}
+	releaseHeld()
+	for i, result := range held {
+		select {
+		case got := <-result:
+			if want := fmt.Sprintf("200:%s", heldVersions[i]); got != want {
+				t.Fatalf("retained request = %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("retained request did not complete")
+		}
+	}
+
 }
 
 func TestDeploy_CandidateDiesBeforeCutoverKeepsHealthyRoute(t *testing.T) {
@@ -527,5 +599,57 @@ func TestDeploy_TransientGenerationLedgerDeleteFailureRecoversWithoutRestart(t *
 	}
 	if rec := deployBareGeneration(t, srv, token, app.Slug, "print('v3')", false); rec.Code != http.StatusOK {
 		t.Fatalf("next handoff remained blocked after cleanup recovery: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDeploy_InactiveServingGenerationCannotStopRetainedSessions(t *testing.T) {
+	srv, store, token, mgr, _, rt := buildManifestE2EServer(t, config.RuntimeConfig{})
+	defer srv.Close()
+	rt.serveTraffic = true
+	rt.holdStarted = make(chan struct{}, 1)
+	rt.holdRelease = make(chan struct{})
+	defer close(rt.holdRelease)
+	app := createGenerationTestApp(t, store, "inactive-with-drain", 1, 16)
+	if rec := deployBareGeneration(t, srv, token, app.Slug, "print('v1')", false); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	first, _ := store.GetServingDeployment(app.ID)
+	go proxyGenerationBody(srv, app.Slug, "?hold=1")
+	select {
+	case <-rt.holdStarted:
+	case <-time.After(time.Second):
+		t.Fatal("not held")
+	}
+	if rec := deployBareGeneration(t, srv, token, app.Slug, "print('v2')", false); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	current, _ := store.GetServingDeployment(app.ID)
+	url := srv.proxy.ReplicaTargetURL(app.Slug, 0)
+	if err := mgr.StopGeneration(app.Slug, current.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !srv.proxy.DeregisterReplicaIfTarget(app.Slug, 0, url) {
+		t.Fatal("active route not removed")
+	}
+	if err := store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if mgr.HasRunning(app.Slug) || srv.proxy.PoolHasAny(app.Slug) {
+		t.Fatal("active generation still live")
+	}
+	for _, allowDowntime := range []bool{false, true} {
+		rec := deployBareGeneration(t, srv, token, app.Slug, "print('v3')", allowDowntime)
+		if rec.Code != 409 {
+			t.Fatalf("stop-first with retained sessions: %d %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "must wait for all previous generations to retire") {
+			t.Fatalf("wrong refusal: %s", rec.Body.String())
+		}
+		if !srv.proxy.IsGenerationDraining(app.Slug, first.ID) {
+			t.Fatal("retained generation erased")
+		}
+		if info, ok := mgr.GetGenerationReplica(app.Slug, first.ID, 0); !ok || info.Status != "running" {
+			t.Fatalf("retained worker stopped: %+v", info)
+		}
 	}
 }

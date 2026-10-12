@@ -626,7 +626,8 @@ type ServerConfig struct {
 
 	// Render-admission park budget. Bounds how many in-flight requests may
 	// park waiting for render capacity before they are shed, and how long a
-	// parked request waits. Pointers so unset falls back to the accessor
+	// parked request waits. Documents and WebSocket upgrades have independent
+	// budgets with these same ceilings. Pointers so unset falls back to the accessor
 	// defaults below.
 	RenderParkMaxPerApp *int    `yaml:"render_park_max_per_app"`
 	RenderParkMaxTotal  *int    `yaml:"render_park_max_total"`

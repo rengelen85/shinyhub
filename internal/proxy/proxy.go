@@ -675,7 +675,9 @@ type Proxy struct {
 
 	// renderPark bounds parked render-paced upgrades; nil means unlimited (and
 	// is the default until wired). Guarded internally.
-	renderPark atomic.Pointer[parkBudget]
+	renderPark     atomic.Pointer[parkBudget]
+	renderPagePark atomic.Pointer[parkBudget]
+	renderPageWait atomic.Int64
 }
 
 // memoryGuard pairs the configured floor with the probe that reads the host's
@@ -869,6 +871,9 @@ func (p *Proxy) setAppLimiterLocked(slug string, l *admission.AppLimiter) {
 // unlimited. Safe to call at startup before serving.
 func (p *Proxy) SetRenderParkBudget(perApp, total int) {
 	p.renderPark.Store(newParkBudget(perApp, total))
+	// Separate budgets prevent document waiters from starving the actual
+	// WebSocket upgrades which consume render capacity.
+	p.renderPagePark.Store(newParkBudget(perApp, total))
 }
 
 // appLimiter returns slug's render-admission limiter, or nil when pacing is
@@ -3295,6 +3300,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// BeginHibernate could observe activeConns=0 for a replica we have
 	// already chosen, hibernate the pool, and stop the very backends we
 	// are about to forward to.
+	renderWaited := false
+routeLookup:
 	p.mu.RLock()
 	pool := p.pools[slug]
 	trigger := p.wakeTrigger
@@ -3344,12 +3351,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//
 	// It runs only once the pool is known populated, so by construction it fires
 	// only for an app that is up and routable and merely out of render tokens.
-	// It binds no slot, spawns no worker and holds no goroutine: the check is
-	// arithmetic and the response is a static page, so a deferred page load costs
-	// the server strictly less than the render it defers.
+	// It binds no replica slot and spawns no worker while briefly queued. The
+	// shared park budget bounds sockets and goroutines; expiry keeps the existing
+	// 503 wait-page fallback. Page checks never consume a render token.
 	if p.renderGateBlocks(r, slug) {
 		p.mu.RUnlock()
-		p.serveRenderWaitPage(rec, r, slug)
+		if !renderWaited && p.waitForRenderPage(r, slug) {
+			renderWaited = true
+			// Re-select after waiting: a deploy, stop or wake may have changed the pool.
+			goto routeLookup
+		}
+		if r.Context().Err() == nil {
+			p.serveRenderWaitPage(rec, r, slug)
+		}
 		return
 	}
 

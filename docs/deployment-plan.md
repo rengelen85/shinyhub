@@ -168,7 +168,13 @@ resource limits, worker policy, and schedule declarations
 can be staged and published with the replacement when no producer needs to run.
 Hooks, deploy-time shared producers, other isolation modes, and unsupported placement
 still require stop-first deployment. The refusal names the reason. A consecutive
-deploy waits for the previous drain and cleanup within a bounded deadline.
+compatible deploy can publish another generation while earlier sessions drain.
+Each outgoing generation retains its original retirement deadline; a later
+deploy does not extend it. Candidate admission uses the host's remaining memory,
+so retained generations can defer a new handoff for capacity. Unconfirmed
+process cleanup still fences new launches, and stop-first operations wait for
+all retained generations. Rolling restarts can also proceed beside a previous
+deploy's drain; a currently executing roll remains serialized.
 
 The server reserves memory for the candidate and configured warm spares, using
 explicit limits or observed worker startup peaks. A candidate that fails

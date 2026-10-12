@@ -77,9 +77,6 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 		}
 		return s.activationRepairError(errors.New("published grouped activation has no verified ready worker"))
 	}
-	if s.proxy.HasDrainingGeneration(app.Slug) {
-		return &activation.RetryableError{Reason: "previous grouped generation is still draining", RetryAfter: 5 * time.Second}
-	}
 	rows, err := s.store.ListDeploymentReplicas(app.ID)
 	if err != nil {
 		return s.activationRepairError(err)
@@ -90,7 +87,7 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 			blockingRows = append(blockingRows, row)
 		}
 	}
-	if hasBlockingGenerationRows(blockingRows, current.ID, true) {
+	if s.hasUnownedGenerationRows(app.Slug, blockingRows, current.ID, true) {
 		return &activation.RetryableError{Reason: "previous grouped generation cleanup is unconfirmed", RetryAfter: 5 * time.Second}
 	}
 	projected := *app
@@ -99,6 +96,9 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 		if err := s.generationHandoffCapacityCheck(&projected); err != nil {
 			if a.RollFallback != "restart" {
 				return err
+			}
+			if s.proxy.HasDrainingGeneration(app.Slug) {
+				return &activation.WaitingError{Reason: "stop-first fallback must wait for retained generations", RetryAfter: 5 * time.Second}
 			}
 			if err := s.store.UpdateScheduleActivationProgress(a.ID, "grouped_restart", -1, 0); err != nil {
 				return err
@@ -136,6 +136,9 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 		return fmt.Errorf("%w: rolling activation requires a prepared deployment", activation.ErrUnsupported)
 	}
 	if restarting {
+		if s.proxy.HasDrainingGeneration(app.Slug) {
+			return &activation.WaitingError{Reason: "stop-first fallback must wait for retained generations", RetryAfter: 5 * time.Second}
+		}
 		if err := s.confirmAppConsumersStopped(app); err != nil {
 			return s.activationRepairError(err)
 		}

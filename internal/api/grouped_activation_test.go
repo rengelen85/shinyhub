@@ -250,3 +250,91 @@ func TestInterruptedServingActivationPreservesScheduleEdits(t *testing.T) {
 		t.Fatalf("schedule edit lost: %+v %v", sc, err)
 	}
 }
+
+func TestGroupedRollWaitsBeforeCommittingRestartFallback(t *testing.T) {
+	srv, store, token, mgr, _, rt := buildManifestE2EServer(t, config.RuntimeConfig{})
+	defer srv.Close()
+	rt.serveTraffic = true
+	rt.holdStarted = make(chan struct{}, 1)
+	rt.holdRelease = make(chan struct{})
+	defer close(rt.holdRelease)
+	app := createGenerationTestApp(t, store, "grouped-fallback-drain", 1, 16)
+	if _, err := store.DB().Exec("UPDATE apps SET worker_isolation='grouped',worker_grouped_size=4,worker_max_workers=2 WHERE id=?", app.ID); err != nil {
+		t.Fatal(err)
+	}
+	srv.SetAvailableMemoryForTest(func() (int, error) { return 4096, nil })
+	if rec := deployBareGeneration(t, srv, token, app.Slug, "print('v1')", false); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	// Grouped first deploy prepares an idle pool. A first roll supplies its
+	// initial ready worker before the held request enters it.
+	app, _ = store.GetAppByID(app.ID)
+	initial, _ := store.GetServingDeployment(app.ID)
+	if _, err := store.EnqueueRollingRestart(app, initial); err != nil {
+		t.Fatal(err)
+	}
+	boot, err := store.ClaimNextScheduleActivation(time.Now())
+	if err != nil || boot == nil {
+		t.Fatalf("initial claim: %v", err)
+	}
+	if err := srv.Roll(context.Background(), boot); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScheduleActivation(boot.ID, "succeeded", "", time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := store.GetServingDeployment(app.ID)
+	firstSlot := -1
+	for _, worker := range mgr.AllGenerationsForSlug(app.Slug) {
+		if worker.DeploymentID == first.ID {
+			firstSlot = worker.Index
+			break
+		}
+	}
+	if firstSlot < 0 {
+		t.Fatal("initial worker missing")
+	}
+	go proxyGenerationBody(srv, app.Slug, "?hold=1")
+	select {
+	case <-rt.holdStarted:
+	case <-time.After(time.Second):
+		t.Fatal("not held")
+	}
+	if rec := deployBareGeneration(t, srv, token, app.Slug, "print('v2')", false); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	if !srv.proxy.IsGenerationDraining(app.Slug, first.ID) {
+		t.Fatal("first generation not draining")
+	}
+	app, _ = store.GetAppByID(app.ID)
+	current, _ := store.GetServingDeployment(app.ID)
+	a, err := store.EnqueueRollingRestart(app, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec("UPDATE schedule_activations SET roll_fallback='restart' WHERE id=?", a.ID); err != nil {
+		t.Fatal(err)
+	}
+	a, err = store.ClaimNextScheduleActivation(time.Now())
+	if err != nil || a == nil {
+		t.Fatalf("claim: %v", err)
+	}
+	srv.SetAvailableMemoryForTest(func() (int, error) { return 0, nil })
+	var waiting *activation.WaitingError
+	if err := srv.Roll(context.Background(), a); !errors.As(err, &waiting) {
+		t.Fatalf("roll = %v, want waiting", err)
+	}
+	if waiting.Reason != "stop-first fallback must wait for retained generations" {
+		t.Fatalf("wrong wait: %s", waiting.Reason)
+	}
+	if info, ok := mgr.GetGenerationReplica(app.Slug, first.ID, firstSlot); !ok || info.Status != "running" {
+		t.Fatal("fallback stopped retained worker")
+	}
+	saved, err := store.GetScheduleActivation(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Phase == "grouped_restart" {
+		t.Fatal("waiting committed disruptive fallback")
+	}
+}

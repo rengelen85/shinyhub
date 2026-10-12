@@ -15,6 +15,12 @@ var errRetiringProxy = errors.New("previous ShinyHub process still proxies sessi
 // between repair attempts, when no goroutine owns the lock but the activation
 // still owns runtime and routing state.
 func (s *Server) guardActivationLifecycle(appID int64, operation string) error {
+	return s.guardActivationLifecycleWithDrain(appID, operation, false)
+}
+
+// Only generation handoffs may proceed beside independently retiring generations.
+// Destructive operations retain the ordinary drain fence.
+func (s *Server) guardActivationLifecycleWithDrain(appID int64, operation string, allowDrain bool) error {
 	if s.proxy != nil {
 		if s.proxy.RetiringParentAlive() {
 			return fmt.Errorf("%s: %w", operation, errRetiringProxy)
@@ -23,7 +29,7 @@ func (s *Server) guardActivationLifecycle(appID int64, operation string) error {
 		if err != nil {
 			return fmt.Errorf("%s: inspect generation drain: %w", operation, err)
 		}
-		if s.proxy.HasDrainingGeneration(app.Slug) {
+		if !allowDrain && s.proxy.HasDrainingGeneration(app.Slug) {
 			return fmt.Errorf("%s: %w; retry after retirement completes", operation, errGenerationDraining)
 		}
 	}

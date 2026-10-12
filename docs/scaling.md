@@ -260,7 +260,14 @@ Pacing is visible in the rejection rollup, on the app detail page and in
 `shinyhub apps show`, and as the `reason` label on
 `shinyhub_admission_rejects_total`:
 
-- `render-deferred` - a page load was sent to the wait page. Expected during
+Page loads first wait inline for up to `server.render_park_ttl` (2 seconds by
+default). This uses the same per-app and host ceilings as WebSocket
+upgrades, with independent budgets so waiting pages do not displace sessions.
+It holds no worker slot and spends no render token. If capacity returns,
+the same request serves the current generation. Cancellation releases its queue
+place immediately; a full queue or sustained overload still uses the wait page.
+
+- `render-deferred` - a page load exhausted its queue budget and was sent to the wait page. Expected during
   bursts. One patient browser re-polls every ~1.75 s, so this counts waiting,
   not refusal.
 - `render-paced` - a session waited out the park window and was shed. This is
