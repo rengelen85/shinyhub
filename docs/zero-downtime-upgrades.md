@@ -1,5 +1,5 @@
 ---
-description: "Upgrade on SIGHUP with listener handoff and a separate drain budget for established app sessions."
+description: "Upgrade ShinyHub on SIGHUP with listener handoff, a separate session drain budget, and opt-in WebSocket continuity for native multiplex apps."
 ---
 
 # Zero-downtime upgrades (systemd)
