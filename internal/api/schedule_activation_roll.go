@@ -24,6 +24,9 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 	if a == nil || a.AppID == nil {
 		return activation.ErrTargetDeleted
 	}
+	if s.proxy != nil && s.proxy.RetiringParentAlive() {
+		return &activation.WaitingError{Reason: errRetiringProxy.Error(), RetryAfter: 5 * time.Second}
+	}
 	release := s.acquireDeployLock(a.AppSlug)
 	defer func() { release() }()
 
@@ -72,6 +75,11 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 	if app.Slug != a.AppSlug {
 		return fmt.Errorf("%w: app identity changed", activation.ErrTargetDeleted)
 	}
+	// A stop/hibernate admitted after a manual request must remain effective;
+	// queued replacement is not an instruction to start a stopped app.
+	if a.ScheduleRunID == nil && app.Status != "running" && app.Status != "degraded" {
+		return activation.ErrNotNeeded
+	}
 	if err := s.guardCompatibilityQuarantine(app.ID, "scheduled data activation"); err != nil {
 		return fmt.Errorf("%w: %v", activation.ErrUnsupported, err)
 	}
@@ -114,6 +122,9 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 	if err := s.validateScheduleActivationForApp(app, "roll"); err != nil {
 		return fmt.Errorf("%w: %v", activation.ErrUnsupported, err)
 	}
+	if err := s.checkColocatedShared(app.ID, s.tiersForApp(app)); err != nil {
+		return fmt.Errorf("%w: %v", activation.ErrUnsupported, err)
+	}
 	if s.manager == nil || s.proxy == nil {
 		return fmt.Errorf("%w: local process manager and proxy are required", activation.ErrUnsupported)
 	}
@@ -141,6 +152,21 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 	if a.SourceContentDigest != "" && current.ContentDigest != a.SourceContentDigest {
 		return activation.ErrSuperseded
 	}
+	if a.ScheduleRunID == nil && a.SourceDeploymentID != nil {
+		source, err := s.store.GetDeploymentByID(*a.SourceDeploymentID)
+		if errors.Is(err, db.ErrNotFound) {
+			return activation.ErrSuperseded
+		}
+		if err != nil {
+			return fmt.Errorf("load manual restart source: %w", err)
+		}
+		// Legacy bundles can have no digest. A different bundle directory still
+		// means a newer deploy won; a same-bundle serving activation may safely
+		// have a different deployment ID.
+		if source.AppID != app.ID || source.BundleDir != current.BundleDir {
+			return activation.ErrSuperseded
+		}
+	}
 	if a.SourceProducerFingerprint != "" && a.ScheduleID != nil {
 		schedule, err := s.store.GetSchedule(*a.ScheduleID)
 		if errors.Is(err, db.ErrNotFound) {
@@ -164,7 +190,7 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 			return linkErr
 		}
 		if app.WorkerIsolation != "grouped" || linked != current.ID {
-			return &activation.RetryableError{Reason: "previous generation is still draining", RetryAfter: 5 * time.Second}
+			return &activation.WaitingError{Reason: "previous generation is still draining", RetryAfter: 5 * time.Second}
 		}
 	}
 	if app.WorkerIsolation == "grouped" {

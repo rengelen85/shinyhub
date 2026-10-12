@@ -231,6 +231,20 @@ server capability before requesting any restart. Unsupported isolation and
 unprepared bundles are refused. Environment values saved earlier are read by
 the replacement workers.
 
+Rolling restart acceptance does not wait for an existing roll or a previous
+generation's drain. Repeated requests for the same target share an unstarted
+manual activation; a request made after execution starts queues another
+activation, so it cannot silently join workers booting older environment
+values. Each app has at most one unstarted manual request. Replacement remains
+serialized with app lifecycle operations, and
+waiting for a drain does not consume the rollout retry budget. If the serving
+bundle changes before execution, the activation reports `superseded`; stopping
+the app before execution reports `not_needed` and leaves it stopped.
+`--wait` follows completion including worker retirement, rather than only
+candidate readiness. For long drains, set `--wait-timeout` to cover the previous
+drain plus replacement and retirement; the default is five minutes. A CLI wait
+timeout does not cancel the accepted activation.
+
 Important behavior:
 
 - Only `succeeded` runs activate. Failed, timed-out, cancelled, interrupted, or

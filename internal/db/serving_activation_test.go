@@ -8,6 +8,166 @@ import (
 	"github.com/rvben/shinyhub/internal/db"
 )
 
+func TestManualRestartsQueueIndependentlyBehindRunningActivation(t *testing.T) {
+	store := newScheduleStore(t)
+	appID := newScheduleAppFixture(t, store, "manual-roll-queue")
+	app, _ := store.GetAppByID(appID)
+	dep := promoteConvergenceDeployment(t, store, appID, "v1", "digest-v1")
+	first, err := store.EnqueueRollingRestart(app, dep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextScheduleActivation(time.Now())
+	if err != nil || claimed.ID != first.ID {
+		t.Fatalf("claim=%+v %v", claimed, err)
+	}
+	second, err := store.EnqueueRollingRestart(app, dep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID || second.Status != "pending" {
+		t.Fatal("manual restart reused an execution which may have read stale environment")
+	}
+	if err := store.FinishScheduleActivation(first.ID, "succeeded", "", time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = store.ClaimNextScheduleActivation(time.Now())
+	if err != nil || claimed.ID != second.ID {
+		t.Fatalf("queued restart was lost: %+v %v", claimed, err)
+	}
+}
+
+func TestGenerationDrainWaitDoesNotConsumeRolloutAttempts(t *testing.T) {
+	store := newScheduleStore(t)
+	appID := newScheduleAppFixture(t, store, "manual-roll-long-drain")
+	app, _ := store.GetAppByID(appID)
+	dep := promoteConvergenceDeployment(t, store, appID, "v1", "digest-v1")
+	a, err := store.EnqueueRollingRestart(app, dep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for i := 0; i < 5; i++ {
+		claimed, err := store.ClaimNextScheduleActivation(now)
+		if err != nil || claimed.ID != a.ID {
+			t.Fatalf("claim=%+v %v", claimed, err)
+		}
+		now = now.Add(time.Minute)
+		if err := store.WaitScheduleActivation(a.ID, "previous generation is still draining", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, err = store.GetScheduleActivation(a.ID)
+	if err != nil || a.Attempts != 0 || a.CapacityDeferrals != 0 || a.Status != "pending" {
+		t.Fatalf("waiting consumed attempts: %+v %v", a, err)
+	}
+}
+
+func TestGenerationDrainWaitPreservesRecoveryFence(t *testing.T) {
+	for _, phase := range []string{"recovering", "grouped_restart"} {
+		t.Run(phase, func(t *testing.T) {
+			store := newScheduleStore(t)
+			appID := newScheduleAppFixture(t, store, "recover-wait")
+			app, _ := store.GetAppByID(appID)
+			dep := promoteConvergenceDeployment(t, store, appID, "v1", "digest-v1")
+			a, err := store.EnqueueRollingRestart(app, dep)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now()
+			if _, err := store.ClaimNextScheduleActivation(now); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.RequeueRunningScheduleActivations(now); err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := store.ClaimNextScheduleActivation(now)
+			if err != nil || claimed.Phase != "recovering" {
+				t.Fatalf("reclaim=%+v %v", claimed, err)
+			}
+			if phase == "grouped_restart" {
+				if err := store.UpdateScheduleActivationProgress(a.ID, phase, -1, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.WaitScheduleActivation(a.ID, "retiring parent", now); err != nil {
+				t.Fatal(err)
+			}
+			waiting, err := store.GetScheduleActivation(a.ID)
+			if err != nil || waiting.Status != "repairing" || waiting.Phase != phase {
+				t.Fatalf("wait=%+v %v", waiting, err)
+			}
+			if inFlight, err := store.ScheduleActivationInFlight(appID); err != nil || !inFlight {
+				t.Fatalf("recovery fence=%v %v", inFlight, err)
+			}
+			claimed, err = store.ClaimNextScheduleActivation(now)
+			if err != nil || claimed.Phase != phase {
+				t.Fatalf("reclaim after wait=%+v %v", claimed, err)
+			}
+		})
+	}
+}
+
+func TestManualRestartCoalescesOnlyUnstartedWork(t *testing.T) {
+	store := newScheduleStore(t)
+	appID := newScheduleAppFixture(t, store, "manual-roll-coalesce")
+	app, _ := store.GetAppByID(appID)
+	dep := promoteConvergenceDeployment(t, store, appID, "v1", "digest-v1")
+	first, err := store.EnqueueRollingRestart(app, dep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.EnqueueRollingRestart(app, dep)
+	if err != nil || second.ID != first.ID {
+		t.Fatalf("unstarted request not coalesced: %+v %v", second, err)
+	}
+	if _, err := store.ClaimNextScheduleActivation(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WaitScheduleActivation(first.ID, "draining", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	third, err := store.EnqueueRollingRestart(app, dep)
+	if err != nil || third.ID == first.ID {
+		t.Fatalf("started request was incorrectly reused: %+v %v", third, err)
+	}
+	if _, err := store.ClaimNextScheduleActivation(time.Now()); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("new activation overtook waiting predecessor: %v", err)
+	}
+	if _, err := store.ClaimNextScheduleActivation(time.Now().Add(2 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManualRestartSupportsLegacyServingFallback(t *testing.T) {
+	store := newScheduleStore(t)
+	appID := newScheduleAppFixture(t, store, "manual-roll-legacy")
+	app, _ := store.GetAppByID(appID)
+	dep := promoteConvergenceDeployment(t, store, appID, "v1", "digest-v1")
+	if _, err := store.DB().Exec("UPDATE apps SET active_deployment_id=NULL WHERE id=?", appID); err != nil {
+		t.Fatal(err)
+	}
+	a, err := store.EnqueueRollingRestart(app, dep)
+	if err != nil || a.SourceDeploymentID == nil || *a.SourceDeploymentID != dep.ID {
+		t.Fatalf("legacy enqueue=%+v %v", a, err)
+	}
+}
+
+func TestManualRestartRejectsStaleServingTarget(t *testing.T) {
+	store := newScheduleStore(t)
+	appID := newScheduleAppFixture(t, store, "manual-roll-stale")
+	app, _ := store.GetAppByID(appID)
+	old := promoteConvergenceDeployment(t, store, appID, "v1", "digest-v1")
+	promoteConvergenceDeployment(t, store, appID, "v2", "digest-v2")
+	if _, err := store.EnqueueRollingRestart(app, old); !errors.Is(err, db.ErrRollingRestartTargetChanged) {
+		t.Fatalf("stale enqueue=%v", err)
+	}
+	rows, err := store.ListScheduleActivationsByApp(appID, 50)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("stale request left queued work: %+v %v", rows, err)
+	}
+}
+
 func TestManualRestartIsNeitherCoalescedNorScheduledRollDamper(t *testing.T) {
 	store := newScheduleStore(t)
 	appID := newScheduleAppFixture(t, store, "manual-roll-damper")

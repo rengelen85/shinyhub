@@ -536,11 +536,15 @@ func (s *Store) ClaimNextScheduleActivation(now time.Time) (*ScheduleActivation,
 	var id int64
 	var priorStatus, priorPhase string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, status, phase FROM schedule_activations
-		WHERE status = 'running'
-		   OR (status IN ('repairing', 'pending', 'deferred_interval', 'deferred_capacity') AND due_at <= ?)
-		ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'repairing' THEN 1 ELSE 2 END,
-		         due_at ASC, id ASC LIMIT 1`, now).Scan(&id, &priorStatus, &priorPhase)
+		SELECT a.id, a.status, a.phase FROM schedule_activations a
+		WHERE (a.status = 'running'
+		   OR (a.status IN ('repairing', 'pending', 'deferred_interval', 'deferred_capacity') AND a.due_at <= ?))
+		AND (a.status IN ('running','repairing') OR NOT EXISTS (SELECT 1 FROM schedule_activations older
+		 WHERE older.app_id=a.app_id AND older.id<>a.id
+		 AND (older.status IN ('running','repairing') OR
+		 (older.id<a.id AND older.status IN ('pending','deferred_interval','deferred_capacity')))))
+		ORDER BY CASE a.status WHEN 'running' THEN 0 WHEN 'repairing' THEN 1 ELSE 2 END,
+		         a.due_at ASC, a.id ASC LIMIT 1`, now).Scan(&id, &priorStatus, &priorPhase)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return nil, err
@@ -588,6 +592,25 @@ func (s *Store) UpdateScheduleActivationProgress(id int64, phase string, surgeIn
 		return fmt.Errorf("update schedule activation progress: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// WaitScheduleActivation waits without charging rollout attempts or capacity
+// deferrals. Reclaimed work retains its recovery phase and lifecycle fence.
+func (s *Store) WaitScheduleActivation(id int64, reason string, dueAt time.Time) error {
+	res, err := s.db.Exec(`UPDATE schedule_activations
+		SET status=CASE WHEN phase IN ('recovering','grouped_restart') THEN 'repairing' ELSE 'pending' END,
+		phase=CASE WHEN phase IN ('recovering','grouped_restart') THEN phase ELSE 'pending' END,
+		due_at=?, defer_reason=?, updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND status='running'`, dueAt, reason, id)
+	if err != nil {
+		return fmt.Errorf("wait schedule activation: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
 		return ErrNotFound
 	}
 	return nil

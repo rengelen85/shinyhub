@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net"
 	"sync"
 	"time"
@@ -177,6 +178,24 @@ func (p *Proxy) SetDraining(v bool) { p.instanceDraining.Store(v) }
 // Draining reports whether this instance is draining for shutdown.
 func (p *Proxy) Draining() bool { return p.instanceDraining.Load() }
 
+// SetRetiringParent fences destructive lifecycle decisions while the proxy
+// which served established sessions before this handoff is still alive and
+// until its recovery cleanup completes. Close done only after both conditions.
+// Call before recovery or request handling; a nil channel means no parent.
+func (p *Proxy) SetRetiringParent(done <-chan struct{}) { p.retiringParent = done }
+
+func (p *Proxy) RetiringParentAlive() bool {
+	if p.retiringParent == nil {
+		return false
+	}
+	select {
+	case <-p.retiringParent:
+		return false
+	default:
+		return true
+	}
+}
+
 // ActiveUpgradedConns is the number of live hijacked (WebSocket) connections.
 func (p *Proxy) ActiveUpgradedConns() int { return p.conns.count() }
 
@@ -187,12 +206,45 @@ func (p *Proxy) ActiveUpgradedConns() int { return p.conns.count() }
 // SetDraining(true) and stopped accepting new connections before calling
 // DrainUpgraded, so the tracked set only shrinks.
 func (p *Proxy) DrainUpgraded(timeout time.Duration) (forced int) {
+	return p.DrainUpgradedContext(context.Background(), timeout)
+}
+
+// DrainUpgradedContext also ends a retiring proxy's drain when service shutdown
+// is requested. This prevents a long reload-only budget from delaying SIGTERM.
+// Reauthorization may close connections concurrently; trackedConn.Close is
+// idempotent, so those connections retain their normal revocation semantics.
+func (p *Proxy) DrainUpgradedContext(ctx context.Context, timeout time.Duration) (forced int) {
+	return p.drainUpgraded(ctx, timeout, 0)
+}
+
+// DrainUpgradedForReload shrinks a reload drain to the ordinary shutdown grace
+// when SIGINT/SIGTERM arrives, without disconnecting sessions immediately.
+func (p *Proxy) DrainUpgradedForReload(ctx context.Context, timeout, shutdownGrace time.Duration) int {
+	return p.drainUpgraded(ctx, timeout, shutdownGrace)
+}
+
+func (p *Proxy) drainUpgraded(ctx context.Context, timeout, shutdownGrace time.Duration) int {
 	if p.conns.count() == 0 {
 		return 0
 	}
-	deadline := time.Now().Add(timeout)
-	for p.conns.count() > 0 && time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
+	deadline := time.NewTimer(max(0, timeout))
+	expires := time.Now().Add(timeout)
+	shutdown := ctx.Done()
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for p.conns.count() > 0 {
+		select {
+		case <-shutdown:
+			if shutdownGrace <= 0 {
+				return p.conns.closeAll()
+			}
+			deadline.Reset(max(0, min(time.Until(expires), shutdownGrace)))
+			shutdown = nil
+		case <-deadline.C:
+			return p.conns.closeAll()
+		case <-ticker.C:
+		}
 	}
-	return p.conns.closeAll()
+	return 0
 }

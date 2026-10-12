@@ -31,6 +31,7 @@ func (f *fakeUpgrader) Listen(network, addr string) (net.Listener, error) { retu
 func (f *fakeUpgrader) Ready() error                                      { return nil }
 func (f *fakeUpgrader) Exit() <-chan struct{}                             { return f.exitCh }
 func (f *fakeUpgrader) HasParent() bool                                   { return f.hasParent }
+func (f *fakeUpgrader) WaitForParent(context.Context) error               { return nil }
 
 func (f *fakeUpgrader) Upgrade() error {
 	f.mu.Lock()
@@ -81,12 +82,15 @@ func TestWireSignals_SIGHUPTriggersUpgrade(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	WireSignals(ctx, f, sighup, quietLogger())
+	state := WireSignals(ctx, f, sighup, quietLogger())
 
 	sighup <- syscall.SIGHUP
 	waitFor(t, func() bool { return f.upgradeCount() == 1 }, "one Upgrade call")
 	if f.isStopped() {
 		t.Fatal("a successful SIGHUP upgrade must not Stop the upgrader")
+	}
+	if !state.SuccessfulHandoff() {
+		t.Fatal("successful upgrade was not recorded")
 	}
 }
 
@@ -126,5 +130,17 @@ func TestWireSignals_ContextCancelStops(t *testing.T) {
 	case <-f.Exit():
 	default:
 		t.Fatal("Stop must close Exit")
+	}
+}
+
+func TestSelfStopIsNotClassifiedAsReload(t *testing.T) {
+	f := newFakeUpgrader()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := WireSignals(ctx, f, make(chan os.Signal), quietLogger())
+	f.Stop()
+	<-f.Exit()
+	if state.SuccessfulHandoff() {
+		t.Fatal("self-stop selected a reload drain while context was live")
 	}
 }

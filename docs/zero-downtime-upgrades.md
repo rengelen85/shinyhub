@@ -1,11 +1,13 @@
 ---
-description: "Upgrade or restart on SIGHUP without dropping live sessions or refusing connections, by re-execing the control plane in place."
+description: "Upgrade on SIGHUP with listener handoff and a separate drain budget for established app sessions."
 ---
 
 # Zero-downtime upgrades (systemd)
 
-ShinyHub can be upgraded or restarted without dropping live app sessions or
-refusing client connections. On `SIGHUP` the running control plane re-execs the
+ShinyHub hands new connections to a successor during a compatible upgrade.
+Existing app sessions keep using the retiring proxy until they close or its
+drain deadline expires; sessions still open at that deadline are disconnected.
+On `SIGHUP` the running control plane re-execs the
 new binary, hands off its listening sockets to the successor, drains in-flight
 WebSocket sessions, releases the ownership lease, and exits. App processes keep
 running throughout (`server.shutdown_apps: adopt`, the default).
@@ -87,8 +89,26 @@ systemctl reload shinyhub
 ```
 
 A continuous client sees no connection-refused gap; in-flight sessions drain on
-the old process for up to `server.drain_timeout` (default 60s) before any
+the old process for up to `server.reload_drain_timeout` (defaults to
+`server.drain_timeout`, normally 60s) before any
 straggler is force-closed.
+
+For a longer upgrade drain without extending app-version retirement:
+
+```yaml
+server:
+  drain_timeout: 10m
+  reload_drain_timeout: 8h
+```
+
+This setting is read by the retiring process at its own startup. Editing the
+file immediately before reload changes the successor's future drain budget,
+not the already-running parent's budget.
+
+This postpones the upgrade disconnect; it does not transfer existing sessions
+to the successor. The retiring proxy continues checking session authorization
+throughout its drain. A SIGINT/SIGTERM shortens a reload drain to at most the
+ordinary `drain_timeout`; it does not reset an earlier reload deadline.
 
 ## Tunables (`shinyhub.yaml`)
 
@@ -96,10 +116,32 @@ straggler is force-closed.
 |---|---|---|
 | `server.pid_file` | (empty) | PID file the ready process writes; required for systemd MAINPID tracking. |
 | `server.upgrade_timeout` | `60s` | How long the old process waits for the successor to become ready before aborting the upgrade and continuing to serve. |
-| `server.drain_timeout` | `60s` | How long to wait for live WebSocket sessions to close before force-closing them. |
+| `server.drain_timeout` | `60s` | App-generation retirement, replica removal, and ordinary service shutdown session drain. |
+| `server.reload_drain_timeout` | `server.drain_timeout` | Positive duration for established WebSockets on a retiring proxy after a successful reload. Environment override: `SHINYHUB_RELOAD_DRAIN_TIMEOUT`. |
 
 ## Notes & limits
 
+- **Repeated upgrades.** The listener handoff library refuses another upgrade
+  while the successor's parent is still alive. A long reload drain therefore
+  delays the next upgrade; wait for the retiring proxy to exit before reloading
+  again. It also retains that process's memory and database connection.
+- **Backend protection during handoff.** The successor cannot count sessions
+  still flowing through its parent. While that parent is alive, idle
+  hibernation and lifecycle mutations such as deploy, stop, resize and
+  non-rolling restart are fenced until the parent exits and recovery cleanup
+  finishes. Rolling restarts are accepted into the durable queue and wait. This deliberately trades lifecycle availability for session
+  continuity until cross-process session accounting is available.
+- **Multiplex scope.** Multiplex workers can be re-adopted. Elastic workers
+  (`grouped` and `per_session`) have process-local client bindings and are
+  rebuilt during recovery; a longer proxy drain does not preserve their
+  backend sessions.
+- **Service stop budget.** Set systemd `TimeoutStopSec` above your ordinary
+  `drain_timeout` plus HTTP and ownership shutdown (allow at least another
+  minute). For a ten-minute drain, a twelve-minute stop budget is appropriate.
+  The supervisor's termination policy can close sessions sooner than ShinyHub.
+- **App changes remain separate.** A deploy or schedule roll may retire the
+  backend an old proxy connection uses before the reload drain ends. The longer
+  reload budget does not extend that backend's generation deadline.
 - **Failure is safe.** If the successor fails to start within `upgrade_timeout`,
   the old process keeps serving - the upgrade simply does not happen.
 - **Startup preflight.** The handoff re-execs the process's own `argv[0]`, so at

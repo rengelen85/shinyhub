@@ -3027,8 +3027,9 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		LaunchReservationHeld: false,
 		// A stopped app is built and validated but not booted, so a broken
 		// bundle is still rejected here rather than at start time.
-		PrepareOnly: keepStopped,
-		Progress:    deployResponse.event,
+		PrepareOnly:       keepStopped,
+		PreparationIntent: deploy.PrepareKeepStopped,
+		Progress:          deployResponse.event,
 	}, app)
 	if groupedHandoff {
 		floor, floorErr := s.generationSlotFloor(app)
@@ -3067,6 +3068,10 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 	if needsPreactivationConfig {
 		prepared := deployParams
 		prepared.PrepareOnly = true
+		prepared.PreparationIntent = deploy.PrepareActivateNext
+		if generationHandoff {
+			prepared.PreparationIntent = deploy.PrepareWhileServing
+		}
 		result, err = s.deployRun(prepared)
 		if err == nil && len(prestartPlan.producers) > 0 {
 			// Commit the crash-recovery fence before admitting any producer. A hard
@@ -3962,6 +3967,7 @@ func (s *Server) handleRollbackApp(w http.ResponseWriter, r *http.Request) {
 	{
 		prepare := rollbackParams
 		prepare.PrepareOnly = true
+		prepare.PreparationIntent = deploy.PrepareActivateNext
 		result, err = s.deployRun(prepare)
 		if err == nil {
 			restored, restoreErr := s.store.RestoreDeploymentScheduleSnapshot(prev.ID, app.ID)
@@ -4213,6 +4219,10 @@ func (s *Server) handleRestartApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "process manager not available")
 		return
 	}
+	if r.URL.Query().Get("roll") == "true" {
+		s.handleEnqueueRollingRestart(w, r, app)
+		return
+	}
 
 	// Serialize against concurrent deploy/rollback/stop on the same slug.
 	// The active deployment MUST be read inside the lock: a deploy that wins
@@ -4255,28 +4265,6 @@ func (s *Server) handleRestartApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.URL.Query().Get("roll") == "true" {
-		if err := s.validateScheduleActivationForApp(app, "roll"); err != nil {
-			writeError(w, http.StatusUnprocessableEntity, err.Error())
-			return
-		}
-		if app.Status != "running" && app.Status != "degraded" {
-			writeError(w, http.StatusConflict, "rolling restart requires a running app; use apps start for a stopped or hibernated app")
-			return
-		}
-		if !current.Prepared {
-			writeError(w, http.StatusConflict, "rolling restart requires a prepared deployment; deploy the app first")
-			return
-		}
-		a, err := s.store.EnqueueRollingRestart(app, current)
-		if err != nil {
-			writeError(w, http.StatusConflict, "enqueue rolling restart: "+err.Error())
-			return
-		}
-		s.audit(r, "rolling_restart", "app", slug, fmt.Sprintf(`{"activation_id":%d}`, a.ID))
-		writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "slug": slug, "activation_id": a.ID, "drain_timeout_seconds": s.generationDrainTimeoutSeconds()})
-		return
-	}
 	if s.proxy != nil {
 		s.proxy.Deregister(slug)
 	}

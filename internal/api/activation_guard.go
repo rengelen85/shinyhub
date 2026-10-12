@@ -8,6 +8,7 @@ import (
 var errScheduleActivationInFlight = errors.New("scheduled data activation owns serving runtime state")
 var errCompatibilityQuarantined = errors.New("app is compatibility-quarantined")
 var errGenerationDraining = errors.New("previous generation is still draining")
+var errRetiringProxy = errors.New("previous ShinyHub process still proxies sessions; retry after its reload drain completes")
 
 // guardActivationLifecycle is called while the app's deploy lock is held.
 // The lock excludes an active Roll call; the durable query excludes mutations
@@ -15,6 +16,9 @@ var errGenerationDraining = errors.New("previous generation is still draining")
 // still owns runtime and routing state.
 func (s *Server) guardActivationLifecycle(appID int64, operation string) error {
 	if s.proxy != nil {
+		if s.proxy.RetiringParentAlive() {
+			return fmt.Errorf("%s: %w", operation, errRetiringProxy)
+		}
 		app, err := s.store.GetAppByID(appID)
 		if err != nil {
 			return fmt.Errorf("%s: inspect generation drain: %w", operation, err)

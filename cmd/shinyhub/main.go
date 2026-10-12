@@ -1109,7 +1109,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
 	defer signal.Stop(sighup)
-	upgrade.WireSignals(ctx, upg, sighup, logger)
+	upgradeSignals := upgrade.WireSignals(ctx, upg, sighup, logger)
 
 	// Fail fast on the commonest startup mistake, a second instance on a port
 	// something else already holds. The serving bind is the last thing this
@@ -1586,6 +1586,27 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	defer srv.Close()
 	srv.SetUsagePolicy(usagePolicy)
 	srv.SetVersion(version)
+	var retiringParentDone <-chan struct{}
+	var releaseRetiringParentFence func()
+	if upg.HasParent() {
+		done := make(chan struct{})
+		retiringParentDone = done
+		fence := make(chan struct{})
+		prx.SetRetiringParent(fence)
+		var releaseOnce sync.Once
+		releaseRetiringParentFence = func() { releaseOnce.Do(func() { close(fence) }) }
+		go func() {
+			if err := upg.WaitForParent(ctx); err != nil {
+				// Fail closed: an unconfirmed parent's sessions must not be
+				// mistaken for zero. No store access in this goroutine.
+				if ctx.Err() == nil {
+					logger.Error("cannot confirm retiring proxy exit; lifecycle changes remain fenced", "err", err)
+				}
+				return
+			}
+			close(done)
+		}()
+	}
 
 	// In clustered deployments every instance runs a pool syncer that
 	// reconciles the proxy's backend pools against the DB replica table.
@@ -2646,7 +2667,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		// Remove ShinyHub-managed containers no live replica re-adopted across
 		// every configured local container tier. Shared Docker daemons are
 		// deduplicated by endpoint.
-		if err := lifecycle.SweepOrphanContainersForTiers(mgr, cfg.Runtime.TierOrder()); err != nil {
+		if err := lifecycle.SweepOrphanContainersForTiersWithGenerations(store, mgr, cfg.Runtime.TierOrder()); err != nil {
 			// An orphan may still hold an old result cache namespace open, so
 			// pruning waits for the next deploy or retirement instead.
 			slog.Warn("container sweep incomplete; skipping startup result cache prune", "err", err)
@@ -2707,9 +2728,38 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		// owed; serve it now that this owner can boot pools. The scan retries
 		// through transient store failures, so it runs beside the owner's
 		// loops instead of delaying them.
-		safego.Go("relaunch owed redeploys", srv.RelaunchOwedRedeploys)
+		relaunchOwed := func() { safego.Go("relaunch owed redeploys", srv.RelaunchOwedRedeploys) }
+		if !prx.RetiringParentAlive() {
+			relaunchOwed()
+		}
 
 		var loops sync.WaitGroup
+		if retiringParentDone != nil && prx.RetiringParentAlive() {
+			// Recovery retains obsolete multiplex generations while the parent
+			// proxies them. Keep the lifecycle fence until cleanup finishes,
+			// so no new candidate or draining generation can enter this pass.
+			loops.Add(1)
+			go func() {
+				defer loops.Done()
+				runRetiringParentCleanup(octx, retiringParentDone, recoveryInputs.Apps,
+					srv.TryAcquireAppOperation, func(recovered *db.App) error {
+						app, err := store.GetAppByID(recovered.ID)
+						if errors.Is(err, db.ErrNotFound) {
+							return nil
+						}
+						if err != nil {
+							return err
+						}
+						// Parent exit is confirmed; the separate lifecycle fence
+						// stays held until every app in this pass is processed.
+						lifecycle.CleanupObsoleteDeploymentGenerations(store, mgr, nil, app)
+						return nil
+					}, func() {
+						releaseRetiringParentFence()
+						relaunchOwed()
+					})
+			}()
+		}
 		if monitor != nil {
 			loops.Add(1)
 			go func() { defer loops.Done(); monitor.Run(octx, monitorInterval) }()
@@ -3171,6 +3221,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	}
 	// Mark unready for both the signal and clean self-stop paths.
 	prx.SetDraining(true)
+	handedOff := upgradeSignals.SuccessfulHandoff()
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelShutdown()
@@ -3195,12 +3246,6 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		reporterCancel()
 		reporterWG.Wait()
 	}
-	// Stop re-authorizing live sessions before the drain below starts closing
-	// them, so the two are never racing over the same connections.
-	if recheckCancel != nil {
-		recheckCancel()
-		recheckWG.Wait()
-	}
 	// Stop the pool syncer (clustered only). Nil out the on-miss hook after
 	// the syncer goroutine exits so a late-arriving request cannot invoke
 	// SyncSlug with an already-cancelled context.
@@ -3223,12 +3268,26 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	// force-close stragglers. App backends (separate processes) remain alive
 	// during this window, so sessions keep flowing until drained or force-closed.
 	if n := prx.ActiveUpgradedConns(); n > 0 {
-		slog.Info("draining upgraded connections", "count", n, "timeout", cfg.Server.DrainTimeout)
-		if forced := prx.DrainUpgraded(cfg.Server.DrainTimeout); forced > 0 {
+		drainCtx := context.Background()
+		drainTimeout := cfg.Server.DrainTimeout
+		if handedOff && ctx.Err() == nil {
+			// The upgrader requested retirement after a successful handoff,
+			// rather than a SIGINT/SIGTERM service shutdown.
+			drainTimeout = cfg.Server.EffectiveReloadDrainTimeout()
+			drainCtx = ctx
+		}
+		slog.Info("draining upgraded connections", "count", n, "timeout", drainTimeout)
+		if forced := prx.DrainUpgradedForReload(drainCtx, drainTimeout, cfg.Server.DrainTimeout); forced > 0 {
 			slog.Warn("drain timeout reached, force-closed upgraded connections", "count", forced)
 		} else {
 			slog.Info("upgraded connections drained cleanly")
 		}
+	}
+	// Retiring proxies still enforce access revocations until their final
+	// connection closes. Join the sweep before its store is closed below.
+	if recheckCancel != nil {
+		recheckCancel()
+		recheckWG.Wait()
 	}
 	// The tracer closes after every span producer (lifecycle watcher, job
 	// runs, proxied requests and upgraded sessions) has stopped, so spans
@@ -3247,6 +3306,10 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 
 	switch cfg.Server.ShutdownApps {
 	case "stop":
+		if handedOff {
+			slog.Info("leaving app processes running for handoff successor despite server.shutdown_apps=stop")
+			break
+		}
 		slog.Info("stopping app processes (server.shutdown_apps=stop)")
 		if err := mgr.StopAll(); err != nil {
 			slog.Warn("stop app processes", "err", err)

@@ -1,11 +1,87 @@
 package proxy
 
 import (
+	"context"
 	"net"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestProxy_DrainUpgradedContextStopsLongReloadDrain(t *testing.T) {
+	p := New()
+	underlying := &stubConn{}
+	p.conns.track(underlying, ConnPrincipal{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() { done <- p.DrainUpgradedContext(ctx, 8*time.Hour) }()
+	cancel()
+	select {
+	case forced := <-done:
+		if forced != 1 || !underlying.isClosed() || p.ActiveUpgradedConns() != 0 {
+			t.Fatal("shutdown failed to close retained connection")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("service shutdown waited for reload budget")
+	}
+}
+
+func TestReloadDrainShrinksToShutdownGrace(t *testing.T) {
+	p := New()
+	underlying := &stubConn{}
+	p.conns.track(underlying, ConnPrincipal{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() { done <- p.DrainUpgradedForReload(ctx, time.Hour, 200*time.Millisecond) }()
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("SIGTERM immediately cut the reload sessions")
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case forced := <-done:
+		if forced != 1 || !underlying.isClosed() {
+			t.Fatal("shutdown grace failed to retire session")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown retained hour-long reload budget")
+	}
+}
+
+func TestRetiringParentProtectsIdleBackends(t *testing.T) {
+	p := New()
+	p.SetPoolSize("app", 1)
+	done := make(chan struct{})
+	p.SetRetiringParent(done)
+	if !p.RetiringParentAlive() || p.BeginHibernate("app", time.Now()) {
+		t.Fatal("successor hibernated a backend with unknown parent sessions")
+	}
+	close(done)
+	if p.RetiringParentAlive() || !p.BeginHibernate("app", time.Now()) {
+		t.Fatal("parent exit failed to restore ordinary hibernation")
+	}
+}
+
+func TestReloadDrainContinuesAuthorizationChecks(t *testing.T) {
+	p := New()
+	underlying := &stubConn{}
+	p.conns.track(underlying, ConnPrincipal{UserID: 1, Slug: "app"})
+	p.SetDraining(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		p.StartSessionRecheck(ctx, 10*time.Millisecond, func(ConnPrincipal) (bool, string, error) { return true, "user_revoked", nil })
+	}()
+	if forced := p.DrainUpgradedForReload(context.Background(), time.Second, 100*time.Millisecond); forced != 0 || !underlying.isClosed() {
+		t.Fatal("revocation was lost during reload drain")
+	}
+	cancel()
+	<-sweepDone
+}
 
 // stubConn is a no-op net.Conn whose Close records that it happened.
 type stubConn struct {

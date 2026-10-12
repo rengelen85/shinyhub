@@ -1051,9 +1051,9 @@ func newAppsRestartCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&f.roll, "roll", false, "Replace workers while serving traffic; defer if parallel capacity is unavailable")
 	cmd.Flags().BoolVar(&f.wait, "wait", false,
-		"After restarting, wait until the app is healthy again")
+		"Wait for restart completion (with --roll, includes old worker retirement)")
 	cmd.Flags().DurationVar(&f.waitTimeout, "wait-timeout", 300*time.Second,
-		"How long to wait for the app to become healthy when --wait is set")
+		"Maximum completion wait; with --roll, include any previous drain and retirement")
 	return cmd
 }
 

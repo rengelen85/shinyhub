@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+var ErrRollingRestartTargetChanged = errors.New("rolling restart target changed; retry against the current serving deployment")
+
 // EnqueueRollingRestart uses the durable activation queue without inventing a
 // data publication. A NULL run ID distinguishes forced process replacement
 // from a schedule activation whose data is already loaded by some replicas.
@@ -18,12 +20,47 @@ func (s *Store) EnqueueRollingRestart(app *App, deployment *Deployment) (*Schedu
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var busy int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM schedule_activations WHERE app_id=? AND status IN ('pending','deferred_interval','deferred_capacity','running','repairing')`, app.ID).Scan(&busy); err != nil {
+	// Admission never takes the app lifecycle lock: the coordinator owns
+	// execution serialization. Requests can coalesce only before execution;
+	// requests after a roll has started queue a fresh environment read.
+	// Resolve the source with the same legacy fallback as GetServingDeployment.
+	var currentID int64
+	err = tx.QueryRow(`SELECT d.id FROM deployments d JOIN apps a ON a.id=d.app_id
+ WHERE a.id=? AND a.slug=? AND d.status='succeeded'
+ ORDER BY CASE WHEN d.id=a.active_deployment_id THEN 0 ELSE 1 END, d.id DESC LIMIT 1`, app.ID, app.Slug).Scan(&currentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
 		return nil, err
 	}
-	if busy > 0 {
-		return nil, ErrScheduleActivationBusy
+	if currentID != deployment.ID || deployment.AppID != app.ID {
+		return nil, ErrRollingRestartTargetChanged
+	}
+	// Unstarted work has not read the environment and can safely absorb another
+	// request. Never reuse a started/waiting execution. Bound each app to one
+	// unstarted manual request; a stale one is replaced rather than accumulated.
+	var queuedID int64
+	err = tx.QueryRow(`SELECT id FROM schedule_activations WHERE app_id=?
+ AND schedule_run_id IS NULL AND status='pending' AND started_at IS NULL
+ ORDER BY id LIMIT 1`, app.ID).Scan(&queuedID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if err == nil {
+		queued, err := getActivationTx(ctx, tx, queuedID)
+		if err != nil {
+			return nil, err
+		}
+		if queued.SourceDeploymentID != nil && *queued.SourceDeploymentID == deployment.ID {
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return queued, nil
+		}
+		if _, err := tx.Exec(`UPDATE schedule_activations SET status='superseded',phase='complete',finished_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, time.Now().UTC(), queuedID); err != nil {
+			return nil, err
+		}
 	}
 	var generation int64
 	if err := tx.QueryRow(`SELECT COALESCE(MAX(generation),1) FROM app_data_publication WHERE app_id=?`, app.ID).Scan(&generation); err != nil {
@@ -34,7 +71,12 @@ func (s *Store) EnqueueRollingRestart(app *App, deployment *Deployment) (*Schedu
 	}
 	var id int64
 	err = tx.QueryRow(`INSERT INTO schedule_activations (app_id,app_slug,schedule_name,source_deployment_id,source_app_version,source_content_digest,action,roll_fallback,target_generation,status,phase,due_at)
- VALUES (?,?,'manual restart',?,?,?,'roll','defer',?,'pending','pending',?) RETURNING id`, app.ID, app.Slug, deployment.ID, deployment.Version, deployment.ContentDigest, generation, time.Now().UTC()).Scan(&id)
+ SELECT a.id,a.slug,'manual restart',d.id,d.version,d.content_digest,'roll','defer',?,'pending','pending',?
+ FROM apps a JOIN deployments d ON d.app_id=a.id
+ WHERE a.id=? AND a.slug=? AND d.id=? AND d.status='succeeded' RETURNING id`, generation, time.Now().UTC(), app.ID, app.Slug, deployment.ID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrRollingRestartTargetChanged
+	}
 	if err != nil {
 		return nil, err
 	}

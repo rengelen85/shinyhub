@@ -29,6 +29,15 @@ type RetryableError struct {
 	RetryAfter time.Duration
 }
 
+// WaitingError pauses new or reclaimed execution while an earlier generation
+// owns resources. Waiting must not exhaust the failed-rollout budget.
+type WaitingError struct {
+	Reason     string
+	RetryAfter time.Duration
+}
+
+func (e *WaitingError) Error() string { return e.Reason }
+
 // RepairRequiredError means a rollout crossed its first destructive boundary
 // and the fresh surge must remain available until every canonical route is
 // healthy again. It is retryable regardless of the ordinary attempt budget.
@@ -51,6 +60,7 @@ type Store interface {
 	ClaimNextScheduleActivation(now time.Time) (*db.ScheduleActivation, error)
 	FinishScheduleActivation(id int64, status, lastError string, finishedAt time.Time, countAttempt bool) error
 	DeferScheduleActivation(id int64, status, reason string, dueAt, deferredAt time.Time) error
+	WaitScheduleActivation(id int64, reason string, dueAt time.Time) error
 }
 
 type Runner interface {
@@ -142,6 +152,17 @@ func (c *Coordinator) ProcessNext(ctx context.Context) (bool, error) {
 	case errors.Is(runErr, ErrTargetDeleted):
 		status = "target_deleted"
 	case runErr != nil:
+		var waiting *WaitingError
+		if errors.As(runErr, &waiting) {
+			retry := waiting.RetryAfter
+			if retry <= 0 {
+				retry = 5 * time.Second
+			}
+			if err := c.store.WaitScheduleActivation(a.ID, waiting.Reason, finishedAt.Add(retry)); err != nil {
+				return true, fmt.Errorf("wait activation %d: %w", a.ID, err)
+			}
+			return true, nil
+		}
 		var capacity *CapacityError
 		if errors.As(runErr, &capacity) {
 			capacityDeferredAt := finishedAt

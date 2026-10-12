@@ -444,6 +444,9 @@ type (
 
 // Proxy routes /app/:slug/* to the registered backend pool for that slug.
 type Proxy struct {
+	// retiringParent is wired once before startup recovery. Until it exits,
+	// local counters cannot prove that adopted workers have no sessions.
+	retiringParent <-chan struct{}
 	// cancelElasticLifetime only cancels a timer; called under mu and must not
 	// call back into the proxy or wait for an app operation.
 	cancelElasticLifetime func(string, int)
@@ -2205,6 +2208,9 @@ func (p *Proxy) RetireGeneration(slug string, deploymentID int64) bool {
 // through its active-connection increment, so a sticky request cannot slip in
 // between the idle check and route removal.
 func (p *Proxy) TryRetireGeneration(slug string, deploymentID int64) bool {
+	if p.RetiringParentAlive() {
+		return false
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pool := p.pools[slug]
@@ -2716,6 +2722,9 @@ func (p *Proxy) RegisteredSlugs() map[string]struct{} {
 // while activeConns catches a request that has already picked a replica but
 // has not yet completed.
 func (p *Proxy) BeginHibernate(slug string, since time.Time) bool {
+	if p.RetiringParentAlive() {
+		return false
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.seenMu.Lock()

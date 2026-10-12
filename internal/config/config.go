@@ -544,6 +544,11 @@ type ServerConfig struct {
 	// long-lived sessions should raise it. Defaults to 60s.
 	DrainTimeout time.Duration `yaml:"drain_timeout"`
 
+	// ReloadDrainTimeout bounds established connections on the retiring proxy
+	// after a successful SIGHUP handoff. Omitted means DrainTimeout, preserving
+	// existing shutdown behavior without extending app-generation retirement.
+	ReloadDrainTimeout *time.Duration `yaml:"reload_drain_timeout"`
+
 	// UpgradeTimeout bounds how long the old process waits for a new one to
 	// signal Ready during a zero-downtime upgrade (SIGHUP) before aborting the
 	// upgrade and continuing to serve. Defaults to 60s.
@@ -673,6 +678,18 @@ type ServerConfig struct {
 	// On by default. A pointer so an operator who wants WebSocket bytes relayed
 	// untouched, or who would rather spend no CPU on them, can turn it off.
 	WebSocketCompression *bool `yaml:"websocket_compression"`
+}
+
+// EffectiveReloadDrainTimeout preserves the app drain budget when the
+// reload-specific override is omitted.
+func (s *ServerConfig) EffectiveReloadDrainTimeout() time.Duration {
+	if s.ReloadDrainTimeout != nil {
+		return *s.ReloadDrainTimeout
+	}
+	if s.DrainTimeout > 0 {
+		return s.DrainTimeout
+	}
+	return time.Minute
 }
 
 // StatusOverlayEnabled reports whether app page loads get the status overlay.
@@ -1805,6 +1822,9 @@ func loadRaw(path string) (*Config, error) {
 	}
 	if cfg.Server.DrainTimeout <= 0 {
 		cfg.Server.DrainTimeout = 60 * time.Second
+	}
+	if cfg.Server.ReloadDrainTimeout != nil && *cfg.Server.ReloadDrainTimeout <= 0 {
+		return nil, fmt.Errorf("server.reload_drain_timeout must be positive")
 	}
 	if cfg.Server.StopGrace <= 0 {
 		cfg.Server.StopGrace = 10 * time.Second
@@ -3035,6 +3055,13 @@ func applyEnv(cfg *Config) error {
 			return fmt.Errorf("SHINYHUB_UPGRADE_TIMEOUT must be positive, got %q", v)
 		}
 		cfg.Server.UpgradeTimeout = d
+	}
+	if v := os.Getenv("SHINYHUB_RELOAD_DRAIN_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("SHINYHUB_RELOAD_DRAIN_TIMEOUT must be a positive duration, got %q", v)
+		}
+		cfg.Server.ReloadDrainTimeout = &d
 	}
 	if v := os.Getenv("SHINYHUB_SESSION_RECHECK_INTERVAL"); v != "" {
 		d, perr := time.ParseDuration(v)

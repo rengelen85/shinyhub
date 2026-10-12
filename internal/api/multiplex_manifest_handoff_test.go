@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/rvben/shinyhub/internal/deploy"
+	"github.com/rvben/shinyhub/internal/deployevent"
 )
 
 func TestDeploy_MultiplexManifestHandoff(t *testing.T) {
@@ -146,7 +147,17 @@ on_success = "roll"
 			revision := appResourceRevision(before)
 			var readinessChecks atomic.Int32
 			var oldRouteLost atomic.Bool
+			var preparationMessage atomic.Value
 			srv.SetDeployRunForTest(func(p deploy.Params) (*deploy.PoolResult, error) {
+				progress := p.Progress
+				p.Progress = func(event deployevent.Event) {
+					if strings.HasPrefix(event.Message, "Bundle prepared") {
+						preparationMessage.Store(event.Message)
+					}
+					if progress != nil {
+						progress(event)
+					}
+				}
 				if p.GenerationScoped != tc.handoff {
 					return nil, fmt.Errorf("generation-scoped deploy = %v, want %v", p.GenerationScoped, tc.handoff)
 				}
@@ -184,6 +195,9 @@ on_success = "roll"
 				t.Fatal(err)
 			}
 			if tc.status == http.StatusOK {
+				if tc.handoff && preparationMessage.Load() != "Bundle prepared; current version continues serving" {
+					t.Fatalf("handoff output misreported serving state: %v", preparationMessage.Load())
+				}
 				if active.DeploymentID == previous.DeploymentID {
 					t.Fatal("candidate not promoted")
 				}

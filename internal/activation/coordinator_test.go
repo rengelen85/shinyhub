@@ -40,6 +40,12 @@ func (f *fakeStore) DeferScheduleActivation(_ int64, status, _ string, dueAt, _ 
 	return nil
 }
 
+func (f *fakeStore) WaitScheduleActivation(_ int64, _ string, dueAt time.Time) error {
+	f.deferred = append(f.deferred, "pending")
+	f.deferredDueAt = append(f.deferredDueAt, dueAt)
+	return nil
+}
+
 type fakeRunner struct{ err error }
 
 func (r fakeRunner) Roll(context.Context, *db.ScheduleActivation) error { return r.err }
@@ -60,6 +66,7 @@ func (*failingClaimStore) FinishScheduleActivation(int64, string, string, time.T
 func (*failingClaimStore) DeferScheduleActivation(int64, string, string, time.Time, time.Time) error {
 	return nil
 }
+func (*failingClaimStore) WaitScheduleActivation(int64, string, time.Time) error { return nil }
 
 func TestCoordinatorMapsRuntimeOutcomesToDurableActivationStates(t *testing.T) {
 	tests := []struct {
@@ -76,6 +83,7 @@ func TestCoordinatorMapsRuntimeOutcomesToDurableActivationStates(t *testing.T) {
 		{name: "newer bundle", runErr: ErrSuperseded, wantFinish: "superseded"},
 		{name: "capacity", runErr: &CapacityError{Reason: "memory floor", RetryAfter: time.Minute}, wantDefer: "deferred_capacity"},
 		{name: "transient", runErr: &RetryableError{Reason: "temporary boot failure"}, wantDefer: "pending"},
+		{name: "previous drain", runErr: &WaitingError{Reason: "previous generation is still draining"}, wantDefer: "pending"},
 		{name: "repair", runErr: &RepairRequiredError{Reason: "surge owns the safety route"}, wantDefer: "repairing"},
 		{name: "runtime failure", runErr: errors.New("health timeout"), wantFinish: "failed", wantErr: true},
 	}

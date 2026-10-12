@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ func (s stubUpgrader) Upgrade() error                              { return nil 
 func (s stubUpgrader) Exit() <-chan struct{}                       { return nil }
 func (s stubUpgrader) Stop()                                       {}
 func (s stubUpgrader) HasParent() bool                             { return s.hasParent }
+func (s stubUpgrader) WaitForParent(context.Context) error         { return nil }
 
 var _ upgrade.Upgrader = stubUpgrader{}
 

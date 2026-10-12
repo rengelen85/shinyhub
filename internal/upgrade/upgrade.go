@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/tableflip"
@@ -36,6 +37,8 @@ type Upgrader interface {
 	// HasParent reports whether this process was started by an upgrade handoff
 	// and therefore inherits its listeners from a parent that is still bound.
 	HasParent() bool
+	// WaitForParent returns once a handoff parent's process has exited.
+	WaitForParent(context.Context) error
 	// Stop disables further upgrades and closes Exit.
 	Stop()
 }
@@ -50,13 +53,35 @@ func New(timeout time.Duration, pidFile string) (Upgrader, error) {
 	})
 }
 
+// SignalState records whether shutdown follows a successful upgrade.
+type SignalState struct {
+	mu       sync.Mutex
+	inFlight chan struct{}
+	handoff  bool
+}
+
+// SuccessfulHandoff waits for any pending Upgrade result. The library may
+// close Exit before the signal goroutine has received that result.
+func (s *SignalState) SuccessfulHandoff() bool {
+	s.mu.Lock()
+	done := s.inFlight
+	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handoff
+}
+
 // WireSignals connects process signals to the upgrader lifecycle and returns
 // immediately (it launches one goroutine per concern):
 //   - each value on sighup triggers a zero-downtime Upgrade; a failed upgrade is
 //     logged and the current process keeps serving.
 //   - ctx cancellation (SIGINT/SIGTERM via signal.NotifyContext) calls Stop,
 //     which closes Exit so the main loop proceeds to graceful shutdown.
-func WireSignals(ctx context.Context, upg Upgrader, sighup <-chan os.Signal, log *slog.Logger) {
+func WireSignals(ctx context.Context, upg Upgrader, sighup <-chan os.Signal, log *slog.Logger) *SignalState {
+	state := &SignalState{}
 	// SIGHUP loop: triggers an upgrade per signal, and exits on ctx cancellation
 	// so the goroutine does not outlive the server.
 	go func() {
@@ -69,7 +94,16 @@ func WireSignals(ctx context.Context, upg Upgrader, sighup <-chan os.Signal, log
 					return
 				}
 				log.Info("SIGHUP received, starting zero-downtime upgrade")
-				if err := upg.Upgrade(); err != nil {
+				state.mu.Lock()
+				done := make(chan struct{})
+				state.inFlight = done
+				state.mu.Unlock()
+				err := upg.Upgrade()
+				state.mu.Lock()
+				state.handoff = state.handoff || err == nil
+				close(done)
+				state.mu.Unlock()
+				if err != nil {
 					log.Error("zero-downtime upgrade failed; continuing to serve", "err", err)
 					continue
 				}
@@ -83,6 +117,7 @@ func WireSignals(ctx context.Context, upg Upgrader, sighup <-chan os.Signal, log
 		<-ctx.Done()
 		upg.Stop()
 	}()
+	return state
 }
 
 // NotifyReady tells systemd (Type=notify) that this process is the live service:

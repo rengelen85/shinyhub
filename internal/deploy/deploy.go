@@ -560,6 +560,9 @@ type Params struct {
 	// deploy time while leaving the app down. The returned PoolResult carries no
 	// replicas.
 	PrepareOnly bool
+	// PreparationIntent describes the serving state during a prepare-only run.
+	// Its zero value makes no claim about whether an app is serving or stopped.
+	PreparationIntent PreparationIntent
 	// Progress receives safe, user-facing lifecycle updates. Run may call it
 	// concurrently while replicas boot; callers must serialize their sink.
 	Progress func(deployevent.Event)
@@ -1304,7 +1307,8 @@ func Run(p Params) (res *PoolResult, err error) {
 		if perr != nil {
 			return nil, perr
 		}
-		p.report(deployevent.Phase("replicas", deployevent.StatusCompleted, "Bundle prepared; app remains stopped"))
+		message := p.PreparationIntent.message()
+		p.report(deployevent.Phase("replicas", deployevent.StatusCompleted, message))
 		slog.Info("deploy: bundle prepared without starting it",
 			"slug", p.Slug,
 			"hooks_declared", res.HooksDeclared, "hooks_run", res.HooksRun,

@@ -414,7 +414,7 @@ func RecoverProcesses(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, d
 
 		reps, err := store.ListReplicas(app.ID)
 		if err != nil || len(reps) == 0 {
-			cleanupObsoleteDeploymentGenerations(store, mgr, app)
+			CleanupObsoleteDeploymentGenerations(store, mgr, prx, app)
 			markRecoveryStopped(store, app.Slug)
 			continue
 		}
@@ -570,7 +570,7 @@ func RecoverProcesses(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, d
 		if !anyAlive && !indeterminate && !healable {
 			markRecoveryDown(store, app.Slug)
 		}
-		cleanupObsoleteDeploymentGenerations(store, mgr, app)
+		CleanupObsoleteDeploymentGenerations(store, mgr, prx, app)
 	}
 
 	parkStrandedReplicas(store)
@@ -672,11 +672,14 @@ func reconcileDeploymentGenerationProjection(store *db.Store, app *db.App) bool 
 	return true
 }
 
-// cleanupObsoleteDeploymentGenerations runs after authoritative projection
+// CleanupObsoleteDeploymentGenerations runs after authoritative projection
 // reconciliation, even if no active process could be adopted. Each ledger is
 // deleted as a unit only when every recorded native identity is confirmed gone;
 // failures remain durable and block another handoff until a later recovery.
-func cleanupObsoleteDeploymentGenerations(store *db.Store, mgr *process.Manager, app *db.App) {
+func CleanupObsoleteDeploymentGenerations(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, app *db.App) {
+	if prx != nil && prx.RetiringParentAlive() {
+		return
+	}
 	rows, err := store.ListDeploymentReplicas(app.ID)
 	if err != nil {
 		slog.Error("generation recovery: list cleanup identities", "slug", app.Slug, "err", err)
@@ -1575,11 +1578,39 @@ func FenceOrphanScheduleContainersForTiers(mgr *process.Manager, tierNames []str
 	return nil
 }
 
+// SweepOrphanContainersForTiersWithGenerations protects durable generation
+// identities as well as adopted workers. Ledger cleanup owns their retirement;
+// the broad sweep must not destroy a parent-held generation or an unconfirmed
+// cleanup identity. Failure to read that ledger prevents destructive sweeping.
+func SweepOrphanContainersForTiersWithGenerations(store *db.Store, mgr *process.Manager, tierNames []string) error {
+	protected := make(map[string]bool)
+	apps, err := store.ListApps(0, 0)
+	if err != nil {
+		return fmt.Errorf("load generation container owners: %w", err)
+	}
+	for _, app := range apps {
+		rows, err := store.ListDeploymentReplicas(app.ID)
+		if err != nil {
+			return fmt.Errorf("load generation identities for %s: %w", app.Slug, err)
+		}
+		for _, row := range rows {
+			if row.WorkerID != "" {
+				protected[row.WorkerID] = true
+			}
+		}
+	}
+	return sweepOrphanContainersForTiers(mgr, tierNames, protected)
+}
+
 // SweepOrphanContainersForTiers sweeps every registered container-backed tier.
 // It complements durable per-replica recovery; it is not ownership proof. The
 // error joins every tier's failure, so a caller can tell that an orphan may
 // still be running.
 func SweepOrphanContainersForTiers(mgr *process.Manager, tierNames []string) error {
+	return sweepOrphanContainersForTiers(mgr, tierNames, nil)
+}
+
+func sweepOrphanContainersForTiers(mgr *process.Manager, tierNames []string, protected map[string]bool) error {
 	if len(tierNames) == 0 {
 		tierNames = []string{""}
 	}
@@ -1598,7 +1629,7 @@ func SweepOrphanContainersForTiers(mgr *process.Manager, tierNames []string) err
 				seenScopes[scope] = struct{}{}
 			}
 		}
-		if err := SweepOrphanContainers(mgr, sweeper); err != nil {
+		if err := sweepOrphanContainers(mgr, sweeper, protected); err != nil {
 			errs = append(errs, fmt.Errorf("tier %q: %w", tierName, err))
 		}
 	}
@@ -1614,6 +1645,10 @@ func SweepOrphanContainersForTiers(mgr *process.Manager, tierNames []string) err
 // listing failure or any orphan that could not be removed, each of which
 // leaves an unowned container possibly still running.
 func SweepOrphanContainers(mgr *process.Manager, sweeper ContainerSweeper) error {
+	return sweepOrphanContainers(mgr, sweeper, nil)
+}
+
+func sweepOrphanContainers(mgr *process.Manager, sweeper ContainerSweeper, protected map[string]bool) error {
 	if sweeper == nil {
 		return nil
 	}
@@ -1626,7 +1661,7 @@ func SweepOrphanContainers(mgr *process.Manager, sweeper ContainerSweeper) error
 	live := mgr.RunningContainerIDs()
 	removed := 0
 	for _, c := range containers {
-		if live[c.ID] {
+		if live[c.ID] || protected[c.ID] {
 			continue
 		}
 		if err := sweeper.RemoveHandle(process.RunHandle{ContainerID: c.ID}); err != nil {
