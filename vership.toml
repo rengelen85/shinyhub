@@ -1,5 +1,7 @@
 [project]
-type = "go"
+# The release version lives in package.json. Go mode reads the latest tag and
+# cannot finish a prepared bump; explicit checks below still validate Go.
+type = "node"
 branch = "main"
 
 [changelog]

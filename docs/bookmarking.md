@@ -279,7 +279,12 @@ four-filter app.
 ## Update hidden dashboards automatically
 
 Filter-only dashboards can opt into switching to a newly deployed generation
-while their tab is hidden. In the app's `shinyhub.toml`:
+while their tab is hidden.
+
+Use ShinyHub 0.20.4 or later and `shinyhub-bookmarks` 0.5.3 or later. Older
+adapters do not advertise the pending-sync protocol, so switching stays manual.
+
+In the app's `shinyhub.toml`:
 
 ```toml
 [app]

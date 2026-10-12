@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.20.4](https://github.com/rvben/shinyhub/compare/v0.20.3...v0.20.4) - 2026-10-12
+
+### Added
+
+- **upgrade**: opt into `server.reload_sessions: preserve` to keep WebSocket sessions across repeated compatible hub reloads for stable single-host SQLite/native multiplex apps. Authorization, usage recording and exact backend accounting continue through the current owner. Reloads during app transitions or at the relay limit are refused; ordinary app-replacement deadlines still apply. Configure this on the running parent before the reload whose sessions must survive.
+- **lifecycle**: allow compatible deploys and rolls to overlap draining app generations, routing new clients to the newest healthy version while existing sessions retain their original retirement deadline.
+- **appnav**: opt filter-only multiplex dashboards into `version_switch = "when_hidden"`. After a continuous hidden grace period, restore registered filters from the URL on the new version and show an update notice. Require completed restoration, saved filters and no pending sync or work blockers. This needs `shinyhub-bookmarks >= 0.5.3`; manual switching remains the default and unregistered state is not preserved.
+- **lifecycle**: configure `server.reload_drain_timeout` independently of app retirement, queue rolling restarts behind incompatible drains, and return joined activation IDs immediately so `--wait` can follow them.
+- **demo**: record bounded wake decisions and outcomes ([eb755b3](https://github.com/rvben/shinyhub/commit/eb755b36330a60a60261866487ab351c91488e0e))
+
+### Fixed
+
+- **proxy**: briefly queue HTML render admission during reconnect bursts, and finish already-accepted requests before listener shutdown to avoid failed loads during handoff.
+- **deploy**: describe an available serving version accurately while a replacement bundle is prepared.
+- **bookmarks**: publish adapter 0.5.3 with pending-sync and restoration capabilities for safe automatic version switching. Mark changed inputs pending before debounce or URL persistence, and treat uncertain state conservatively.
+- **demo**: allow only known routes through the edge ([56e6f12](https://github.com/rvben/shinyhub/commit/56e6f12662fbb743003bc56e9e1d2673843340fd))
+- **demo**: reject disabled OAuth probes before container access ([d00f218](https://github.com/rvben/shinyhub/commit/d00f218f56c8b3da7834222f896261540b66ab55))
+
 ## [0.20.3](https://github.com/rvben/shinyhub/compare/v0.20.2...v0.20.3) - 2026-10-09
 
 ### Added
