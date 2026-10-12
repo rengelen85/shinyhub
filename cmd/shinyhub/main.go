@@ -439,6 +439,7 @@ func serverConfigPath() string {
 
 func init() {
 	cli.SetVersion(version)
+	reloadCmd.Flags().DurationVar(&reloadWait, "wait", 0, "Wait up to this duration for temporary transitions before reloading (0..24h)")
 	serveCmd.Flags().BoolVar(&serveNoBrowser, "no-browser", false, "Do not open a browser after interactive first-run setup")
 	backupCmd.Flags().StringVar(&backupOut, "out", "", "Destination archive path (.tar.gz)")
 	_ = backupCmd.MarkFlagRequired("out")
@@ -447,7 +448,7 @@ func init() {
 		"Confirm every old server and listed job process tree is stopped, then record uncertainty and clear the fence")
 	restoreCmd.Flags().Bool("force", false, "Restore even if a running server is detected (only after confirming the server is stopped)")
 	const configUsage = "Path to the server config file (overrides SHINYHUB_CONFIG; default ./shinyhub.yaml)"
-	for _, c := range []*cobra.Command{serveCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd} {
+	for _, c := range []*cobra.Command{serveCmd, reloadCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd} {
 		c.Flags().StringVar(&configPath, "config", "", configUsage)
 	}
 }
@@ -459,7 +460,7 @@ var buildRootOnce sync.Once
 // tests to call; registration happens exactly once per process.
 func buildRoot() *cobra.Command {
 	buildRootOnce.Do(func() {
-		rootCmd.AddCommand(newRelayProtocolCmd(), newInitCmd(), serveCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd, newHealthcheckCmd(), newWorkerCmd(), newSandboxCmd())
+		rootCmd.AddCommand(newRelayProtocolCmd(), newInitCmd(), serveCmd, reloadCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd, newHealthcheckCmd(), newWorkerCmd(), newSandboxCmd())
 		cli.AddCommandsTo(rootCmd)
 	})
 	return rootCmd
@@ -3255,63 +3256,89 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		})
 		upg.(*upgrade.RepeatableUpgrader).EnableRelayHandoff()
 	}
-	checkRelayUpgrade := func() error {
+	checkRelayUpgrade := func(probe bool) error {
 		_, live, unknown := relayLeases.Snapshot()
 		if unknown {
 			return errors.New("cannot verify retained relay leases; upgrade refused")
 		}
-		if cfg.Server.ReloadSessions == "preserve" && live >= cfg.Server.ReloadRelayLimit {
-			return errors.New("reload relay limit reached; wait for retained sessions to finish")
-		}
-		if live > 0 || cfg.Server.ReloadSessions == "preserve" {
-			probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			err := upgrade.CheckRelaySuccessor(probeCtx)
-			cancel()
+		if cfg.Server.ReloadSessions == "preserve" {
+			var blockers []string
+			temporary := true
+			if live >= cfg.Server.ReloadRelayLimit {
+				blockers = append(blockers, "reload relay limit reached; wait for retained sessions to finish")
+			}
+			if serveOpts.FirstRun != nil {
+				blockers = append(blockers, "first-run setup must finish")
+				temporary = false
+			}
+			poolBlockers, poolTemporary := prx.RelayUpgradeBlockers()
+			blockers = append(blockers, poolBlockers...)
+			temporary = temporary && poolTemporary
+			if len(poolBlockers) == 0 {
+				if _, stable := prx.RelaySnapshot(); !stable {
+					blockers = append(blockers, "upgraded connection does not match a stable active replica")
+				}
+			}
+			apps, err := store.ListAppsLean(0, 0)
 			if err != nil {
 				return err
 			}
+			for _, app := range apps {
+				inFlight, err := store.ScheduleActivationInFlight(app.ID)
+				if err != nil {
+					return err
+				}
+				if inFlight {
+					blockers = append(blockers, fmt.Sprintf("%s: serving activation in progress", app.Slug))
+				}
+			}
+			if len(blockers) > 0 {
+				reason := "session-preserving reload blocked: " + strings.Join(blockers, "; ")
+				if temporary {
+					return &upgrade.TransitionError{Reason: reason}
+				}
+				return errors.New(reason)
+			}
 		}
-		if cfg.Server.ReloadSessions != "preserve" {
+		if !probe || (live == 0 && cfg.Server.ReloadSessions != "preserve") {
 			return nil
 		}
-		if serveOpts.FirstRun != nil {
-			return errors.New("session-preserving reload requires first-run setup to finish")
-		}
-		if _, stable := prx.RelaySnapshot(); !stable {
-			return errors.New("session-preserving reload waits for app transitions to finish")
-		}
-		apps, err := store.ListAppsLean(0, 0)
-		if err != nil {
-			return err
-		}
-		for _, app := range apps {
-			inFlight, err := store.ScheduleActivationInFlight(app.ID)
-			if err != nil {
-				return err
-			}
-			if inFlight {
-				return errors.New("session-preserving reload waits for serving activations to finish")
-			}
-		}
-		return nil
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return upgrade.CheckRelaySuccessor(probeCtx)
 	}
 	upg.(*upgrade.RepeatableUpgrader).SetUpgradeGuard(func() (func(), error) {
+		// Observe known blockers without fencing the fleet on every wait tick.
+		// Recheck after pausing to close the admission race before probing.
+		if err := checkRelayUpgrade(false); err != nil {
+			return nil, err
+		}
 		if cfg.Server.ReloadSessions != "preserve" {
 			_, live, unknown := relayLeases.Snapshot()
 			if live == 0 && !unknown {
-				return nil, checkRelayUpgrade()
+				return nil, checkRelayUpgrade(true)
 			}
 		}
 		release, ok := srv.TryPauseAppOperations()
 		if !ok {
-			return nil, errors.New("session-preserving reload waits for admitted app operations")
+			return nil, &upgrade.TransitionError{Reason: "session-preserving reload waits for admitted app operations"}
 		}
-		if err := checkRelayUpgrade(); err != nil {
+		if err := checkRelayUpgrade(true); err != nil {
 			release()
 			return nil, err
 		}
 		return release, nil
 	})
+	var reloadStartupReady atomic.Bool
+	reloadReady := reloadReadyPredicate(isClustered(cfg), prx, reloadStartupReady.Load, elector.IsOwner, ownerAndReady, srv.AppOperationsPaused)
+	stopReloadControl, err := upgrade.StartReloadControl(ctx, cfg.Server.PIDFile, cfg.Server.UpgradeTimeout, upg, upgradeSignals, reloadReady, logger)
+	if err != nil {
+		// An optional acknowledgement endpoint must not turn a compatible cold
+		// start into an outage. Signals still work; the command fails clearly.
+		logger.Error("acknowledged reload unavailable; use SIGHUP until the control socket configuration is corrected", "err", err)
+		stopReloadControl = func() {}
+	}
+	defer stopReloadControl()
 	if err := upg.Ready(); err != nil {
 		_ = httpSrv.Close()
 		if metricsSrv != nil {
@@ -3338,6 +3365,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	if relayRPC != nil {
 		relayRPC.Commit()
 	}
+	reloadStartupReady.Store(true)
 	startFirstRunExperience(ctx, logger, srv.Router(), store, cfg, ownerAndReady, serveOpts)
 
 	select {
@@ -3352,6 +3380,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	// Mark unready for both the signal and clean self-stop paths.
 	prx.SetDraining(true)
 	handedOff := upgradeSignals.SuccessfulHandoff()
+	stopReloadControl()
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelShutdown()

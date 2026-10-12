@@ -3,9 +3,11 @@ package proxy
 import (
 	"net"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/rvben/shinyhub/internal/config"
 	"github.com/rvben/shinyhub/internal/upgrade"
 )
 
@@ -61,6 +63,11 @@ func TestRelayCountsProtectGenerationAndExactReplacement(t *testing.T) {
 	if err := p.RegisterReplica("dashboard", 0, backend.TargetURL, nil, 7); err != nil {
 		t.Fatal(err)
 	}
+	seedServedAt(p, "dashboard", 2*wsWarnGrace)
+	p.RecordActivity("dashboard")
+	if ever, warning := p.ConnectivityHealth("dashboard"); !ever || warning {
+		t.Fatalf("relayed connectivity = %t, %t", ever, warning)
+	}
 	if p.ReplicaSessionCounts("dashboard")[0] != 2 {
 		t.Fatal("relay sessions omitted from admission")
 	}
@@ -79,6 +86,9 @@ func TestRelayCountsProtectGenerationAndExactReplacement(t *testing.T) {
 	if _, err := p.ActivateGeneration("dashboard", 8); err != nil {
 		t.Fatal(err)
 	}
+	if blockers, temporary := p.RelayUpgradeBlockers(); !temporary || len(blockers) != 1 || blockers[0] != "dashboard: draining generation" {
+		t.Fatalf("blockers = %v", blockers)
+	}
 	if p.TryRetireGeneration("dashboard", 7) {
 		t.Fatal("old generation retired over relay sessions")
 	}
@@ -90,5 +100,21 @@ func TestRelayCountsProtectGenerationAndExactReplacement(t *testing.T) {
 	}
 	if !p.TryRetireGeneration("dashboard", 7) {
 		t.Fatal("released relay blocked retirement")
+	}
+}
+
+func TestRelayUpgradeBlockersNamesAndClassifiesAllPools(t *testing.T) {
+	p := New()
+	p.SetPoolMode("elastic", config.IsolationPerSession, 1, 4)
+	p.SetPoolSize("candidate", 1)
+	if err := p.RegisterReplica("candidate", 0, "http://localhost:1234", nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.StageGeneration("candidate", 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	blockers, temporary := p.RelayUpgradeBlockers()
+	if temporary || !reflect.DeepEqual(blockers, []string{"candidate: candidate generation", "elastic: elastic pool"}) {
+		t.Fatalf("blockers = %v, temporary=%t", blockers, temporary)
 	}
 }

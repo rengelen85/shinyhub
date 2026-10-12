@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -229,6 +231,30 @@ func (p *Proxy) relaySessions(slug string, deploymentID int64, index int, target
 
 func (p *Proxy) HasRelaySessions(slug string, deploymentID int64) bool {
 	return p.relaySessions(slug, deploymentID, -1, "") > 0
+}
+
+// RelayUpgradeBlockers names pools that cannot safely enter relay mode. The
+// second result is true only when every blocker can clear without changing
+// configuration; elastic pools are permanent blockers.
+func (p *Proxy) RelayUpgradeBlockers() ([]string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var blockers []string
+	temporary := true
+	for slug, pool := range p.pools {
+		if poolIsElastic(pool) {
+			temporary = false
+			blockers = append(blockers, fmt.Sprintf("%s: elastic pool", slug))
+		}
+		if len(pool.drainingGenerations) > 0 {
+			blockers = append(blockers, fmt.Sprintf("%s: draining generation", slug))
+		}
+		if len(pool.candidates) > 0 {
+			blockers = append(blockers, fmt.Sprintf("%s: candidate generation", slug))
+		}
+	}
+	sort.Strings(blockers)
+	return blockers, temporary
 }
 
 // RelaySnapshot returns exact upgraded-connection identities. Only multiplex

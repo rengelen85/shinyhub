@@ -246,8 +246,34 @@ func (u *RepeatableUpgrader) WaitForParent(ctx context.Context) error {
 	return u.parentErr
 }
 
+// upgradeAdmissionLocked checks state before the guard pauses app operations.
+// It is repeated after the guard in case shutdown or another upgrade intervenes.
+func (u *RepeatableUpgrader) upgradeAdmissionLocked() error {
+	select {
+	case <-u.stopped:
+		return errors.New("terminating")
+	default:
+	}
+	if u.inFlight || u.upgraded {
+		return errors.New("upgrade already in progress or completed")
+	}
+	if !u.ready {
+		return &TransitionError{Reason: "upgrade is not ready"}
+	}
+	select {
+	case <-u.parentDone:
+	default:
+		return &TransitionError{Reason: "parent control plane has not retired"}
+	}
+	return u.parentErr
+}
+
 func (u *RepeatableUpgrader) Upgrade() (result error) {
 	u.mu.Lock()
+	if err := u.upgradeAdmissionLocked(); err != nil {
+		u.mu.Unlock()
+		return err
+	}
 	guard := u.guard
 	failure := u.upgradeFailure
 	u.mu.Unlock()
@@ -266,25 +292,9 @@ func (u *RepeatableUpgrader) Upgrade() (result error) {
 		}
 	}()
 	u.mu.Lock()
-	if !u.ready || u.inFlight || u.upgraded {
+	if err := u.upgradeAdmissionLocked(); err != nil {
 		u.mu.Unlock()
-		return errors.New("upgrade is not ready or already in progress")
-	}
-	select {
-	case <-u.stopped:
-		u.mu.Unlock()
-		return errors.New("terminating")
-	default:
-	}
-	select {
-	case <-u.parentDone:
-	default:
-		u.mu.Unlock()
-		return errors.New("parent control plane has not retired")
-	}
-	if u.parentErr != nil {
-		u.mu.Unlock()
-		return u.parentErr
+		return err
 	}
 	u.inFlight = true
 	files := make([]*os.File, 0, len(u.used))

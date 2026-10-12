@@ -65,6 +65,26 @@ All three integration details matter:
 2. `bookmarking_dependency()` loads the inert app-side browser bridge.
 3. `bookmark_store="url"` enables Shiny's native URL serializer.
 
+For an app with an Apply button, capture the displayed filters only when the
+user commits them:
+
+```python
+register(
+    session=session,
+    input=input,
+    fields={"region": "Region"},
+    commit=input.apply,
+)
+```
+
+All registered fields use this trigger. The helper captures the initial inputs
+and snapshots them again on Apply. Restore corrections settle into the initial
+committed view before draft edits are isolated. A later-rendered field gets its initial
+committed value when it first appears. Draft edits leave the URL and saved status
+unchanged; both automatic switching and copied links use the captured values.
+Use the same Apply input that commits the app's displayed view. Its browser
+event marks synchronization pending until the committed URL has been saved.
+
 Call `register()` exactly once from the top-level server session. To bookmark
 inputs rendered by modules, include their resolved IDs (for example,
 `"filters-region"`) in this top-level field mapping. Calling `register()` from

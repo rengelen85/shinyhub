@@ -51,7 +51,8 @@ const env = { ...inherited, XDG_CONFIG_HOME: join(state, 'config'), GOWORK: 'off
 
 async function command(args, name, extra = {}) {
   const log = createWriteStream(join(work, `${name}.log`), { mode: 0o600 });
-  const child = spawn(args[0], args.slice(1), { cwd: root, env, signal: abort.signal, ...extra });
+  const { expectedExit = 0, ...spawnExtra } = extra;
+  const child = spawn(args[0], args.slice(1), { cwd: root, env, signal: abort.signal, ...spawnExtra });
   children.add(child);
   let stdout = '';
   child.stdout.on('data', chunk => { stdout += chunk; });
@@ -59,7 +60,8 @@ async function command(args, name, extra = {}) {
   child.stderr.pipe(log, { end: false });
   try {
     const [code] = await once(child, 'exit');
-    assert.equal(code, 0, `${name} failed; inspect ${name}.log`);
+    if (expectedExit === 'nonzero') assert.notEqual(code, 0, `${name} unexpectedly succeeded`);
+    else assert.equal(code, expectedExit, `${name} failed; inspect ${name}.log`);
     return stdout;
   } finally { children.delete(child); log.end(); }
 }
@@ -134,7 +136,7 @@ try {
   await new Promise(resolve => reservation.close(resolve));
   const host = `http://127.0.0.1:${port}`;
   await writeFile(passwordFile, password, { mode: 0o600 });
-  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: 4\n  drain_timeout: 5s\n${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
+  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: ${relayMode ? 16 : 4}\n  drain_timeout: 5s\n${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
   await command([binary, 'init', '--config', config, '--admin-user', username, '--admin-password-file', passwordFile], 'init', { cwd: state });
   const log = createWriteStream(join(work, 'server.log'), { mode: 0o600 });
   server = spawn(binary, ['serve', '--config', config, '--no-browser'], { cwd: state, env, detached: true });
@@ -234,8 +236,9 @@ try {
   });
   if (relayMode) {
     await checkSessionRelays({ context, page, original, appURL, host, state, app, work,
-      api, request, deploy, check, poll, output, assertDisconnected, sockets, viewerID: viewerRecord.id, viewer });
+      binary, config, command, api, request, deploy, check, poll, output, assertDisconnected, sockets, viewerID: viewerRecord.id, viewer });
     await checkBookmarkContinuity({ root, state, binary, clientConfig, host, token, env, command, context, check, poll, report });
+    assert.deepEqual(report.browserErrors, [], 'no browser script errors');
     report.status = 'passed';
     console.log('BROWSER SESSION RELAY E2E PASS');
   } else {

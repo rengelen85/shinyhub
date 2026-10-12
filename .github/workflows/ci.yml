@@ -61,6 +61,20 @@ jobs:
           go build -ldflags="-w" -o /tmp/shinyhub ./cmd/shinyhub
           python3 scripts/check-sdk-linking.py /tmp/shinyhub
 
+  # The bookmark SDK supports Python 3.10, whose copy protocol differs from
+  # newer interpreters. Keep that minimum-version compatibility exercised.
+  test-python-bookmarks-minimum:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - uses: astral-sh/setup-uv@v7
+      - name: Bookmark SDK on minimum supported Python
+        run: make test-py-bookmarks PYTHON_VERSION=3.10
+
   # Keep the stable baseline, older compatibility and newest preview under the
   # same SDK and native-launch checks; no free-threaded interpreter is selected.
   test-python-runtime:

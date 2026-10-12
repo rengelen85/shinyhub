@@ -1280,3 +1280,166 @@ async def test_overlapping_native_bookmark_does_not_inherit_adapter_selection(
         SYNC_ACK_INPUT_ID,
         "period",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restored", [False, True])
+async def test_commit_keeps_draft_edits_out_of_capabilities_and_real_bookmarks(
+    monkeypatch,
+    restored,
+):
+    from shiny import reactive, ui
+    from shiny.bookmark import BookmarkState
+    from shiny.session import Inputs as ShinyInputs
+
+    effects = []
+    real_effect = reactive.effect
+
+    def track_effect(fn=None, **kwargs):
+        def install(callback):
+            effect = real_effect(callback, session=None, **kwargs)
+            effects.append(effect)
+            return effect
+
+        return install(fn) if fn is not None else install
+
+    monkeypatch.setattr(reactive, "effect", track_effect)
+    inputs = ShinyInputs(
+        {
+            "region": reactive.Value("retired" if restored else "EU"),
+            "apply": reactive.Value(0),
+            "period": reactive.Value(),
+            REQUEST_INPUT_ID: reactive.Value(),
+        }
+    )
+    session = Session()
+
+    async def encode():
+        async def save(state):
+            for callback in session.bookmark.bookmark_callbacks:
+                await callback(state)
+            assert "region" in dir(state.input)
+            assert "region" in state.input
+            assert "apply" in state.input
+            assert "not_rendered_yet" not in state.input
+            state.values["committed_region"] = state.input.region()
+
+        return (
+            "https://example.test/app?"
+            + await BookmarkState(inputs, [], save)._encode_state()
+        )
+
+    session.bookmark.get_bookmark_url = encode
+    register(
+        session=session,
+        input=inputs,
+        fields={
+            "region": Field(
+                "Region",
+                restore=ChoiceRestore(choices=["EU", "US", "APAC"], default="EU"),
+            ),
+            "period": "Period",
+        },
+        commit=inputs["apply"],
+    )
+    try:
+        # App-owned bookmark requests may run before the first flush and outside
+        # a reactive context. Our hook must provide the initial snapshot safely.
+        early_state = BookmarkState(inputs, [], None)
+        live_input_keys = set(inputs._map)
+        await session.bookmark.bookmark_callbacks[0](early_state)
+        assert set(inputs._map) == live_input_keys
+        with reactive.isolate():
+            assert early_state.input.region() == ("retired" if restored else "EU")
+        await reactive.flush()
+        settled_state = BookmarkState(inputs, [], None)
+        await session.bookmark.bookmark_callbacks[0](settled_state)
+        if restored:
+            monkeypatch.setattr(ui, "update_select", lambda *args, **kwargs: None)
+            restore = type(
+                "RestoreState", (), {"input": {"region": "retired"}, "values": {}}
+            )()
+            with reactive.isolate():
+                await session.bookmark.restore_callbacks[0](restore)
+            assert session.messages[-1][1]["syncReady"] is False
+            settling_state = BookmarkState(inputs, [], None)
+            await session.bookmark.bookmark_callbacks[0](settling_state)
+            with reactive.isolate():
+                assert settling_state.input.region() == "EU"
+            inputs["region"].set("EU")  # Browser acknowledges restore correction.
+            await reactive.flush()
+            assert session.messages[-1][1]["syncReady"] is True
+            with reactive.isolate():
+                assert "retired" not in await encode()
+        await session.flushed_callbacks[0]()
+        inputs["period"].set("Q1")
+        await reactive.flush()
+        inputs["period"].set("draft-Q2")
+        await reactive.flush()
+        with reactive.isolate():
+            url = await encode()
+        assert "period=%22Q1%22" in url
+        assert "draft-Q2" not in url
+
+        async def failing_serializer(value, state_dir):
+            raise ValueError("custom serializer failed")
+
+        inputs._serializers["region"] = failing_serializer
+        inputs["region"].set("US")
+        inputs["apply"].set(1)
+        await reactive.flush()  # Apply must not invoke the failing serializer.
+        applied = session.messages[-1][1]
+        assert applied["fields"][0]["value"] == "US"
+        assert applied["registeredInputs"] == ["apply"]
+        revision = applied["syncRevision"]
+        inputs[REQUEST_INPUT_ID].set(
+            {
+                "version": 1,
+                "requestId": "failed-sync",
+                "purpose": "sync",
+                "include": ["region"],
+                "syncRevision": revision,
+            }
+        )
+        await reactive.flush()
+        assert session.messages[-1][1]["code"] == "serialization_failed"
+        inputs._serializers.pop("region")
+        message_count = len(session.messages)
+        inputs["region"].set("APAC")
+        await reactive.flush()
+        assert len(session.messages) == message_count, (
+            "draft edit republished capabilities"
+        )
+        with reactive.isolate():
+            url = await encode()
+        assert "region=%22US%22" in url
+        assert "APAC" not in url
+        inputs["apply"].set(2)
+        await reactive.flush()
+        assert session.messages[-1][1]["fields"][0]["value"] == "APAC"
+        with reactive.isolate():
+            url = await encode()
+        assert "region=%22APAC%22" in url
+    finally:
+        for effect in effects:
+            effect.destroy()
+
+
+def test_commit_requires_a_direct_input_and_failed_validation_allows_retry(
+    inert_reactivity,
+):
+    from shiny import reactive
+    from shiny.session import Inputs as ShinyInputs
+
+    inputs = ShinyInputs({"region": reactive.Value("EU"), "apply": reactive.Value(0)})
+    session = Session()
+    with pytest.raises(ValueError, match="direct Shiny input"):
+        register(
+            session=session, input=inputs, fields={"region": "Region"}, commit=lambda: 1
+        )
+    register(
+        session=session,
+        input=inputs,
+        fields={"region": "Region"},
+        commit=inputs["apply"],
+    )

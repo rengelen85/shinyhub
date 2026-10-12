@@ -221,13 +221,13 @@
     inputEventsInstalled = true;
     if (window.jQuery) {
       window.jQuery(document).on("shiny:inputchanged.shinyhubBookmarks", inputChanged);
-      window.jQuery(document).on("shiny:connected.shinyhubBookmarks", function () { dispatchDiscovery(); });
+      window.jQuery(document).on("shiny:connected.shinyhubBookmarks", function () { window.setTimeout(dispatchDiscovery, 0); });
       window.jQuery(document).on("shiny:disconnected.shinyhubBookmarks", function () {
         emitSyncStatus("pending", "", "");
       });
     } else {
       document.addEventListener("shiny:inputchanged", inputChanged);
-      document.addEventListener("shiny:connected", function () { dispatchDiscovery(); });
+      document.addEventListener("shiny:connected", function () { window.setTimeout(dispatchDiscovery, 0); });
       document.addEventListener("shiny:disconnected", function () { emitSyncStatus("pending", "", ""); });
     }
   }

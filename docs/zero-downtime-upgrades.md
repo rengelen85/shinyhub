@@ -1,5 +1,5 @@
 ---
-description: "Upgrade ShinyHub on SIGHUP with listener handoff, a separate session drain budget, and opt-in WebSocket continuity for native multiplex apps."
+description: "Upgrade ShinyHub with acknowledged reloads with listener handoff, a separate session drain budget, and opt-in WebSocket continuity for native multiplex apps."
 ---
 
 # Zero-downtime upgrades (systemd)
@@ -7,7 +7,7 @@ description: "Upgrade ShinyHub on SIGHUP with listener handoff, a separate sessi
 ShinyHub hands new connections to a successor during a compatible upgrade.
 Existing app sessions keep using the retiring proxy until they close or its
 drain deadline expires; sessions still open at that deadline are disconnected.
-On `SIGHUP` the running control plane re-execs the
+On an acknowledged `shinyhub reload` request (or `SIGHUP`), the running control plane re-execs the
 new binary, hands off its listening sockets to the successor, drains in-flight
 WebSocket sessions, releases the ownership lease, and exits. App processes keep
 running throughout (`server.shutdown_apps: adopt`, the default).
@@ -88,6 +88,43 @@ install -m 0755 ./shinyhub /usr/local/bin/shinyhub
 systemctl reload shinyhub
 ```
 
+The reference systemd unit uses `shinyhub reload --wait 10m`. The command
+returns success only after the successor acknowledges readiness and its PID
+matches `server.pid_file`. Standalone successors must regain mutation ownership;
+clustered successors may be healthy standbys after their first pool sync. A refusal or failed handoff returns nonzero, so
+`systemctl reload` reports failure while the current process continues serving.
+The unit allows fourteen minutes for the default ten-minute transition wait,
+startup acknowledgement, and a separate readiness budget. If you increase
+`--wait` or `server.upgrade_timeout`, set `TimeoutStartSec` to at least
+`wait + 2 * upgrade_timeout + 70s`.
+
+For a local invocation without systemd:
+
+```bash
+shinyhub reload --config /etc/shinyhub/shinyhub.yaml --wait 10m
+```
+
+Without `--wait`, temporary blockers fail immediately. With it, the command
+waits up to that duration for app operations, candidates, draining generations,
+serving activations, parent retirement, or relay capacity. Elastic pools and successor errors fail
+immediately. Canceling the caller cancels the transition wait. Once a handoff
+starts, the server uses `server.upgrade_timeout` to finish or recover it; if the
+acknowledgement connection is lost, verify the published live PID before retrying.
+The private `.reload` directory beside the PID file contains process-specific
+control sockets and must remain accessible while the server is running. Keep
+its path short enough for the platform's Unix socket limit. Socket setup failures
+are logged and leave the server serving; acknowledged reload then fails clearly
+until the configuration is corrected. Crash-left sockets for the current PID
+are reclaimed without replacing live sockets or other files.
+
+When upgrading a server that predates acknowledged reloads, replace the binary
+and use the existing signal-based unit once (or send SIGHUP to its `MainPID`).
+Confirm the successor is ready, then install the updated unit and run
+`systemctl daemon-reload`. The new command refuses to silently fall back to a
+signal when the old server has no reload control socket. Existing custom units
+that still use `/bin/kill -HUP` continue to report signal delivery, not the
+handoff result; update `ExecReload` to use the command above.
+
 A continuous client sees no connection-refused gap; in-flight sessions drain on
 the old process for up to `server.reload_drain_timeout` (defaults to
 `server.drain_timeout`, normally 60s) before any
@@ -126,16 +163,22 @@ process keeps its existing WebSocket tunnels, closes its database and lifecycle
 control plane, and retires its session lease when its final session closes. If it launched
 native backends, it keeps only their stdout/stderr readers and process reapers
 alive until those backends exit, preserving logs without database access.
+The retiring process logs how many launched replicas it is waiting for. Do not
+kill it while those replicas are running: their output pipes still belong to it,
+and killing it breaks their logs or can terminate them with SIGPIPE.
 Adopted backends do not create another output reader on each reload. A ready successor reads
 sealed leases for the exact backend processes, counts them for admission and
 hibernation, and performs authorization and usage persistence for the relays.
 Later reloads can proceed while earlier relays remain alive. Login expiration,
 access revocation and ordinary service stop still close sessions as usual.
 
-A preserving reload is refused while an app operation, candidate or previous
+A preserving handoff cannot begin while an app operation, candidate or previous
 generation is still draining, or when any pool uses elastic isolation. The
-current process keeps serving; inspect the upgrade log and retry after the
-transition finishes. At the relay limit, another preserving reload is refused
+current process keeps serving; the upgrade error names the blocking apps and
+reasons (elastic pool, draining generation, candidate generation, or serving
+activation). An acknowledged reload can wait for temporary blockers with
+`--wait`; a signal-based reload is refused immediately. At the relay limit,
+another preserving reload is refused
 instead of disconnecting older sessions, reserving capacity even if a new session
 arrives during handoff. Close old tabs to
 reclaim capacity. The limit bounds retained session relays, not their age or output-only
@@ -146,7 +189,7 @@ Compatible app deployments and rolling restarts may run after the control plane
 has retired. Their own `drain_timeout` still applies to retained backend sessions;
 preserving a hub reload does not preserve a session across replacement of its
 app process. Stop-first changes remain fenced while relayed sessions exist.
-Reloading during an app-generation drain is intentionally unsupported. This
+A waiting reload begins its handoff after the app-generation drain finishes. This
 mode preserves WebSocket transport; XHR fallback transport and recovery after
 an owner crash are outside its continuity guarantee.
 
@@ -186,8 +229,8 @@ limit, deploys a replacement, and revokes access to a relayed session.
 
 - **Repeated upgrades in drain mode.** The handoff refuses another upgrade
   while the successor's parent is still alive. A long reload drain therefore
-  delays the next upgrade; wait for the retiring proxy to exit before reloading
-  again. It also retains that process's memory and database connection.
+  delays the next upgrade; use `reload --wait` to wait for the retiring proxy
+  to exit, or retry after it exits. It also retains that process's memory and database connection.
 - **Backend protection during handoff.** The successor cannot count sessions
   still flowing through its parent. While that parent is alive, idle
   hibernation and lifecycle mutations such as deploy, stop, resize and
@@ -210,7 +253,7 @@ limit, deploys a replacement, and revokes access to a relayed session.
 - **Startup preflight.** The handoff re-execs the process's own `argv[0]`, so at
   boot the server checks that `argv[0]` resolves to an executable (the same
   `PATH` lookup the handoff uses) and logs a warning when it does not. With the
-  warning present every `SIGHUP` fails safe with the current process still
+  warning present every reload fails safe with the current process still
   serving; fix how the service launches the binary (an absolute `ExecStart`
   path, or a name resolvable on the unit's `PATH`) before relying on reloads.
 - **Database migrations must be backward-compatible and non-blocking.** During

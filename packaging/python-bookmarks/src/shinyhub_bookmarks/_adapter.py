@@ -431,15 +431,21 @@ def register(
     fields: Mapping[str, Field | str] | Iterable[tuple[str, Field | str]],
     max_url_length: int = DEFAULT_MAX_URL_LENGTH,
     legacy_fields: Mapping[str, str] | None = None,
+    commit: Callable[[], Any] | None = None,
 ) -> Registration:
     """Expose selected Shiny inputs to ShinyHub's durable view-link controls.
 
     The app must use ``App(..., bookmark_store="url")`` and include
     :func:`bookmarking_dependency` in its UI. The browser-local ShinyHub
     switcher receives registered display values and generated URLs. Registered
-    input changes keep the current address synchronized. ShinyHub has no
+    input changes keep the current address synchronized. With ``commit=input.apply``,
+    registered values are captured initially and whenever Apply changes; draft
+    edits leave the URL and saved status unchanged. ShinyHub has no
     dedicated bookmark-state API or store; the state travels in Shiny's URL.
     """
+
+    if commit is not None and not callable(commit):
+        raise TypeError("commit must be a direct Shiny input, such as input.apply")
 
     bookmark = session.bookmark
     if getattr(bookmark, "store", None) != "url":
@@ -475,8 +481,17 @@ def register(
         if field.baseline is not MISSING
     }
     registration = Registration(registered, max_url_length)
-    setattr(bookmark, REGISTRATION_MARKER, registration)
     resolved_ids = {field.resolved_id for field in registered}
+    # Direct reactive inputs retain their identity, allowing the bridge to mark
+    # an Apply event pending before its server-side capture has completed.
+    commit_ids = (
+        sorted(name for name in _known_input_ids(input) if input[name] is commit)
+        if commit is not None
+        else []
+    )
+    if commit is not None and not commit_ids:
+        raise ValueError("commit must be a direct Shiny input, such as input.apply")
+    setattr(bookmark, REGISTRATION_MARKER, registration)
     lock = asyncio.Lock()
     restored_overrides: dict[str, Any] = {}
     selected_fields: ContextVar[tuple[str, ...] | None] = ContextVar(
@@ -500,15 +515,49 @@ def register(
     from shiny.module import ResolvedId
     from shiny.types import SilentException
 
-    def read_current_values() -> dict[str, Any]:
+    def read_live_values(only: set[str] | None = None) -> dict[str, Any]:
         values: dict[str, Any] = {}
         for field in registered:
+            if only is not None and field.input_id not in only:
+                continue
             try:
                 values[field.input_id] = input[ResolvedId(field.resolved_id)]()
             except SilentException:
                 # Keep the dependency registered, but do not mistake an input
                 # that has not materialized yet for an intentional None value.
                 continue
+        return values
+
+    committed = reactive.Value()
+    committed_initialized = False
+
+    def capture_committed_values(initial_fields: set[str] | None = None) -> None:
+        values = copy.deepcopy(read_live_values(initial_fields))
+        if initial_fields is not None:
+            values = {**committed.get(), **values}
+        committed.set(values)
+
+    if commit is not None:
+
+        @reactive.effect(priority=100)
+        @reactive.event(commit, ignore_none=False)
+        def _capture_committed_values() -> None:
+            capture_committed_values()
+
+    def read_current_values() -> dict[str, Any]:
+        if commit is None:
+            return read_live_values()
+        # Keep the snapshot dependency even during initialization. Restore
+        # corrections must be acknowledged before drafts become isolated.
+        captured = committed.get() if committed.is_set() else None
+        if not committed_initialized or captured is None:
+            return read_live_values()
+        values = copy.deepcopy(captured)
+        missing = {field.input_id for field in registered} - values.keys()
+        # Dynamically rendered fields acquire an initial committed value when
+        # they first materialize. Existing fields keep their captured values.
+        if missing:
+            values.update(read_live_values(missing))
         return values
 
     def capture_observed_baseline(field: _RegisteredField, value: Any) -> None:
@@ -566,6 +615,7 @@ def register(
                 _apply_choice_update(session, field, updates[field.input_id])
 
     async def publish_capabilities() -> None:
+        nonlocal committed_initialized
         values = []
         current_values = read_current_values()
         process_pending_restores(current_values)
@@ -617,6 +667,25 @@ def register(
                 # Do not learn from the first reactive effect: Shiny may already
                 # have applied URL state before the restore hook identifies it.
                 capture_observed_baseline(field, current)
+        if (
+            commit is not None
+            and not committed_initialized
+            and restore_inspected
+            and not pending_restored_inputs
+            and not restored_overrides
+        ):
+            capture_committed_values()
+            committed_initialized = True
+        elif (
+            commit is not None
+            and committed_initialized
+            and not restored_overrides
+            and not pending_restored_inputs
+        ):
+            missing = current_values.keys() - committed.get().keys()
+            if missing:
+                capture_committed_values(set(missing))
+
         browser_revision_read_failed = False
         try:
             observed_browser_revision = input[BROWSER_REVISION_INPUT_ID]()
@@ -649,7 +718,9 @@ def register(
                     and not pending_restored_inputs
                     and not restored_overrides
                 ),
-                "registeredInputs": sorted(resolved_ids),
+                "registeredInputs": sorted(resolved_ids)
+                if commit is None
+                else commit_ids,
                 "fields": values,
                 "adjustments": [item.as_message() for item in registration.adjustments],
             },
@@ -662,12 +733,69 @@ def register(
             state.exclude[:] = _selection_exclusions(
                 state.exclude, _known_input_ids(input), selected
             )
+        if commit is not None:
+            with reactive.isolate():
+                captured = copy.deepcopy(
+                    committed.get()
+                    if committed_initialized and committed.is_set()
+                    else {**read_live_values(), **restored_overrides}
+                )
+            captured_by_id = {
+                field.resolved_id: reactive.Value(
+                    copy.deepcopy(captured[field.input_id]), read_only=True
+                )
+                for field in registered
+                if field.input_id in captured
+            }
+            original = state.input
+            # Inputs.__getattr__ resolves arbitrary names as reactive inputs.
+            # copy.copy probes __getstate__ on Python 3.10, mutating the live
+            # input map and invoking an unset reactive value. Construct instead.
+            frozen = type(input)(
+                {ResolvedId(key): value for key, value in captured_by_id.items()}
+            )
+            frozen._serializers = input._serializers
+
+            class CommittedInputs:
+                def __dir__(self) -> list[str]:
+                    return sorted(set(dir(original)) | captured_by_id.keys())
+
+                def __getitem__(self, name: str) -> Any:
+                    if name in captured_by_id:
+                        return captured_by_id[name]
+                    return original[name]
+
+                def __contains__(self, name: str) -> bool:
+                    return self[name].is_set()
+
+                def __getattr__(self, name: str) -> Any:
+                    if name in captured_by_id:
+                        return captured_by_id[name]
+                    return getattr(original, name)
+
+                async def _serialize(
+                    self, *, exclude: list[str], state_dir: Any
+                ) -> dict[str, Any]:
+                    values = await original._serialize(
+                        exclude=list(set(exclude) | resolved_ids), state_dir=state_dir
+                    )
+                    # Reuse Shiny's custom serializers over the frozen values.
+                    # Failures stay in the ordinary URL-request error path and
+                    # can never abort the app's Apply effect.
+                    values.update(
+                        await frozen._serialize(exclude=exclude, state_dir=state_dir)
+                    )
+                    return values
+
+            state.input = CommittedInputs()
 
     @bookmark.on_restore
     async def _inspect_restored_bookmark(state: Any) -> None:
-        nonlocal restore_inspected
+        nonlocal restore_inspected, committed_initialized
+        if commit is not None:
+            committed_initialized = False
         state_input = state.input if isinstance(state.input, Mapping) else {}
-        current_values = read_current_values()
+        current_values = read_live_values()
         for field in registered:
             restored = _restored_value(state_input, field)
             if restored is not None:

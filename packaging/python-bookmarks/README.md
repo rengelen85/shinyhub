@@ -62,6 +62,26 @@ ordinary browser bookmark reopens the same view without filling the Back button
 with every intermediate slider or text-input value. The explicit **Link to this
 view** action remains the exact, selective sharing control.
 
+For an app with an Apply button, capture the displayed filters only when the
+user commits them:
+
+```python
+register(
+    session=session,
+    input=input,
+    fields={"region": "Region"},
+    commit=input.apply,
+)
+```
+
+All registered fields use this trigger. The helper captures the initial inputs
+and snapshots them again on Apply. Restore corrections settle into the initial
+committed view before draft edits are isolated. A later-rendered field gets its initial
+committed value when it first appears. Draft edits leave the URL and saved status
+unchanged; both automatic switching and copied links use the captured values.
+Use the same Apply input that commits the app's displayed view. Its browser
+event marks synchronization pending until the committed URL has been saved.
+
 Declare stable baselines with `Field(baseline=...)`. This is comparison
 metadata; it does not set the Shiny control's initial value. On a clean page,
 the helper logs a mismatch without logging either value and safely retains the

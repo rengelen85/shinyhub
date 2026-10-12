@@ -34,6 +34,31 @@ func closedCh() chan struct{} {
 // openCh returns a channel that is never closed, simulating startup.
 func openCh() chan struct{} { return make(chan struct{}) }
 
+func TestReloadReadinessIncludesClusteredStandbyButWaitsForOwnerRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                                 string
+		clustered, started, synced, draining, paused, owner, recovered, want bool
+	}{
+		{name: "standalone owner ready", started: true, synced: true, owner: true, recovered: true, want: true},
+		{name: "standalone waits for owner", started: true, synced: true},
+		{name: "clustered standby ready", clustered: true, started: true, synced: true, want: true},
+		{name: "clustered acquiring owner", clustered: true, started: true, synced: true, owner: true},
+		{name: "clustered recovered owner", clustered: true, started: true, synced: true, owner: true, recovered: true, want: true},
+		{name: "clustered startup", clustered: true, synced: true},
+		{name: "clustered initial sync", clustered: true, started: true},
+		{name: "clustered draining", clustered: true, started: true, synced: true, draining: true},
+		{name: "paused owner", started: true, synced: true, owner: true, recovered: true, paused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ready := reloadReadyPredicate(tc.clustered, &fakeDrainChecker{draining: tc.draining, syncedOnce: tc.synced},
+				func() bool { return tc.started }, func() bool { return tc.owner }, func() bool { return tc.recovered }, func() bool { return tc.paused })
+			if got := ready(); got != tc.want {
+				t.Fatalf("ready = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProbeMethods(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
 		t.Run(method+" allowed", func(t *testing.T) {

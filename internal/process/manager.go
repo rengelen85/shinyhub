@@ -464,11 +464,19 @@ func (m *Manager) WaitOwnedOutput(ctx context.Context) {
 	for _, pool := range m.entries {
 		for _, entry := range pool {
 			if entry != nil && entry.ownsOutput && entry.done != nil {
+				select {
+				case <-entry.done:
+					continue
+				default:
+				}
 				done = append(done, entry.done)
 			}
 		}
 	}
 	m.mu.Unlock()
+	if len(done) > 0 {
+		slog.Info("waiting for replicas launched by this process; keep this process alive to preserve replica logs", "replicas", len(done))
+	}
 	for _, finished := range done {
 		select {
 		case <-finished:

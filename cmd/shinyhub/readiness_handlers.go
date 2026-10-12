@@ -18,6 +18,18 @@ type drainChecker interface {
 	SyncedOnce() bool
 }
 
+// A standalone successor must regain mutation ownership before reload returns.
+// A clustered standby may serve traffic without owning the fleet; if it wins
+// ownership, wait for its worker recovery just as we do for a standalone owner.
+func reloadReadyPredicate(clustered bool, prx drainChecker, started, isOwner, ownerReady, paused func() bool) func() bool {
+	return func() bool {
+		if !started() || prx.Draining() || !prx.SyncedOnce() || paused() {
+			return false
+		}
+		return (clustered && !isOwner()) || ownerReady()
+	}
+}
+
 // probeMethods limits unauthenticated liveness/readiness endpoints to the two
 // safe retrieval methods understood by load balancers. In particular, do not
 // answer TRACE or accept state-changing verbs on the public app origin.

@@ -24,12 +24,14 @@ RuntimeDirectoryMode=0700
 # shinyhub.yaml must set: server.pid_file: /run/shinyhub/shinyhub.pid
 ExecStart=/usr/local/bin/shinyhub serve --config /etc/shinyhub/shinyhub.yaml
 # Zero-downtime upgrade: drop a new /usr/local/bin/shinyhub binary, then
-# `systemctl reload shinyhub`. SIGHUP makes the running process re-exec the new
-# binary and hand off the listeners; old WebSocket sessions drain, then it exits.
-ExecReload=/bin/kill -HUP $MAINPID
+# `systemctl reload shinyhub`. The command waits for temporary app transitions
+# and exits successfully only when a successor acknowledges readiness. Rejected
+# reloads and failed handoffs make systemctl reload fail while apps keep serving.
+ExecReload=/usr/local/bin/shinyhub reload --config /etc/shinyhub/shinyhub.yaml --wait 10m --output table
 PIDFile=/run/shinyhub/shinyhub.pid
-# Generous start timeout: an upgrade may take a moment to become ready.
-TimeoutStartSec=120
+# Allow transition wait, startup acknowledgement, and fresh readiness budget.
+# Increase with --wait or upgrade_timeout: wait + 2*upgrade_timeout + 70s.
+TimeoutStartSec=14min
 
 # Restart only on genuine failure. A zero-downtime handoff is safe: the
 # successor sends READY=1 + MAINPID=<successor> via sd_notify before the

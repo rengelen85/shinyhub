@@ -3,6 +3,7 @@ package upgrade
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,28 @@ import (
 
 	"github.com/cloudflare/tableflip"
 )
+
+func TestUpgradeAdmissionRetriesStartupAndParentRetirementBeforeGuard(t *testing.T) {
+	u := &RepeatableUpgrader{stopped: make(chan struct{}), parentDone: make(chan struct{})}
+	guardCalls := 0
+	u.guard = func() (func(), error) { guardCalls++; return nil, errTest }
+	for _, stage := range []string{"upgrade is not ready", "parent control plane has not retired"} {
+		err := u.Upgrade()
+		var transition *TransitionError
+		if !errors.As(err, &transition) || transition.Reason != stage || guardCalls != 0 {
+			t.Fatalf("admission %q: %v, guard calls %d", stage, err, guardCalls)
+		}
+		u.ready = true
+	}
+	close(u.parentDone)
+	if err := u.Upgrade(); !errors.Is(err, errTest) || guardCalls != 1 {
+		t.Fatalf("retired parent: %v, guard calls %d", err, guardCalls)
+	}
+	close(u.stopped)
+	if err := u.Upgrade(); err == nil || guardCalls != 1 {
+		t.Fatalf("stopped upgrader admitted guard: %v", err)
+	}
+}
 
 // The subprocess harness uses real inherited listeners, pipes and held tunnels.
 // Its only ownership signal is the actual handoff protocol; no synthetic parent

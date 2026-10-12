@@ -5,6 +5,7 @@ package upgrade
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -55,6 +56,65 @@ type SignalState struct {
 	handoff  bool
 }
 
+// TransitionError identifies a temporary admission failure. Waiting reloads
+// retry only these failures; configuration and successor failures stay fatal.
+type TransitionError struct{ Reason string }
+
+func (e *TransitionError) Error() string { return e.Reason }
+
+// Reload serializes signals and acknowledged reload requests. It never queues
+// another handoff behind an in-flight or already successful handoff.
+func (s *SignalState) Reload(ctx context.Context, upg Upgrader, wait time.Duration, log *slog.Logger) error {
+	s.mu.Lock()
+	if s.handoff || s.inFlight != nil {
+		s.mu.Unlock()
+		return errors.New("reload already in progress or this process has handed off")
+	}
+	done := make(chan struct{})
+	s.inFlight = done
+	s.mu.Unlock()
+	succeeded := false
+	defer func() {
+		s.mu.Lock()
+		s.handoff = s.handoff || succeeded
+		close(done)
+		s.inFlight = nil
+		s.mu.Unlock()
+	}()
+	deadline := time.Now().Add(wait)
+	var lastReason string
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := upg.Upgrade()
+		if err == nil {
+			succeeded = true
+			return nil
+		}
+		var transition *TransitionError
+		if wait == 0 || !errors.As(err, &transition) {
+			return err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("reload wait timed out: %w", err)
+		}
+		if lastReason != err.Error() {
+			log.Info("waiting to reload", "reason", err, "remaining", remaining)
+			lastReason = err.Error()
+		}
+		delay := min(time.Second, remaining)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("reload canceled while waiting (%s): %w", err, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
 // SuccessfulHandoff waits for any pending Upgrade result. The library may
 // close Exit before the signal goroutine has received that result.
 func (s *SignalState) SuccessfulHandoff() bool {
@@ -84,20 +144,14 @@ func WireSignals(ctx context.Context, upg Upgrader, sighup <-chan os.Signal, log
 			select {
 			case <-ctx.Done():
 				return
+			case <-upg.Exit():
+				return
 			case _, ok := <-sighup:
 				if !ok {
 					return
 				}
 				log.Info("SIGHUP received, starting zero-downtime upgrade")
-				state.mu.Lock()
-				done := make(chan struct{})
-				state.inFlight = done
-				state.mu.Unlock()
-				err := upg.Upgrade()
-				state.mu.Lock()
-				state.handoff = state.handoff || err == nil
-				close(done)
-				state.mu.Unlock()
+				err := state.Reload(ctx, upg, 0, log)
 				if err != nil {
 					log.Error("zero-downtime upgrade failed; continuing to serve", "err", err)
 					continue

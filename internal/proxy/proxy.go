@@ -1631,6 +1631,7 @@ func (p *Proxy) SetSlugExists(fn func(string) (bool, error)) {
 // one-shot ERROR: the realtime channel is not getting through, which usually
 // means a reverse proxy is not forwarding the WebSocket upgrade.
 func (p *Proxy) RecordActivity(slug string) {
+	p.observeRelayConnectivity(slug)
 	p.seenMu.Lock()
 	now := time.Now()
 	p.lastSeen[slug] = now
@@ -1674,9 +1675,27 @@ func (p *Proxy) MarkWSReady(slug string) {
 	p.seenMu.Unlock()
 }
 
+// A retained session already completed its handshake in the retiring process.
+func (p *Proxy) observeRelayConnectivity(slug string) {
+	if p.relayLeases == nil {
+		return
+	}
+	p.seenMu.RLock()
+	_, connected := p.wsReady[slug]
+	p.seenMu.RUnlock()
+	if connected {
+		return
+	}
+	sessions, _ := p.relayLeases.Sessions(slug, 0, -1, "")
+	if sessions > 0 {
+		p.MarkWSReady(slug)
+	}
+}
+
 // IsWSReady reports whether slug has observed a 101 Switching Protocols
 // response since the last deregister/hibernate.
 func (p *Proxy) IsWSReady(slug string) bool {
+	p.observeRelayConnectivity(slug)
 	p.seenMu.RLock()
 	defer p.seenMu.RUnlock()
 	_, ok := p.wsReady[slug]
@@ -1703,6 +1722,7 @@ const wsWarnGrace = 20 * time.Second
 // reports (false, false). The app-detail envelope combines this with the app's
 // running state to surface an operator warning.
 func (p *Proxy) ConnectivityHealth(slug string) (everConnected, servingWithoutWS bool) {
+	p.observeRelayConnectivity(slug)
 	p.seenMu.RLock()
 	defer p.seenMu.RUnlock()
 	if _, ok := p.wsReady[slug]; ok {

@@ -24,6 +24,19 @@ Create the service user, configuration, and data directories referenced by the
 unit before starting it. Store `auth.secret` outside the repository with owner-
 only permissions.
 
+## Reload the server
+
+Set `server.pid_file: /run/shinyhub/shinyhub.pid`. The unit creates that runtime
+directory with mode `0700`. Its `ExecReload` calls `shinyhub reload --wait 10m`
+and waits for the successor's readiness acknowledgement. `systemctl reload`
+returns nonzero when the reload is refused, its transition wait expires, or the
+successor fails to start; the current server keeps serving after a failed handoff.
+
+For servers installed with a signal-based unit, follow the one-time transition
+in [zero-downtime upgrades](../zero-downtime-upgrades.md) before replacing
+`ExecReload`. Install the updated unit and run `systemctl daemon-reload`;
+replacing the binary alone does not update systemd's reload command.
+
 ## Private service configuration
 
 The unit is normally `0644`; keep secret values out of `Environment=` lines

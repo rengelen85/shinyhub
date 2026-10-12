@@ -115,6 +115,9 @@ func TestSweepOrphanDirs_SkipsPlatformLockDirInBothRoots(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.MkdirAll(filepath.Join(cfg.Storage.AppDataDir, ".reload-relays"), 0o750); err != nil {
+		t.Fatal(err)
+	}
 	// A real orphan alongside it: the exclusion must be the lock dir only, not
 	// a blanket "ignore dot-directories" or "ignore this root".
 	if err := os.MkdirAll(filepath.Join(cfg.Storage.AppDataDir, ".stray"), 0o750); err != nil {
@@ -134,6 +137,9 @@ func TestSweepOrphanDirs_SkipsPlatformLockDirInBothRoots(t *testing.T) {
 			t.Errorf("reported the platform lock dir as an orphan: %s", p)
 		}
 	}
+	if got[filepath.Join(cfg.Storage.AppDataDir, ".reload-relays")] {
+		t.Error("reported relay directory as orphan")
+	}
 	if p := filepath.Join(cfg.Storage.AppDataDir, ".stray"); !got[p] {
 		t.Errorf("orphans = %v, want %s reported", orphans, p)
 	}
@@ -147,5 +153,22 @@ func TestSweepOrphanDirs_MissingRootsOK(t *testing.T) {
 	}
 	if len(orphans) != 0 {
 		t.Fatalf("orphans = %v, want none", orphans)
+	}
+}
+
+func TestSweepOrphanDirsSkipsConfiguredReloadControlOnly(t *testing.T) {
+	cfg := mkCfg(t)
+	cfg.Server.PIDFile = filepath.Join(cfg.Storage.AppDataDir, "hub.pid")
+	for _, root := range []string{cfg.Storage.AppsDir, cfg.Storage.AppDataDir} {
+		if err := os.MkdirAll(filepath.Join(root, ".reload"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orphans, err := SweepOrphanDirs(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphans) != 1 || orphans[0] != filepath.Join(cfg.Storage.AppsDir, ".reload") {
+		t.Fatalf("orphans = %v", orphans)
 	}
 }

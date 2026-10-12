@@ -11,7 +11,7 @@ afterEach(() => {
   while (mountedWindows.length) mountedWindows.pop().close();
 });
 
-function mountBridge({ throwOnInput = false, timeoutMap = {} } = {}) {
+function mountBridge({ throwOnInput = false, timeoutMap = {}, jquery = false } = {}) {
   const dom = new JSDOM('<!doctype html><body></body>', {
     runScripts: 'dangerously',
     url: 'https://hub.test/app/demo/',
@@ -34,6 +34,9 @@ function mountBridge({ throwOnInput = false, timeoutMap = {} } = {}) {
       inputs.push({ id, value, options });
     },
   };
+  if (jquery) dom.window.jQuery = () => ({ on(name, handler) {
+    dom.window.document.addEventListener(name.split('.')[0], handler);
+  } });
   const script = dom.window.document.createElement('script');
   script.textContent = source;
   dom.window.document.body.appendChild(script);
@@ -859,4 +862,40 @@ test('late capabilities cannot lower the observed browser revision in the same s
  m.handlers['shinyhub-bookmark-capabilities']({...caps,observedBrowserRevision:0,syncRevision:1,autoSync:true});
  await flush(m.window,10);
  assert.equal(requests(m).length,2,'late acknowledgement stranded a clean input');
+});
+
+for (const jquery of [false, true]) {
+  test(`connected discovery follows Shiny init (${jquery ? 'jQuery' : 'native'})`, async () => {
+    const m = mountBridge({ jquery });
+    m.inputs.length = 0;
+    // Shiny 1.8 onopen dispatches connected synchronously, then sends init.
+    m.window.document.dispatchEvent(new m.window.Event('shiny:connected'));
+    assert.equal(m.inputs.length, 0, 'discovery sent update before init');
+    m.inputs.push({ id: 'init' });
+    await flush(m.window);
+    assert.deepEqual(m.inputs.map(entry => entry.id), ['init', '.shinyhub_bookmark_discover']);
+  });
+}
+
+
+test('commit trigger stays pending while draft filters stay saved', async () => {
+  const m = mountBridge({ timeoutMap: { 300: 0 } });
+  const statuses = [];
+  m.window.addEventListener('shinyhub:bookmark:sync-status', e => statuses.push(e.detail));
+  m.handlers['shinyhub-bookmark-capabilities']({ version: 1, store: 'url', session: 's1',
+    autoSync: true, pendingSync: true, syncReady: true, registeredInputs: ['apply'],
+    observedBrowserRevision: 0, syncRevision: 1, syncFields: ['region'],
+    fields: [{ id: 'region', label: 'Region', value: 'US' }],
+  });
+  await flush(m.window, 10);
+  m.handlers['shinyhub-bookmark-result']({ version: 1, purpose: 'sync',
+    requestId: requests(m)[0].value.requestId, url: 'https://hub.test/app/demo/?_inputs_&region=US' });
+  m.window.document.dispatchEvent(new m.window.CustomEvent('shiny:inputchanged', {
+    detail: { name: 'region', value: 'APAC' },
+  }));
+  assert.equal(statuses.at(-1).state, 'saved');
+  m.window.document.dispatchEvent(new m.window.CustomEvent('shiny:inputchanged', {
+    detail: { name: 'apply', value: 1 },
+  }));
+  assert.equal(statuses.at(-1).state, 'pending');
 });

@@ -68,7 +68,8 @@ func OnAppDelete(cfg *config.Config, slug string) error {
 // dir, not a top-level slug, so it is never reported. LockDirName sits at the
 // top of both roots and is skipped for the same reason: ShinyHub creates it on
 // every boot, so reporting it makes the very first log of a fresh install warn
-// about state the server itself just wrote.
+// about state the server itself just wrote. The .reload-relays directory under
+// AppDataDir likewise holds platform-owned session leases.
 //
 // Anything else keeps being reported even when the name could not be a slug.
 // The sweep exists to surface bytes nobody owns, and an operator's stray
@@ -76,6 +77,12 @@ func OnAppDelete(cfg *config.Config, slug string) error {
 func SweepOrphanDirs(cfg *config.Config, known map[string]bool) ([]string, error) {
 	var orphans []string
 	var errs []error
+	pidRoot := ""
+	if cfg.Server.PIDFile != "" {
+		if absolute, err := filepath.Abs(cfg.Server.PIDFile); err == nil {
+			pidRoot = filepath.Dir(absolute)
+		}
+	}
 	for _, base := range []string{cfg.Storage.AppsDir, cfg.Storage.AppDataDir} {
 		entries, err := os.ReadDir(base)
 		if err != nil {
@@ -85,11 +92,12 @@ func SweepOrphanDirs(cfg *config.Config, known map[string]bool) ([]string, error
 			errs = append(errs, fmt.Errorf("read %s: %w", base, err))
 			continue
 		}
+		absoluteBase, _ := filepath.Abs(base)
 		for _, e := range entries {
 			if !e.IsDir() {
 				continue
 			}
-			if known[e.Name()] || e.Name() == LockDirName {
+			if known[e.Name()] || e.Name() == LockDirName || (base == cfg.Storage.AppDataDir && e.Name() == ".reload-relays") || (e.Name() == ".reload" && pidRoot != "" && absoluteBase == pidRoot) {
 				continue
 			}
 			orphans = append(orphans, filepath.Join(base, e.Name()))

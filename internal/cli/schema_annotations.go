@@ -116,6 +116,11 @@ var schemaAnnotations = map[string]cmdAnnotation{
 		{Name: "created_admin", Type: "boolean"},
 	}},
 	"serve": {Mutating: mut, Streaming: true},
+	"reload": {Mutating: mut, ArgTypes: map[string]string{"--config": "path"}, OutputFields: []fieldSpec{
+		{Name: "status", Type: "string", Desc: "reloaded"},
+		{Name: "previous_pid", Type: "integer"},
+		{Name: "pid", Type: "integer", Desc: "Ready successor PID"},
+	}},
 	"validate-config": {Mutating: ro, ArgTypes: map[string]string{"--config": "path"}, OutputFields: []fieldSpec{
 		{Name: "status", Type: "string", Desc: "valid"},
 		{Name: "valid", Type: "boolean", Desc: "configuration passed startup validation"},
