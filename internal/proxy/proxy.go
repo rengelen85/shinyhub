@@ -279,6 +279,9 @@ var waitingPage = waitPage("Waiting for capacity…",
 // The full cookie name is cookiePrefix + slug (e.g. "shinyhub_rep_myapp").
 const cookiePrefix = "shinyhub_rep_"
 
+// versionSwitchCookiePrefix is reserved for navigation intents set by the hub.
+const versionSwitchCookiePrefix = "shinyhub_switch_"
+
 // readySuffix is the per-slug WS-readiness probe path. The full path is
 // /app/<slug>/.shinyhub/ready. The ".shinyhub" segment is namespaced under
 // a leading dot so it cannot collide with a legitimate app route.
@@ -469,8 +472,9 @@ type Proxy struct {
 	appStatusFn func(slug string) (status, reason string)
 	// appNameFn reports the friendly display name used by the injected app
 	// switcher. It is resolved only for top-level HTML pages while app nav is on.
-	appNameFn  func(slug string) string
-	slugExists func(slug string) (bool, error)
+	appNameFn       func(slug string) string
+	versionSwitchFn func(slug string, deploymentID int64) string
+	slugExists      func(slug string) (bool, error)
 
 	// wakeHoldNanos is the maximum time (ns) a request for a not-yet-routable app
 	// is held while its wake completes, so a warm resume is served inline instead
@@ -1137,6 +1141,66 @@ func (p *Proxy) stickyCookieValue(slug string, index int, deploymentID int64) st
 	return strconv.Itoa(index) + "." + strconv.FormatInt(deploymentID, 10)
 }
 
+// PrepareGenerationSwitch defers affinity changes until a top-level navigation.
+// Subrequests of a cancelled switch keep the old page's routing identity.
+func (p *Proxy) PrepareGenerationSwitch(w http.ResponseWriter, r *http.Request, slug string, cancel, automatic bool) {
+	maxAge := 20
+	value := "1"
+	if automatic {
+		value = "auto"
+	}
+	if cancel {
+		maxAge = -1
+		value = ""
+	}
+	http.SetCookie(w, &http.Cookie{Name: versionSwitchCookiePrefix + slug, Value: value,
+		Path: "/app/" + slug + "/", HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		Secure: proxytrust.Scheme(r, p.trustedProxyNets()) == "https", MaxAge: maxAge})
+}
+
+// AutomaticGenerationSwitchSafe excludes pools whose browser-wide client
+// identity could also be carrying a session in another tab.
+func (p *Proxy) AutomaticGenerationSwitchSafe(slug string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	pool := p.pools[slug]
+	return pool != nil && !poolIsElastic(pool) && len(pool.workers) == 0
+}
+
+func (p *Proxy) consumeGenerationSwitch(w http.ResponseWriter, r *http.Request, slug string) *http.Request {
+	intent, err := r.Cookie(versionSwitchCookiePrefix + slug)
+	if err != nil || (intent.Value != "1" && intent.Value != "auto") || !isPageLoad(r) {
+		return r
+	}
+	dest, mode := r.Header.Get("Sec-Fetch-Dest"), r.Header.Get("Sec-Fetch-Mode")
+	// Older browsers omit Fetch Metadata; retain the HTML-page-load fallback.
+	// Explicit iframe and fetch metadata must never consume a navigation intent.
+	if (dest != "" && dest != "document") || (dest == "" && mode != "" && mode != "navigate") {
+		return r
+	}
+	automatic := intent.Value == "auto"
+	p.PrepareGenerationSwitch(w, r, slug, true, automatic)
+	if automatic {
+		if !p.AutomaticGenerationSwitchSafe(slug) {
+			return r
+		}
+		// Preserve both browser-wide identities. Multiplex routing already replaces
+		// stale generation pins; a pin issued by another live tab must remain valid.
+	} else {
+		p.ClearGenerationAffinity(w, r, slug)
+	}
+
+	next := r.Clone(r.Context())
+	next.Header = r.Header.Clone()
+	next.Header.Del("Cookie")
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != versionSwitchCookiePrefix+slug && (automatic || (cookie.Name != cookiePrefix+slug && cookie.Name != clientCookiePrefix+slug)) {
+			next.AddCookie(cookie)
+		}
+	}
+	return next
+}
+
 // ClearGenerationAffinity removes this browser's per-app generation pin. The
 // following top-level reload is therefore routed to the active generation and
 // receives a fresh signed affinity cookie.
@@ -1387,6 +1451,23 @@ func (p *Proxy) SetAppStatusLookup(fn func(slug string) (status, reason string))
 	p.mu.Lock()
 	p.appStatusFn = fn
 	p.mu.Unlock()
+}
+
+// SetVersionSwitchLookup supplies the immutable served bundle's reload policy.
+func (p *Proxy) SetVersionSwitchLookup(fn func(string, int64) string) {
+	p.mu.Lock()
+	p.versionSwitchFn = fn
+	p.mu.Unlock()
+}
+
+func (p *Proxy) versionSwitchPolicy(slug string, deploymentID int64) string {
+	p.mu.RLock()
+	fn := p.versionSwitchFn
+	p.mu.RUnlock()
+	if fn != nil && deploymentID > 0 && p.AutomaticGenerationSwitchSafe(slug) && fn(slug, deploymentID) == "when_hidden" {
+		return "when_hidden"
+	}
+	return "manual"
 }
 
 // SetAppNameLookup registers a callback that reports an app's friendly display
@@ -2928,6 +3009,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r = p.consumeGenerationSwitch(w, r, slug)
+
 	// Wrap the writer so we can capture status + bytes for the access log.
 	// The recorder delegates Flush/Hijack/ReadFrom so streaming responses,
 	// WebSocket upgrades, and the sendfile fast path keep working.
@@ -3806,14 +3889,15 @@ func resolveClientIP(resolver func(*http.Request) string, r *http.Request) strin
 
 // isInternalCookie reports whether a cookie belongs to ShinyHub itself (the
 // session JWT, CSRF token, OAuth-state nonce, the per-app sticky-routing cookie,
-// or the per-app elastic client-id cookie) and so must never be forwarded to an
+// the per-app elastic client-id cookie, or version-switch intent) and so must
+// never be forwarded to an
 // app backend, nor accepted from one via Set-Cookie.
 func isInternalCookie(name string) bool {
 	switch name {
 	case auth.ForwardAuthSignedOutCookie, auth.SecureForwardAuthSignedOutCookie, auth.ForwardAuthSessionCookie, auth.SecureForwardAuthSessionCookie, auth.LogoutHandoffCookie, auth.SecureLogoutHandoffCookie, auth.SessionCookieName, auth.SupportSessionCookieName, auth.SupportSessionGuardCookieName, auth.CSRFCookieName, auth.OAuthStateCookieName:
 		return true
 	}
-	return strings.HasPrefix(name, cookiePrefix) || strings.HasPrefix(name, clientCookiePrefix)
+	return strings.HasPrefix(name, cookiePrefix) || strings.HasPrefix(name, clientCookiePrefix) || strings.HasPrefix(name, versionSwitchCookiePrefix)
 }
 
 // filterReservedSetCookies drops any Set-Cookie header on a backend response

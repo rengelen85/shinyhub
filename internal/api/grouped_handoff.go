@@ -167,7 +167,7 @@ func (s *Server) manifestHandoffReasons(app *db.App, previous *db.Deployment, ma
 		"hibernate_timeout_minutes": true, "min_warm_replicas": true,
 		"max_sessions_per_replica": true, "autoscale": true,
 		"memory_limit_mb": true, "cpu_quota_percent": true, "render_seconds": true,
-		"worker": true,
+		"worker": true, "version_switch": true,
 	}
 	before, after := reflect.ValueOf(old.App), reflect.ValueOf(manifest.App)
 	for i := 0; i < after.NumField(); i++ {

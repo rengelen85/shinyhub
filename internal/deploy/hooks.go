@@ -62,6 +62,10 @@ type AppSettings struct {
 	// FastAPI exports app:app from app.py; Plumber reads plumber.R.
 	Framework string `toml:"framework"`
 
+	// VersionSwitch is a per-bundle declaration that registered filters are
+	// sufficient to restore this app after an unattended hidden-tab reload.
+	VersionSwitch string `toml:"version_switch"`
+
 	HibernateTimeoutMinutes *int `toml:"hibernate_timeout_minutes"`
 	Replicas                *int `toml:"replicas"`
 	MaxSessionsPerReplica   *int `toml:"max_sessions_per_replica"`
@@ -391,6 +395,9 @@ func validateHook(h Hook) error {
 }
 
 func normalizeAndValidateApp(a *AppSettings) error {
+	if a.VersionSwitch != "" && a.VersionSwitch != "manual" && a.VersionSwitch != "when_hidden" {
+		return fmt.Errorf("app.version_switch must be manual or when_hidden, got %q", a.VersionSwitch)
+	}
 	switch a.Framework {
 	case "", "fastapi", "plumber":
 	default:

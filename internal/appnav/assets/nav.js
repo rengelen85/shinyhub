@@ -64,6 +64,8 @@
   var BOOKMARK_TIMEOUT_MS = 10000;
   var VERSION_POLL_TIMEOUT_MS = 10000;
   var VERSION_SWITCH_TIMEOUT_MS = 12000;
+  var AUTO_SWITCH_GRACE_MS = 30000;
+  var AUTO_UPDATE_KEY = "shinyhub-app-nav:auto-update:";
 
   var tag = document.currentScript || document.getElementById(TAG_ID);
   if (!tag) {
@@ -98,6 +100,7 @@
   var currentName = (tag.getAttribute("data-current-name") || "").trim();
   var homeURL = tag.getAttribute("data-home-url") || "/";
   var servedGeneration = tag.getAttribute("data-served-generation") || "";
+  var autoSwitchEnabled = tag.getAttribute("data-version-switch") === "when_hidden";
   var versionURL = tag.getAttribute("data-version-url") || "";
   var switchURL = tag.getAttribute("data-switch-url") || "";
 
@@ -522,6 +525,7 @@
     ".panel:focus { outline: none; }",
     ".panel:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--sh-signal); }",
 
+    ".automatic-update-notice { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; color: var(--sh-soft); font-size: 12px; }",
     ".version-notice {" +
       "  display: none; flex: 0 1 auto; min-height: 0; max-height: min(272px, 44vh);" +
       "  box-sizing: border-box; margin: 12px 12px 4px; padding: 14px; overflow-y: auto;" +
@@ -1617,6 +1621,14 @@
   var navigating = false;
   var snapshotActive = false;
   var versionReady = false;
+  var activeGeneration = "";
+  var hiddenSince = document.hidden ? Date.now() : null;
+  var automaticSwitch = false;
+  var autoSwitchTimer = null;
+  var autoAttemptGeneration = "";
+  var bookmarkSyncStatus = null;
+  var pageActive = true;
+  var automaticallyUpdated = false;
   var versionSwitching = false;
   var versionTimer = null;
   var versionPollFailures = 0;
@@ -1637,6 +1649,7 @@
   var bookmarkSyncError = false;
   var chatReady = false;
   var chatOpen = false;
+  var chatBusy = false;
   var chatBody = null;
   var chatInertSiblings = [];
 
@@ -1773,7 +1786,10 @@
     return {
       version: BOOKMARK_PROTOCOL_VERSION,
       fields: fields,
-      adjustments: adjustments
+      adjustments: adjustments,
+      pendingSync: detail.pendingSync === true && detail.syncReady === true,
+      session: typeof detail.session === "string" ? detail.session : "",
+      syncRevision: detail.syncRevision
     };
   }
 
@@ -2354,7 +2370,7 @@
       ? "Offline snapshot"
       : versionReady
         ? "Update ready"
-        : "Switch app";
+        : automaticallyUpdated ? "Updated" : "Switch app";
     openBtn.setAttribute(
       "aria-label",
       "Switch apps, current app " + label +
@@ -2388,16 +2404,42 @@
     }
   }
 
+  function autoSwitchEligible() {
+    return autoSwitchEnabled && pageActive && document.hidden && hiddenSince !== null &&
+      versionReady && !snapshotActive && !bookmarkOpen && !chatOpen && !chatBusy && !sessionOpen &&
+      !bookmarkPending && bookmarkCapabilities && bookmarkCapabilities.pendingSync &&
+      bookmarkCapabilities.session && bookmarkSyncStatus && bookmarkSyncStatus.pendingSync === true &&
+      bookmarkSyncStatus.state === "saved" && bookmarkSyncStatus.session === bookmarkCapabilities.session &&
+      Number.isInteger(bookmarkSyncStatus.syncRevision) &&
+      bookmarkSyncStatus.syncRevision >= bookmarkCapabilities.syncRevision;
+  }
+
+  function considerAutomaticSwitch() {
+    if (autoSwitchTimer !== null) { window.clearTimeout(autoSwitchTimer); autoSwitchTimer = null; }
+    if (!autoSwitchEligible()) {
+      if (automaticSwitch) cancelVersionSwitch();
+      return;
+    }
+    if (versionSwitching || activeGeneration === autoAttemptGeneration) return;
+    var remaining = AUTO_SWITCH_GRACE_MS - (Date.now() - hiddenSince);
+    if (remaining > 0) {
+      autoSwitchTimer = window.setTimeout(guard(function () {
+        autoSwitchTimer = null;
+        considerAutomaticSwitch();
+      }), remaining);
+    } else { switchVersion(true); }
+  }
+
   function scheduleVersionCheck(failed) {
     if (versionTimer !== null) {
       window.clearTimeout(versionTimer);
     }
-    if (document.hidden) {
+    if (document.hidden && !autoSwitchEnabled) {
       versionTimer = null;
       return;
     }
     versionPollFailures = failed ? Math.min(versionPollFailures + 1, 3) : 0;
-    var base = 15000 * Math.pow(2, versionPollFailures);
+    var base = (document.hidden ? 60000 : 15000) * Math.pow(2, versionPollFailures);
     var jitter = Math.floor(Math.random() * 3000);
     versionTimer = window.setTimeout(guard(checkVersion), base + jitter);
   }
@@ -2406,7 +2448,8 @@
     if (
       !servedGeneration ||
       !versionURL ||
-      document.hidden ||
+      (document.hidden && !autoSwitchEnabled) ||
+      !pageActive ||
       snapshotActive ||
       versionRequestInFlight
     ) {
@@ -2460,7 +2503,9 @@
         }
         versionRequestInFlight = false;
         versionAbort = null;
+        activeGeneration = active;
         setVersionReady(active !== servedGeneration);
+        considerAutomaticSwitch();
         scheduleVersionCheck(false);
       }
     ).catch(function () {
@@ -2542,15 +2587,24 @@
       return;
     }
     versionSwitching = false;
+    var wasAutomatic = automaticSwitch;
+    automaticSwitch = false;
+    clearSwitchIntent();
     clearVersionSwitchRequest();
     setVersionSwitchControlsDisabled(false);
-    root.classList.add("version-error");
-    if (!snapshotActive && !versionNotice.hidden) {
+    if (!wasAutomatic) root.classList.add("version-error");
+    if (!wasAutomatic && !snapshotActive && !versionNotice.hidden) {
       versionSwitch.focus();
     }
     // The POST may have reached the server before a timeout. Reconcile from
     // the authoritative active generation instead of guessing what happened.
     checkVersion();
+  }
+
+  function clearSwitchIntent() {
+    if (!switchURL) return;
+    window.fetch(switchURL, { method: "DELETE", cache: "no-store", credentials: "same-origin",
+      headers: { "X-ShinyHub-Version-Switch": "1" } }).catch(function () {});
   }
 
   function cancelVersionSwitch() {
@@ -2559,6 +2613,9 @@
     }
     versionSwitchSerial += 1;
     versionSwitching = false;
+    if (automaticSwitch) autoAttemptGeneration = "";
+    automaticSwitch = false;
+    clearSwitchIntent();
     if (versionSwitchAbort) {
       versionSwitchAbort.abort();
     }
@@ -2567,11 +2624,15 @@
     root.classList.remove("version-error");
   }
 
-  function switchVersion() {
+  function switchVersion(automatic) {
+    automatic = automatic === true;
+    if (automatic && !autoSwitchEligible()) return;
     if (versionSwitching || !switchURL) {
       return;
     }
     versionSwitching = true;
+    automaticSwitch = automatic;
+    if (automatic) autoAttemptGeneration = activeGeneration;
     var requestSerial = ++versionSwitchSerial;
     root.classList.remove("version-error");
     setVersionSwitchControlsDisabled(true);
@@ -2584,6 +2645,7 @@
       credentials: "same-origin",
       headers: { "X-ShinyHub-Version-Switch": "1" }
     };
+    if (automatic) requestOptions.headers["X-ShinyHub-Automatic-Switch"] = "1";
     if (versionSwitchAbort) {
       requestOptions.signal = versionSwitchAbort.signal;
     }
@@ -2599,10 +2661,15 @@
     window.fetch(switchURL, requestOptions).then(
       function (response) {
         if (requestSerial !== versionSwitchSerial || !versionSwitching) {
+          if (response.ok) clearSwitchIntent();
           return;
         }
         if (!response.ok) {
           throw new Error("version switch returned " + response.status);
+        }
+        if (automatic && !autoSwitchEligible()) { cancelVersionSwitch(); return; }
+        if (automatic) {
+          try { window.sessionStorage.setItem(AUTO_UPDATE_KEY + currentSlug, JSON.stringify({ from: servedGeneration, to: activeGeneration, at: Date.now() })); } catch (e) {}
         }
         clearVersionSwitchRequest();
         announcer.textContent = "Switching to the ready app version";
@@ -2694,6 +2761,7 @@
       return;
     }
     sessionOpen = next;
+    considerAutomaticSwitch();
     if (sessionOpen) {
       setOpen(false);
       setBookmarkOpen(false, false);
@@ -2719,6 +2787,7 @@
       return;
     }
     bookmarkOpen = next;
+    considerAutomaticSwitch();
     if (bookmarkOpen) {
       setOpen(false);
       setSessionOpen(false, false);
@@ -2751,6 +2820,7 @@
     var noticeHadFocus = versionNotice.contains(shadow.activeElement);
     var wasSnapshotActive = snapshotActive;
     snapshotActive = !!next;
+    considerAutomaticSwitch();
     if (snapshotActive) {
       // Snapshot recovery is the higher-priority decision. Do not leave its
       // visible controls behind a version request lock or accept a version
@@ -3058,8 +3128,10 @@
     if (!capabilities) {
       return;
     }
+    if (bookmarkCapabilities && bookmarkCapabilities.session !== capabilities.session) bookmarkSyncStatus = null;
     bookmarkCapabilities = capabilities;
     root.classList.add("bookmark-ready");
+    considerAutomaticSwitch();
     root.classList.toggle("bookmark-adjusted", capabilities.adjustments.length > 0);
     renderBookmarkChrome();
     if (bookmarkOpen) {
@@ -3101,6 +3173,7 @@
     if (!detail || detail.version !== CHAT_PROTOCOL_VERSION || typeof detail.open !== "boolean") return;
     var chatWasOpen = chatOpen;
     chatOpen = detail.open;
+    considerAutomaticSwitch();
     root.classList.toggle("chat-open", chatOpen);
     if (chatBody && chatWasOpen !== chatOpen) setChatModal(chatOpen);
     chatBtn.setAttribute("aria-expanded", chatOpen ? "true" : "false");
@@ -3109,17 +3182,21 @@
   window.addEventListener(CHAT_BUSY_EVENT, guard(function (ev) {
     var detail = ev && ev.detail;
     if (!detail || detail.version !== CHAT_PROTOCOL_VERSION || typeof detail.busy !== "boolean") return;
+    chatBusy = detail.busy;
     chatNew.disabled = detail.busy;
+    considerAutomaticSwitch();
   }));
 
   window.addEventListener(BOOKMARK_SYNC_STATUS_EVENT, guard(function (ev) {
     var detail = ev && ev.detail ? ev.detail : {};
     if (detail.version !== BOOKMARK_PROTOCOL_VERSION) return;
-    if (detail.state !== "saved" && detail.state !== "error") return;
+    if (detail.state !== "saved" && detail.state !== "error" && detail.state !== "pending") return;
+    bookmarkSyncStatus = detail;
     bookmarkSyncError = detail.state === "error";
     bookmarkSyncWarning.hidden = !bookmarkSyncError;
     root.classList.toggle("bookmark-sync-error", bookmarkSyncError);
     renderBookmarkChrome();
+    considerAutomaticSwitch();
     if (bookmarkSyncError) {
       announcer.textContent = "Latest filter changes are not saved in the page URL";
     }
@@ -3337,19 +3414,55 @@
   if (servedGeneration && versionURL) {
     checkVersion();
     document.addEventListener("visibilitychange", guard(function () {
-      if (!document.hidden) {
-        checkVersion();
-      } else {
-        cancelVersionCheck();
-      }
+      hiddenSince = document.hidden ? Date.now() : null;
+      if (!document.hidden && automaticallyUpdated) announcer.textContent = "Updated to the latest version";
+      considerAutomaticSwitch();
+      if (!document.hidden || autoSwitchEnabled) { checkVersion(); }
+      else { cancelVersionCheck(); }
     }));
-    window.addEventListener("pagehide", guard(cancelVersionCheck));
+    window.addEventListener("pagehide", guard(function () {
+      pageActive = false;
+      considerAutomaticSwitch();
+      cancelVersionCheck();
+      cancelVersionSwitch();
+    }));
     window.addEventListener("pageshow", guard(function () {
-      if (!document.hidden) {
+      pageActive = true;
+      hiddenSince = document.hidden ? Date.now() : null;
+      if (!document.hidden && automaticallyUpdated) announcer.textContent = "Updated to the latest version";
+      considerAutomaticSwitch();
+      if (!document.hidden || autoSwitchEnabled) {
         checkVersion();
       }
     }));
   }
+  try {
+    var updateMarker = JSON.parse(window.sessionStorage.getItem(AUTO_UPDATE_KEY + currentSlug) || "null");
+    if (updateMarker && servedGeneration && updateMarker.from === servedGeneration) {
+      autoAttemptGeneration = updateMarker.to;
+    }
+    if (servedGeneration) window.sessionStorage.removeItem(AUTO_UPDATE_KEY + currentSlug);
+    if (updateMarker && servedGeneration && updateMarker.from !== servedGeneration &&
+        Date.now() - updateMarker.at >= 0 && Date.now() - updateMarker.at < 300000) {
+      automaticallyUpdated = true;
+      var updateLine = div("automatic-update-notice");
+      updateLine.setAttribute("role", "status");
+      updateLine.appendChild(document.createTextNode("Updated to the latest version"));
+      var updateDismiss = document.createElement("button");
+      updateDismiss.type = "button";
+      updateDismiss.className = "version-later";
+      updateDismiss.textContent = "Dismiss";
+      updateDismiss.setAttribute("aria-label", "Dismiss update notice");
+      updateDismiss.addEventListener("click", guard(function () {
+        automaticallyUpdated = false;
+        if (shadow.activeElement === updateDismiss) openBtn.focus();
+        updateLine.remove();
+        updateSwitcherStatus();
+      }));
+      updateLine.appendChild(updateDismiss);
+      panel.insertBefore(updateLine, filterWrap);
+    }
+  } catch (e) {}
   updateSwitcherStatus();
   revealBar(true);
   if (typeof window.CustomEvent === "function") {

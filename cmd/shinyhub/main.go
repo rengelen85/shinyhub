@@ -2305,6 +2305,32 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		return app.Name
 	})
 
+	var versionSwitchPolicies sync.Map
+	type servedVersionSwitchPolicy struct{ slug, policy string }
+	prx.SetVersionSwitchLookup(func(slug string, deploymentID int64) string {
+		if cached, ok := versionSwitchPolicies.Load(deploymentID); ok {
+			entry := cached.(servedVersionSwitchPolicy)
+			if entry.slug == slug {
+				return entry.policy
+			}
+			return "manual"
+		}
+		app, err := store.GetAppBySlug(slug)
+		if err != nil {
+			return "manual"
+		}
+		served, err := store.GetDeploymentByID(deploymentID)
+		if err != nil || served.AppID != app.ID {
+			return "manual"
+		}
+		manifest, err := deploy.LoadManifest(served.BundleDir)
+		if err != nil || manifest == nil {
+			return "manual"
+		}
+		versionSwitchPolicies.Store(deploymentID, servedVersionSwitchPolicy{slug: slug, policy: manifest.App.VersionSwitch})
+		return manifest.App.VersionSwitch
+	})
+
 	// Hold a request for a not-yet-routable app while its wake completes, so a
 	// warm resume serves inline (no loading-page round-trip). 0 disables it.
 	prx.SetWakeHoldTimeout(cfg.Lifecycle.WakeHold)
@@ -3032,6 +3058,12 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 			srv.HandleAppVersionJSON(w, r, r.PathValue("slug"))
 		})
 		mux.HandleFunc("POST /app/{slug}/.shinyhub/version/switch", func(w http.ResponseWriter, r *http.Request) {
+			if u := access.ResolveOptionalUser(r, cfg.Auth.Secret, store.IsTokenRevoked, appUserLookup); u != nil {
+				r = r.WithContext(auth.WithUser(r.Context(), u))
+			}
+			srv.HandleAppVersionSwitch(w, r, r.PathValue("slug"))
+		})
+		mux.HandleFunc("DELETE /app/{slug}/.shinyhub/version/switch", func(w http.ResponseWriter, r *http.Request) {
 			if u := access.ResolveOptionalUser(r, cfg.Auth.Secret, store.IsTokenRevoked, appUserLookup); u != nil {
 				r = r.WithContext(auth.WithUser(r.Context(), u))
 			}

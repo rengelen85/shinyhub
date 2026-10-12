@@ -275,3 +275,68 @@ clear.
 
 See [`examples/bookmarking-demo`](../examples/bookmarking-demo/) for a runnable
 four-filter app.
+
+## Update hidden dashboards automatically
+
+Filter-only dashboards can opt into switching to a newly deployed generation
+while their tab is hidden. In the app's `shinyhub.toml`:
+
+```toml
+[app]
+version_switch = "when_hidden" # default: "manual"
+```
+
+This is the app author's declaration that its registered bookmark filters are
+sufficient to restore the view. Audit every meaningful filter and test its URL
+round-trip before enabling it. Forms and editors should retain `manual` unless
+all work they promise to preserve is covered by that contract. ShinyHub cannot
+infer whether arbitrary application state is unsaved.
+
+Automatic switching currently supports multiplex pools only. Grouped and
+per-session pools, including retained elastic workers during an isolation
+change, keep manual switching because their worker identity is shared between
+tabs. The server checks this again when an automatic switch is requested.
+
+The switcher keeps checking for a ready generation while hidden, with a slower
+poll interval. It switches after at least 30 seconds continuously hidden, only
+when restoration has completed and the latest registered filter state is saved
+in the URL. Open chat or bookmark panels, busy chats, pending link creation, and session
+snapshots prevent the switch. Returning to the tab or changing a filter while
+the switch request is in flight cancels automatic navigation. A failed attempt
+leaves the manual notice; it does not repeatedly reload the same generation.
+
+The reload uses the current URL, including its query and hash. The switcher
+shows a dismissible “Updated to the latest version” notice afterwards. Newer
+data may be displayed; unregistered state such as plot zoom, table sorting,
+scroll position or a selected navigation tab is not preserved. Visible tabs
+retain the manual notice and the configured generation retirement deadline.
+
+Automatic switching requires an adapter with the pending-sync protocol below.
+A restored dynamic input that never appears keeps restoration unsettled and
+blocks automatic switching.
+
+Older adapters continue to support bookmarks and manual switching, but cannot
+opt into unattended reloading safely. Deploying the hub alone does not upgrade
+an adapter installed in an app's environment. The policy belongs to the bundle
+that served the page, so a later deploy cannot retroactively opt an older page in.
+
+### Pending-sync adapter contract
+
+Protocol version 1 capabilities add `pendingSync: true`, `syncReady` (restoration
+has settled), `session` (an identity for this Shiny session), `syncRevision`,
+`registeredInputs` (all registered input IDs), and `observedBrowserRevision`
+(the browser change counter observed by the server). `syncFields` remains the
+subset that needs encoding in the bookmark URL.
+
+The browser bridge emits `shinyhub:bookmark:sync-status` with `pending` immediately
+on a registered DOM input or `shiny:inputchanged` event. DOM input catches edits
+that Shiny has not yet submitted, including inputs that update on blur. The
+bridge sends its change counter in the same Shiny batch as the input; the
+server echoes that counter, so unchanged values and type conversions cannot
+leave a clean filter pending forever. It keeps that state until the server has
+observed the latest browser changes and a matching serialization has updated the URL. An older response cannot
+clear a newer edit. Sync statuses include `pendingSync`, `session`,
+`syncRevision`, and `browserRevision`; only a matching `saved` status permits
+an automatic switch. Missing capability, unsettled restore, disconnect, or
+serialization failure blocks it. The Python adapter implements this contract;
+other adapters must implement the same safeguards before advertising it.

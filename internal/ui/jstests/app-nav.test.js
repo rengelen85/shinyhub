@@ -71,6 +71,7 @@ function mount({
   versionPayloads = null,
   switchStatus = 200,
   captureTimers = false,
+  autoUpdateMarker = null,
 } = {}) {
   const jsdomErrors = [];
   const virtualConsole = new VirtualConsole();
@@ -120,6 +121,7 @@ function mount({
   });
 
   if (dismissed) w.sessionStorage.setItem(DISMISS_KEY, '1');
+  if (autoUpdateMarker) w.sessionStorage.setItem("shinyhub-app-nav:auto-update:demo", JSON.stringify(autoUpdateMarker));
   if (position) w.localStorage.setItem(POSITION_KEY, position);
   if (legacyPosition) w.localStorage.setItem(LEGACY_POSITION_KEY, legacyPosition);
 
@@ -140,7 +142,7 @@ function mount({
       status: responseStatus,
       json: () => Promise.resolve(responsePayload),
     };
-    if (!deferred && !(deferSwitch && u === SWITCH_URL)) return Promise.resolve(answer);
+    if (!deferred && !(deferSwitch && u === SWITCH_URL && opts?.method === 'POST')) return Promise.resolve(answer);
     // A real fetch does not answer within the click that started it. Holding it
     // open is the only way to see the panel in the state a first-time visitor
     // actually meets: open, empty, still loading.
@@ -222,6 +224,105 @@ function mount({
 }
 
 const app = (slug, extra = {}) => ({ slug, name: slug, openable: true, ...extra });
+
+async function hiddenSwitchFixture(t, extra = {}) {
+  const m = mount({
+    attrs: { 'data-served-generation': 'old', 'data-version-url': VERSION_URL,
+      'data-switch-url': SWITCH_URL, 'data-version-switch': 'when_hidden' },
+    versionPayload: { active_generation: 'new' }, captureTimers: true, ...extra,
+  });
+  t.after(() => m.window.close());
+  let now = 1000;
+  m.window.Date.now = () => now;
+  m.window.dispatchEvent(new m.window.CustomEvent(BOOKMARK_CAPABILITIES_EVENT, { detail: {
+    version: 1, store: 'url', pendingSync: true, syncReady: true, session: 'session-1', syncRevision: 1,
+    fields: [{ id: 'region', label: 'Region', value: 'Europe' }],
+  } }));
+  m.window.dispatchEvent(new m.window.CustomEvent(BOOKMARK_SYNC_STATUS_EVENT, { detail: {
+    version: 1, state: 'saved', pendingSync: true, syncReady: true, session: 'session-1', syncRevision: 1,
+  } }));
+  await flush(); await flush();
+  Object.defineProperty(m.document, 'hidden', { configurable: true, value: true });
+  m.document.dispatchEvent(new m.window.Event('visibilitychange'));
+  await flush(); await flush();
+  return { ...m, advanceGrace() {
+    now += 30000;
+    const timer = m.timerRecords.find((timer) => timer.delay === 30000);
+    assert.ok(timer, 'hidden grace timer was not scheduled');
+    timer.fn();
+  } };
+}
+
+test('opted-in hidden tabs wait for grace, preserve filter URL and switch once', async (t) => {
+  const m = await hiddenSwitchFixture(t, { url: 'http://apps.example.com/app/demo/?_inputs_&region=Europe#plot' });
+  assert.equal(m.fetches.filter((f) => f.url === SWITCH_URL).length, 0);
+  m.advanceGrace(); await flush(); await flush();
+  assert.equal(m.fetches.filter((f) => f.url === SWITCH_URL).length, 1);
+  assert.equal(m.window.location.search, '?_inputs_&region=Europe');
+  assert.equal(m.window.location.hash, '#plot');
+  assert.equal(m.jsdomErrors.filter((e) => /Not implemented: navigation/.test(e)).length, 1);
+  assert.equal(JSON.parse(m.window.sessionStorage.getItem('shinyhub-app-nav:auto-update:demo')).to, 'new');
+  assert.ok(m.timerRecords.some((timer) => timer.delay >= 60000 && timer.delay < 63000), 'hidden polling stopped');
+});
+
+test('returning to an automatic-switching tab cancels navigation even after POST succeeds', async (t) => {
+  const m = await hiddenSwitchFixture(t, { deferSwitch: true });
+  m.advanceGrace();
+  Object.defineProperty(m.document, 'hidden', { configurable: true, value: false });
+  m.document.dispatchEvent(new m.window.Event('visibilitychange'));
+  await m.settle();
+  assert.equal(m.jsdomErrors.filter((e) => /Not implemented: navigation/.test(e)).length, 0);
+  assert.equal(m.root().classList.contains('version-switching'), false);
+});
+
+test('a pending filter change during the switch POST prevents automatic navigation', async (t) => {
+  const m = await hiddenSwitchFixture(t, { deferSwitch: true });
+  m.advanceGrace();
+  m.window.dispatchEvent(new m.window.CustomEvent(BOOKMARK_SYNC_STATUS_EVENT, { detail: { version: 1, state: 'pending' } }));
+  await m.settle();
+  assert.equal(m.jsdomErrors.filter((e) => /Not implemented: navigation/.test(e)).length, 0);
+});
+
+test('legacy bookmark adapters and errored syncs keep automatic switching manual', async (t) => {
+  for (const status of [{ version: 1, state: 'saved' }, { version: 1, state: 'error' }]) {
+    const m = await hiddenSwitchFixture(t);
+    m.window.dispatchEvent(new m.window.CustomEvent(BOOKMARK_SYNC_STATUS_EVENT, { detail: status }));
+    m.advanceGrace(); await flush(); await flush();
+    assert.equal(m.fetches.filter((f) => f.url === SWITCH_URL).length, 0);
+    assert.equal(m.q('.version-notice').hidden, false);
+  }
+});
+
+test('open bookmark/chat panels and snapshots prevent an automatic switch', async (t) => {
+  for (const block of ['bookmark', 'chat', 'busy-chat', 'snapshot']) {
+    const m = await hiddenSwitchFixture(t);
+    if (block === 'bookmark') m.q('button.bookmark-trigger').click();
+    if (block === 'chat') m.window.dispatchEvent(new m.window.CustomEvent(CHAT_STATE_EVENT, { detail: { version: 1, open: true } }));
+    if (block === 'busy-chat') m.window.dispatchEvent(new m.window.CustomEvent('shinyhub:chat:busy', { detail: { version: 1, busy: true } }));
+    if (block === 'snapshot') m.window.dispatchEvent(new m.window.CustomEvent(SESSION_EVENT, { detail: { state: 'snapshot', title: 'Offline' } }));
+    m.advanceGrace(); await flush(); await flush();
+    assert.equal(m.fetches.filter((f) => f.url === SWITCH_URL).length, 0, block);
+  }
+});
+
+test('automatic switching respects the manual policy and a stale saved revision', async (t) => {
+  for (const extra of [{ attrs: { 'data-served-generation': 'old', 'data-version-url': VERSION_URL, 'data-switch-url': SWITCH_URL } }, {}]) {
+    const m = await hiddenSwitchFixture(t, extra);
+    m.window.dispatchEvent(new m.window.CustomEvent(BOOKMARK_SYNC_STATUS_EVENT, { detail: { version: 1, state: 'saved', pendingSync: true, session: 'session-1', syncRevision: 0 } }));
+    for (const timer of m.timerRecords.filter((timer) => timer.delay === 30000)) timer.fn();
+    await flush(); await flush();
+    assert.equal(m.fetches.filter((f) => f.url === SWITCH_URL).length, 0);
+  }
+});
+
+test('automatic updates show a dismissible one-use explanation', async (t) => {
+  const m = mount({ attrs: { 'data-served-generation': 'new' }, autoUpdateMarker: { from: 'old', to: 'new', at: Date.now() } });
+  t.after(() => m.window.close());
+  assert.match(m.q('.automatic-update-notice').textContent, /Updated to the latest version/);
+  assert.equal(m.window.sessionStorage.getItem('shinyhub-app-nav:auto-update:demo'), null);
+  m.q('.automatic-update-notice button').click();
+  assert.equal(m.q('.automatic-update-notice'), null);
+});
 
 test('mounts a recognizable app bar into the page without fetching anything', async () => {
   const m = mount();
@@ -2032,4 +2133,48 @@ test('a tag with no data-nav-url mounts nothing at all', async () => {
   // control that does nothing, on someone else's page.
   const m = mount({ attrs: { 'data-nav-url': null } });
   assert.equal(m.host(), null);
+});
+
+
+test('loading pages leave the automatic-update marker for the actual app page', () => {
+ const marker={from:'old',to:'new',at:Date.now()};
+ const m=mount({autoUpdateMarker:marker});
+ assert.deepEqual(JSON.parse(m.window.sessionStorage.getItem('shinyhub-app-nav:auto-update:demo')),marker);
+ assert.equal(m.q('.automatic-update-notice'),null);
+ m.window.close();
+});
+
+test('a harmless cancellation can retry after another hidden grace', async (t) => {
+ const m=await hiddenSwitchFixture(t,{deferSwitch:true});
+ m.advanceGrace();
+ Object.defineProperty(m.document,'hidden',{configurable:true,value:false});
+ m.document.dispatchEvent(new m.window.Event('visibilitychange'));
+ await m.settle();
+ Object.defineProperty(m.document,'hidden',{configurable:true,value:true});
+ m.document.dispatchEvent(new m.window.Event('visibilitychange'));
+ await flush();await flush();
+ m.advanceGrace();
+ assert.equal(m.fetches.filter(f=>f.url===SWITCH_URL && f.opts.method==='POST').length,2);
+ assert.ok(m.fetches.some(f=>f.url===SWITCH_URL && f.opts.method==='DELETE'));
+});
+
+
+test('a reload landing on the same generation suppresses another unattended reload', async (t) => {
+ const m=await hiddenSwitchFixture(t,{autoUpdateMarker:{from:'old',to:'new',at:Date.now()}});
+ // The marker's target is latched before any subsequent version check.
+ for(const timer of m.timerRecords.filter(t=>t.delay===30000))timer.fn();
+ await flush();await flush();
+ assert.equal(m.fetches.filter(f=>f.url===SWITCH_URL && f.opts.method==='POST').length,0);
+});
+
+
+test('an automatic switch rejection falls back to the manual notice without an error alert', async (t) => {
+ const m=await hiddenSwitchFixture(t,{switchStatus:409});
+ m.advanceGrace();await flush();await flush();
+ assert.equal(m.root().classList.contains('version-error'),false);
+ assert.equal(m.q('.version-notice').hidden,false);
+ assert.equal(m.jsdomErrors.filter(e=>/Not implemented: navigation/.test(e)).length,0);
+ const poll=m.timerRecords.find(timer=>timer.delay>=60000 && timer.delay<63000);
+ assert.ok(poll);poll.fn();await flush();await flush();
+ assert.equal(m.fetches.filter(f=>f.url===SWITCH_URL && f.opts.method==='POST').length,1,'automatic rejection retried');
 });

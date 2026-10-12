@@ -16,6 +16,7 @@ import (
 
 	"github.com/rvben/shinyhub/internal/appnav"
 	"github.com/rvben/shinyhub/internal/auth"
+	"github.com/rvben/shinyhub/internal/config"
 	"github.com/rvben/shinyhub/internal/favicon"
 	"github.com/rvben/shinyhub/internal/supportui"
 )
@@ -39,6 +40,35 @@ func TestInjectionPreservesAlreadyAllowedAppInlineScripts(t *testing.T) {
 		got, ok := extendCSPForScripts(policy, []string{overlayCSPHash})
 		if !ok || !strings.Contains(got, overlayCSPHash) {
 			t.Fatalf("restricted policy omitted the injected script hash: %q", got)
+		}
+	}
+}
+
+func TestInjectedVersionSwitchPolicyUsesTheServedGeneration(t *testing.T) {
+	p := New()
+	p.SetAppNav(true, "/")
+	p.SetPoolSize("demo", 1)
+	p.SetVersionSwitchLookup(func(slug string, id int64) string {
+		if slug == "demo" && id == 10 {
+			return "when_hidden"
+		}
+		return "manual"
+	})
+	r := httptest.NewRequest(http.MethodGet, "/app/demo/", nil)
+	r.Header.Set("Accept", "text/html")
+	for _, tc := range []struct {
+		id     int64
+		policy string
+	}{{10, "when_hidden"}, {20, "manual"}, {0, "manual"}} {
+		scripts := p.pageScriptsFor(r, "demo", tc.id)
+		var snippet string
+		for _, script := range scripts {
+			if script.cspHash == appnav.CSPHash {
+				snippet = script.render()
+			}
+		}
+		if !strings.Contains(snippet, `data-version-switch="`+tc.policy+`"`) {
+			t.Fatalf("generation %d policy missing", tc.id)
 		}
 	}
 }
@@ -859,6 +889,156 @@ func TestRelaxEncodingForInjection(t *testing.T) {
 			p.relaxEncodingForInjection(s)
 			if got := s.Header.Get("Accept-Encoding"); got != "gzip, br" {
 				t.Fatalf("sub-resource lost its Accept-Encoding %q; it is never injected into", got)
+			}
+		})
+	}
+}
+
+func TestVersionSwitchIntentOnlyChangesAffinityOnDocumentNavigation(t *testing.T) {
+	p := New()
+	for _, tc := range []struct {
+		name, dest, mode string
+		consume          bool
+	}{
+		{"document", "document", "navigate", true}, {"legacy", "", "", true},
+		{"iframe", "iframe", "navigate", false}, {"fetch", "empty", "cors", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/app/demo/", nil)
+			r.Header.Set("Accept", "text/html")
+			r.Header.Set("Sec-Fetch-Dest", tc.dest)
+			r.Header.Set("Sec-Fetch-Mode", tc.mode)
+			for _, c := range []*http.Cookie{{Name: "shinyhub_switch_demo", Value: "1"}, {Name: cookiePrefix + "demo", Value: "old"}, {Name: clientCookiePrefix + "demo", Value: "client"}, {Name: "other", Value: "kept"}} {
+				r.AddCookie(c)
+			}
+			w := httptest.NewRecorder()
+			next := p.consumeGenerationSwitch(w, r, "demo")
+			if !tc.consume {
+				if next != r || len(w.Result().Cookies()) != 0 {
+					t.Fatal("subrequest consumed switch intent")
+				}
+				return
+			}
+			for _, name := range []string{"shinyhub_switch_demo", cookiePrefix + "demo", clientCookiePrefix + "demo"} {
+				if _, err := next.Cookie(name); err == nil {
+					t.Fatalf("navigation kept %s", name)
+				}
+				if _, err := r.Cookie(name); err != nil {
+					t.Fatalf("original request lost %s", name)
+				}
+			}
+			if c, err := next.Cookie("other"); err != nil || c.Value != "kept" {
+				t.Fatal("unrelated cookie removed")
+			}
+			if len(w.Result().Cookies()) != 2 {
+				t.Fatal("navigation did not expire intent and affinity")
+			}
+		})
+	}
+}
+
+func TestAutomaticSwitchNeverChangesSharedElasticClientIdentity(t *testing.T) {
+	p := New()
+	p.SetPoolSize("demo", 1)
+	p.SetVersionSwitchLookup(func(string, int64) string { return "when_hidden" })
+	if p.versionSwitchPolicy("demo", 10) != "when_hidden" {
+		t.Fatal("multiplex opt-in rejected")
+	}
+	for _, mode := range []config.WorkerIsolationMode{config.IsolationMultiplex, config.IsolationGrouped, config.IsolationPerSession} {
+		p.SetPoolMode("demo", mode, 2, 4)
+		r := httptest.NewRequest(http.MethodGet, "/app/demo/", nil)
+		r.Header.Set("Accept", "text/html")
+		r.Header.Set("Sec-Fetch-Dest", "document")
+		r.AddCookie(&http.Cookie{Name: "shinyhub_switch_demo", Value: "auto"})
+		r.AddCookie(&http.Cookie{Name: clientCookiePrefix + "demo", Value: "shared"})
+		w := httptest.NewRecorder()
+		next := p.consumeGenerationSwitch(w, r, "demo")
+		if c, err := next.Cookie(clientCookiePrefix + "demo"); err != nil || c.Value != "shared" {
+			t.Fatal("automatic switch removed shared client")
+		}
+		for _, c := range w.Result().Cookies() {
+			if c.Name == clientCookiePrefix+"demo" {
+				t.Fatal("automatic switch mutated shared cookie")
+			}
+		}
+		if mode != config.IsolationMultiplex {
+			if next != r {
+				t.Fatal("automatic switch proceeded on elastic pool")
+			}
+			if p.versionSwitchPolicy("demo", 10) != "manual" {
+				t.Fatal("elastic pool opted in")
+			}
+		}
+	}
+}
+
+func TestAutomaticSwitchRejectsRetainedElasticWorkers(t *testing.T) {
+	p := New()
+	p.SetPoolSize("demo", 1)
+	p.mu.Lock()
+	p.pools["demo"].workers = map[int]*replicaBackend{1: {}}
+	p.mu.Unlock()
+	if p.AutomaticGenerationSwitchSafe("demo") {
+		t.Fatal("retained elastic worker allowed automatic switch")
+	}
+}
+
+func TestAutomaticSwitchPreservesAnActiveGenerationReplicaPin(t *testing.T) {
+	p := New()
+	p.SetPoolSize("demo", 2)
+	for index, label := range []string{"replica-0", "replica-1"} {
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.Header.Get("Cookie"), versionSwitchCookiePrefix) {
+				t.Error("switch intent reached app backend")
+			}
+			io.WriteString(w, label)
+		}))
+		t.Cleanup(backend.Close)
+		if err := p.RegisterReplica("demo", index, backend.URL, nil, 20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.mu.RLock()
+	p.pools["demo"].replicas[1].activeConns.Store(1)
+	p.mu.RUnlock()
+	for _, tc := range []struct {
+		name       string
+		deployment int64
+		want       string
+		fresh      bool
+	}{
+		{"pin-shared-with-visible-tab", 20, "replica-1", false},
+		{"old-generation-pin", 10, "replica-0", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/app/demo/", nil)
+			r.Header.Set("Accept", "text/html")
+			r.Header.Set("Sec-Fetch-Dest", "document")
+			r.AddCookie(&http.Cookie{Name: cookiePrefix + "demo", Value: p.stickyCookieValue("demo", 1, tc.deployment)})
+			r.AddCookie(&http.Cookie{Name: "shinyhub_switch_demo", Value: "auto"})
+			w := httptest.NewRecorder()
+			p.ServeHTTP(w, r)
+			if w.Code != http.StatusOK || w.Body.String() != tc.want {
+				t.Fatalf("automatic reload = %d %q, want %q", w.Code, w.Body.String(), tc.want)
+			}
+			fresh := false
+			intentExpired := false
+			for _, c := range w.Result().Cookies() {
+				if c.Name == versionSwitchCookiePrefix+"demo" && c.MaxAge < 0 {
+					intentExpired = true
+				}
+				if c.Name == cookiePrefix+"demo" {
+					fresh = true
+					if c.MaxAge < 0 {
+						t.Fatal("automatic switch expired shared replica pin")
+					}
+				}
+			}
+			if !intentExpired {
+				t.Fatal("automatic switch did not expire intent")
+			}
+			if fresh != tc.fresh {
+				t.Fatalf("fresh affinity = %v, want %v", fresh, tc.fresh)
 			}
 		})
 	}

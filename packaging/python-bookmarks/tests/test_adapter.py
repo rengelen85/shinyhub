@@ -7,6 +7,7 @@ import pytest
 
 from shinyhub_bookmarks import ChoiceRestore, register
 from shinyhub_bookmarks._adapter import (
+    BROWSER_REVISION_INPUT_ID,
     DISCOVER_INPUT_ID,
     REQUEST_INPUT_ID,
     SYNC_ACK_INPUT_ID,
@@ -264,6 +265,7 @@ def test_selection_exclusions_are_request_local_and_keep_selected_fields():
         {"region", "period", "other-input"},
         ["region"],
     ) == [
+        BROWSER_REVISION_INPUT_ID,
         DISCOVER_INPUT_ID,
         REQUEST_INPUT_ID,
         SYNC_ACK_INPUT_ID,
@@ -503,21 +505,29 @@ async def test_registered_input_changes_request_automatic_url_sync(monkeypatch):
     await publish()
     assert session.messages[-1][1]["autoSync"] is False
     assert session.messages[-1][1]["syncRevision"] == 0
+    assert session.messages[-1][1]["pendingSync"] is True
+    assert session.messages[-1][1]["syncReady"] is False
+    assert session.messages[-1][1]["registeredInputs"] == ["region"]
+    assert session.messages[-1][1]["observedBrowserRevision"] == 0
+    inputs.values[".shinyhub_bookmark_browser_revision"] = 7
+    await publish()
+    assert session.messages[-1][1]["observedBrowserRevision"] == 7
     assert session.messages[-1][1]["syncFields"] == []
 
     clean_restore = type("RestoreState", (), {"input": {}, "values": {}})()
     await session.bookmark.restore_callbacks[0](clean_restore)
+    assert session.messages[-1][1]["syncReady"] is True
 
     inputs.values["region"] = "Americas"
     await publish()
     assert session.messages[-1][1]["autoSync"] is True
-    assert session.messages[-1][1]["syncRevision"] == 1
+    assert session.messages[-1][1]["syncRevision"] == 2
     assert session.messages[-1][1]["fields"][0]["value"] == "Americas"
     assert session.messages[-1][1]["syncFields"] == ["region"]
 
     inputs.values["region"] = "Europe"
     await publish()
-    assert session.messages[-1][1]["syncRevision"] == 2
+    assert session.messages[-1][1]["syncRevision"] == 3
     assert session.messages[-1][1]["syncFields"] == []
 
     republish = next(
@@ -527,15 +537,28 @@ async def test_registered_input_changes_request_automatic_url_sync(monkeypatch):
     )
     await republish()
     assert session.messages[-1][1]["autoSync"] is True
-    assert session.messages[-1][1]["syncRevision"] == 2
+    assert session.messages[-1][1]["syncRevision"] == 3
 
     acknowledge = next(
         callback for callback in effects if callback.__name__ == "_acknowledge_url_sync"
     )
-    inputs.values[SYNC_ACK_INPUT_ID] = {"version": 1, "syncRevision": 2}
+    inputs.values[SYNC_ACK_INPUT_ID] = {"version": 1, "syncRevision": 3}
     await acknowledge()
     await republish()
     assert session.messages[-1][1]["autoSync"] is False
+
+    original_getitem = Inputs.__getitem__
+
+    def read_with_unavailable_revision(self, name):
+        if name == BROWSER_REVISION_INPUT_ID:
+            def unavailable():
+                raise RuntimeError("revision temporarily unavailable")
+            return unavailable
+        return original_getitem(self, name)
+
+    monkeypatch.setattr(Inputs, "__getitem__", read_with_unavailable_revision)
+    await republish()
+    assert "observedBrowserRevision" not in session.messages[-1][1]
 
 
 @pytest.mark.asyncio
@@ -1067,6 +1090,7 @@ async def test_request_scopes_exclusions_to_its_bookmark_state(monkeypatch):
 
     assert session.bookmark.exclude == ["author_excluded", "region"]
     assert session.bookmark.last_save_state.exclude == [
+        BROWSER_REVISION_INPUT_ID,
         DISCOVER_INPUT_ID,
         REQUEST_INPUT_ID,
         SYNC_ACK_INPUT_ID,
@@ -1117,6 +1141,7 @@ async def test_automatic_sync_can_exclude_every_field_at_baseline(monkeypatch):
     await handle()
 
     assert session.bookmark.last_save_state.exclude == [
+        BROWSER_REVISION_INPUT_ID,
         DISCOVER_INPUT_ID,
         REQUEST_INPUT_ID,
         SYNC_ACK_INPUT_ID,
@@ -1249,6 +1274,7 @@ async def test_overlapping_native_bookmark_does_not_inherit_adapter_selection(
     release.set()
     await request_task
     assert session.bookmark.last_save_state.exclude == [
+        BROWSER_REVISION_INPUT_ID,
         DISCOVER_INPUT_ID,
         REQUEST_INPUT_ID,
         SYNC_ACK_INPUT_ID,

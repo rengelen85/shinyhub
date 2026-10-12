@@ -91,6 +91,15 @@ func SnippetWithName(slug, name, homeURL string) string {
 // page. The client compares this opaque value with the durable active token;
 // it never infers ordering and never treats the token as authorization.
 func SnippetWithGeneration(slug, name, homeURL, generation string) string {
+	return SnippetWithVersionSwitch(slug, name, homeURL, generation, "manual")
+}
+
+// SnippetWithVersionSwitch carries the policy of the bundle that served this
+// page. Unknown policies fall back to manual switching.
+func SnippetWithVersionSwitch(slug, name, homeURL, generation, policy string) string {
+	if policy != "when_hidden" {
+		policy = "manual"
+	}
 	if homeURL == "" {
 		homeURL = "/"
 	}
@@ -100,6 +109,7 @@ func SnippetWithGeneration(slug, name, homeURL, generation string) string {
 		` data-current-name="` + html.EscapeString(name) + `"` +
 		` data-home-url="` + html.EscapeString(homeURL) + `"` +
 		` data-served-generation="` + html.EscapeString(generation) + `"` +
+		` data-version-switch="` + policy + `"` +
 		` data-version-url="` + html.EscapeString(VersionURL(slug)) + `"` +
 		` data-switch-url="` + html.EscapeString(SwitchURL(slug)) + `">` +
 		Script +

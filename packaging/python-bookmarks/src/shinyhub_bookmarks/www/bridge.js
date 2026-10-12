@@ -32,6 +32,12 @@
   var recentSyncOrder = [];
   var discoveryRetryTimer = null;
   var discoveryAttempts = 0;
+  var browserRevision = 0;
+  var observedBrowserRevision = 0;
+  var domPending = Object.create(null);
+  var earlyInputs = Object.create(null);
+  var lastSyncStatus = null;
+  var inputEventsInstalled = false;
 
   function emit(name, detail) {
     try {
@@ -163,12 +169,67 @@
   }
 
   function emitSyncStatus(state, code, message) {
-    emit(SYNC_STATUS, {
+    lastSyncStatus = {
       version: VERSION,
       state: state,
       code: code || "",
-      message: message || ""
-    });
+      message: message || "",
+      pendingSync: !!(cachedCapabilities && cachedCapabilities.pendingSync === true),
+      session: syncSession,
+      syncRevision: desiredSyncRevision,
+      browserRevision: browserRevision
+    };
+    emit(SYNC_STATUS, lastSyncStatus);
+  }
+
+  function hasDirtyInputs() { return cachedCapabilities && cachedCapabilities.pendingSync === true && (Object.keys(domPending).length > 0 || observedBrowserRevision < browserRevision); }
+
+  function markInputChanged(id, fromDOM) {
+    if (!cachedCapabilities) {
+      if (typeof id === "string" && id.charAt(0) !== "." && Object.keys(earlyInputs).length < 1000) earlyInputs[id] = fromDOM;
+      return;
+    }
+    if (cachedCapabilities.pendingSync !== true || !Array.isArray(cachedCapabilities.registeredInputs) || cachedCapabilities.registeredInputs.indexOf(id) === -1) return;
+    browserRevision += 1;
+    if (fromDOM) domPending[id] = true;
+    else delete domPending[id];
+    emitSyncStatus("pending", "", "");
+    if (!fromDOM) sendBrowserRevision();
+  }
+
+  function sendBrowserRevision() {
+    try {
+      // Default batching is essential: Shiny enqueues the original input after
+      // its inputchanged handlers, so an event-priority send here would outrun it.
+      window.Shiny.setInputValue(".shinyhub_bookmark_browser_revision", browserRevision);
+    } catch (error) { /* Keep pending until a later observation succeeds. */ }
+  }
+
+  function inputChanged(event) {
+    var detail = event.detail || event;
+    markInputChanged(detail.name, false);
+  }
+
+  document.addEventListener("input", function (event) {
+    var target = event.target;
+    var bound = target && typeof target.closest === "function" ? target.closest(".shiny-bound-input") : null;
+    markInputChanged(bound ? bound.id : target && target.id, true);
+  }, true);
+
+  function installInputEvents() {
+    if (inputEventsInstalled) return;
+    inputEventsInstalled = true;
+    if (window.jQuery) {
+      window.jQuery(document).on("shiny:inputchanged.shinyhubBookmarks", inputChanged);
+      window.jQuery(document).on("shiny:connected.shinyhubBookmarks", function () { dispatchDiscovery(); });
+      window.jQuery(document).on("shiny:disconnected.shinyhubBookmarks", function () {
+        emitSyncStatus("pending", "", "");
+      });
+    } else {
+      document.addEventListener("shiny:inputchanged", inputChanged);
+      document.addEventListener("shiny:connected", function () { dispatchDiscovery(); });
+      document.addEventListener("shiny:disconnected", function () { emitSyncStatus("pending", "", ""); });
+    }
   }
 
   function acknowledgeURLSync(revision) {
@@ -252,7 +313,7 @@
 
   function sendRequest(detail, kind, revision) {
     if (!install() || pendingRequest) return false;
-    pendingRequest = { requestId: detail.requestId, kind: kind, revision: revision || 0 };
+    pendingRequest = { requestId: detail.requestId, kind: kind, revision: revision || 0, browserRevision: browserRevision };
     try {
       window.Shiny.setInputValue(REQUEST_INPUT, detail, { priority: "event" });
     } catch (error) {
@@ -293,7 +354,7 @@
 
   function requestURLSync() {
     syncTimer = null;
-    if (!syncNeeded || pendingRequest || queuedCreate) return;
+    if (!syncNeeded || pendingRequest || queuedCreate || hasDirtyInputs()) return;
     var include = syncFieldIDs();
     syncNeeded = false;
     syncSequence += 1;
@@ -319,6 +380,8 @@
   // until it times out. A queued link request was never sent and goes to the
   // new session.
   function startServerSession() {
+    observedBrowserRevision = -1;
+    emitSyncStatus("pending", "", "");
     desiredSyncRevision = 0;
     syncRetries = 0;
     syncNeeded = false;
@@ -339,7 +402,7 @@
   }
 
   function scheduleURLSync() {
-    if (!syncNeeded || pendingRequest || queuedCreate) return;
+    if (!syncNeeded || pendingRequest || queuedCreate || hasDirtyInputs()) return;
     clearSyncTimer();
     syncTimer = window.setTimeout(requestURLSync, SYNC_DELAY_MS);
   }
@@ -358,15 +421,32 @@
       return false;
     }
     handlersInstalled = true;
+    installInputEvents();
     window.Shiny.addCustomMessageHandler("shinyhub-bookmark-capabilities", function (message) {
       if (!validVersion(message)) return;
+      if (!cachedCapabilities && message.pendingSync === true && Array.isArray(message.registeredInputs)) {
+        message.registeredInputs.forEach(function (id) {
+          if (Object.prototype.hasOwnProperty.call(earlyInputs, id)) {
+            browserRevision += 1;
+            if (earlyInputs[id]) domPending[id] = true;
+          }
+        });
+        if (browserRevision > 0) sendBrowserRevision();
+      }
+      earlyInputs = Object.create(null);
       cachedCapabilities = message;
-      emit(CAPABILITIES, message);
       if (typeof message.session === "string" && message.session !== syncSession) {
         if (syncSession !== null) startServerSession();
         syncSession = message.session;
       }
-      if (message.autoSync === true) {
+      if (message.pendingSync === true && Number.isInteger(message.observedBrowserRevision)) {
+        observedBrowserRevision = Math.max(observedBrowserRevision, message.observedBrowserRevision);
+      }
+      if (message.pendingSync === true && message.syncReady !== true) emitSyncStatus("pending", "", "");
+      emit(CAPABILITIES, message);
+      if ((message.autoSync === true ||
+          (message.pendingSync === true && (!lastSyncStatus || lastSyncStatus.state !== "saved"))) &&
+          (message.pendingSync !== true || message.syncReady === true)) {
         var revision = Number.isInteger(message.syncRevision) && message.syncRevision >= 0
           ? message.syncRevision
           : desiredSyncRevision + 1;
@@ -377,6 +457,7 @@
         desiredSyncRevision = Math.max(desiredSyncRevision, revision);
         if (!sameRevisionInFlight) {
           syncNeeded = true;
+          emitSyncStatus("pending", "", "");
           scheduleURLSync();
         }
       }
@@ -385,7 +466,8 @@
       if (!validVersion(message)) return;
       var finished = finishRequest(message.requestId);
       if (finished && finished.kind === "sync") {
-        if (syncNeeded || finished.revision !== desiredSyncRevision) {
+        if (syncNeeded || finished.revision !== desiredSyncRevision ||
+            finished.browserRevision !== browserRevision || hasDirtyInputs()) {
           syncNeeded = true;
           drainRequests(true);
           return;
@@ -445,6 +527,7 @@
       dispatchDiscovery();
     }
     if (cachedCapabilities) emit(CAPABILITIES, cachedCapabilities);
+    if (lastSyncStatus) emit(SYNC_STATUS, lastSyncStatus);
   });
 
   window.addEventListener(CREATE, function (event) {

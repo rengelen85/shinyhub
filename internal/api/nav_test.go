@@ -301,7 +301,7 @@ func TestAppVersionJSON_ReturnsOnlyThePublishedOpaqueGeneration(t *testing.T) {
 	}
 }
 
-func TestAppVersionSwitch_RequiresExplicitHeaderAndClearsOnlyThisAppCookie(t *testing.T) {
+func TestAppVersionSwitch_RequiresExplicitHeaderAndSetsAppScopedIntent(t *testing.T) {
 	srv, store := newBrandingTestServer(t, config.BrandingConfig{})
 	srv.proxy = proxy.New()
 	hash, _ := testHashPassword("pw")
@@ -328,11 +328,33 @@ func TestAppVersionSwitch_RequiresExplicitHeaderAndClearsOnlyThisAppCookie(t *te
 	}
 	cookies := rr.Result().Cookies()
 	if len(cookies) != 1 {
-		t.Fatalf("cookies = %d, want one app-scoped affinity deletion", len(cookies))
+		t.Fatalf("cookies = %d, want one app-scoped switch intent", len(cookies))
 	}
-	if cookies[0].Name != "shinyhub_rep_dashboard" || cookies[0].Path != "/app/dashboard/" || cookies[0].MaxAge >= 0 {
-		t.Fatalf("affinity deletion = %#v", cookies[0])
+	if cookies[0].Name != "shinyhub_switch_dashboard" || cookies[0].Path != "/app/dashboard/" || cookies[0].MaxAge != 20 {
+		t.Fatalf("switch intent = %#v", cookies[0])
 	}
+	cancel := reqWithOptionalUser("DELETE", appnav.SwitchURL("dashboard"), nil)
+	cancel.Header.Set("X-ShinyHub-Version-Switch", "1")
+	cancelled := httptest.NewRecorder()
+	srv.HandleAppVersionSwitch(cancelled, cancel, "dashboard")
+	if cancelled.Code != http.StatusNoContent || cancelled.Result().Cookies()[0].MaxAge != -1 {
+		t.Fatal("cancel did not expire intent")
+	}
+	automatic := reqWithOptionalUser("POST", appnav.SwitchURL("dashboard"), nil)
+	automatic.Header.Set("X-ShinyHub-Version-Switch", "1")
+	automatic.Header.Set("X-ShinyHub-Automatic-Switch", "1")
+	blocked := httptest.NewRecorder()
+	srv.HandleAppVersionSwitch(blocked, automatic, "dashboard")
+	if blocked.Code != http.StatusConflict || len(blocked.Result().Cookies()) != 0 {
+		t.Fatal("automatic request with no multiplex pool changed cookies")
+	}
+	srv.proxy.SetPoolSize("dashboard", 1)
+	allowed := httptest.NewRecorder()
+	srv.HandleAppVersionSwitch(allowed, automatic, "dashboard")
+	if allowed.Code != http.StatusNoContent || allowed.Result().Cookies()[0].Value != "auto" {
+		t.Fatal("automatic multiplex intent missing")
+	}
+
 }
 
 func TestAppVersionJSON_DoesNotRevealPrivateAppsToAnonymousCallers(t *testing.T) {

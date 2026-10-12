@@ -88,8 +88,8 @@ func overlayPageScript(slug string) pageScript {
 }
 
 // navPageScript is the app switcher as an injectable script.
-func navPageScript(slug, name, homeURL, generation string) pageScript {
-	return pageScript{render: func() string { return appnav.SnippetWithGeneration(slug, name, homeURL, generation) }, cspHash: appnav.CSPHash}
+func navPageScript(slug, name, homeURL, generation, policy string) pageScript {
+	return pageScript{render: func() string { return appnav.SnippetWithVersionSwitch(slug, name, homeURL, generation, policy) }, cspHash: appnav.CSPHash}
 }
 
 // extendCSPForScripts returns policy with each hash allowed for scripts, and
@@ -478,7 +478,7 @@ func (p *Proxy) pageScriptsFor(r *http.Request, slug string, deploymentID int64)
 		scripts = append(scripts, overlayPageScript(slug))
 	}
 	if nav := p.appNav.Load(); nav != nil && support == nil {
-		scripts = append(scripts, navPageScript(slug, p.appName(slug), nav.homeURL, p.generationActivationToken(slug, deploymentID)))
+		scripts = append(scripts, navPageScript(slug, p.appName(slug), nav.homeURL, p.generationActivationToken(slug, deploymentID), p.versionSwitchPolicy(slug, deploymentID)))
 	}
 	return scripts
 }

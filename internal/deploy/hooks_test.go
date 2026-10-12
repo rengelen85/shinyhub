@@ -33,6 +33,25 @@ func TestLoadManifest_AbsentReturnsNil(t *testing.T) {
 	}
 }
 
+func TestLoadManifestVersionSwitchPolicy(t *testing.T) {
+	for _, policy := range []string{"manual", "when_hidden", "invalid"} {
+		t.Run(policy, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "shinyhub.toml"), []byte("[app]\nversion_switch = \""+policy+"\"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			m, err := LoadManifest(dir)
+			if policy == "invalid" {
+				if err == nil || !strings.Contains(err.Error(), "version_switch") {
+					t.Fatalf("invalid policy accepted: %v", err)
+				}
+			} else if err != nil || m.App.VersionSwitch != policy {
+				t.Fatalf("policy=%+v %v", m, err)
+			}
+		})
+	}
+}
+
 func TestLoadManifest_ParsesPostDeployHook(t *testing.T) {
 	dir := t.TempDir()
 	writeManifest(t, dir, `

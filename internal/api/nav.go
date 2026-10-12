@@ -127,7 +127,7 @@ func (s *Server) HandleAppVersionJSON(w http.ResponseWriter, r *http.Request, sl
 	writeJSON(w, http.StatusOK, appVersionPayload{ActiveGeneration: token})
 }
 
-// HandleAppVersionSwitch clears this browser's signed affinity pin. Requiring
+// HandleAppVersionSwitch prepares (or cancels) a top-level version switch. Requiring
 // a non-simple custom header keeps cross-site forms from forcing a switch; the
 // endpoint sends no CORS permission, so a foreign origin cannot add it.
 func (s *Server) HandleAppVersionSwitch(w http.ResponseWriter, r *http.Request, slug string) {
@@ -142,7 +142,12 @@ func (s *Server) HandleAppVersionSwitch(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusServiceUnavailable, "version switching unavailable")
 		return
 	}
-	s.proxy.ClearGenerationAffinity(w, r, slug)
+	automatic := r.Header.Get("X-ShinyHub-Automatic-Switch") == "1"
+	if r.Method != http.MethodDelete && automatic && !s.proxy.AutomaticGenerationSwitchSafe(slug) {
+		writeError(w, http.StatusConflict, "automatic version switching requires a multiplex pool without retained elastic workers")
+		return
+	}
+	s.proxy.PrepareGenerationSwitch(w, r, slug, r.Method == http.MethodDelete, automatic)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
 }

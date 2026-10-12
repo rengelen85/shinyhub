@@ -52,6 +52,79 @@ const requests = (mounted) => mounted.inputs.filter(
   (entry) => entry.id === '.shinyhub_bookmark_request',
 );
 
+test('browser filter changes become pending before server observation and cannot accept stale syncs', async () => {
+  const m = mountBridge({ timeoutMap: { 300: 0 } });
+  const statuses = [];
+  m.window.addEventListener('shinyhub:bookmark:sync-status', (e) => statuses.push(e.detail));
+  const capability = (revision, value) => ({ version: 1, store: 'url', session: 's1',
+    autoSync: true, pendingSync: true, syncReady: true, registeredInputs: ['region'],
+    observedBrowserRevision: m.inputs.filter(e => e.id === '.shinyhub_bookmark_browser_revision').at(-1)?.value || 0, syncRevision: revision, syncFields: ['region'],
+    fields: [{ id: 'region', label: 'Region', value }],
+  });
+  m.handlers['shinyhub-bookmark-capabilities'](capability(1, 'Europe'));
+  await flush(m.window, 10);
+  const first = requests(m)[0].value;
+  m.handlers['shinyhub-bookmark-result']({ version: 1, purpose: 'sync', requestId: first.requestId,
+    url: 'https://hub.test/app/demo/?_inputs_&region=Europe' });
+  assert.equal(statuses.at(-1).state, 'saved');
+  // A second serialization is in flight when a fresh browser edit occurs.
+  m.handlers['shinyhub-bookmark-capabilities'](capability(2, 'Americas'));
+  await flush(m.window, 10);
+  const stale = requests(m)[1].value;
+  m.window.document.dispatchEvent(new m.window.CustomEvent('shiny:inputchanged', {
+    detail: { name: 'region', value: 'Asia' },
+  }));
+  assert.equal(statuses.at(-1).state, 'pending', 'pending waited for the debounce/server');
+  m.handlers['shinyhub-bookmark-result']({ version: 1, purpose: 'sync', requestId: stale.requestId,
+    url: 'https://hub.test/app/demo/?_inputs_&region=Americas' });
+  await flush(m.window, 10);
+  assert.equal(m.window.location.search, '?_inputs_&region=Europe');
+  assert.equal(statuses.at(-1).state, 'pending');
+  m.handlers['shinyhub-bookmark-capabilities'](capability(3, 'Asia'));
+  await flush(m.window, 10);
+  const latest = requests(m).at(-1).value;
+  m.handlers['shinyhub-bookmark-result']({ version: 1, purpose: 'sync', requestId: latest.requestId,
+    url: 'https://hub.test/app/demo/?_inputs_&region=Asia' });
+  assert.equal(m.window.location.search, '?_inputs_&region=Asia');
+  assert.equal(statuses.at(-1).state, 'saved');
+  assert.equal(statuses.at(-1).pendingSync, true);
+  assert.equal(statuses.at(-1).session, 's1');
+});
+
+test('an untouched dashboard synchronizes once after restoration completes', async () => {
+  const m = mountBridge({ timeoutMap: { 300: 0 } });
+  const capability = { version: 1, store: 'url', session: 's1', autoSync: false,
+    pendingSync: true, syncReady: false, registeredInputs: ['region'], observedBrowserRevision: 0,
+    syncRevision: 0, syncFields: [], fields: [{ id: 'region', label: 'Region', value: 'Europe' }],
+  };
+  m.handlers['shinyhub-bookmark-capabilities'](capability);
+  await flush(m.window, 10);
+  assert.equal(requests(m).length, 0, 'saved before restoration settled');
+  m.handlers['shinyhub-bookmark-capabilities']({ ...capability, syncReady: true });
+  await flush(m.window, 10);
+  assert.equal(requests(m).length, 1);
+  const request = requests(m)[0].value;
+  m.handlers['shinyhub-bookmark-result']({ version: 1, purpose: 'sync', requestId: request.requestId, url: '/app/demo/' });
+  m.handlers['shinyhub-bookmark-capabilities']({ ...capability, syncReady: true });
+  await flush(m.window, 10);
+  assert.equal(requests(m).length, 1, 'clean initial state kept synchronizing');
+});
+
+test('a filter edited before discovery cannot be overwritten by the first capabilities', async () => {
+  const m = mountBridge({ timeoutMap: { 300: 0 } });
+  m.window.document.dispatchEvent(new m.window.CustomEvent('shiny:inputchanged', { detail: { name: 'region', value: 'Asia' } }));
+  const capability = { version: 1, store: 'url', session: 's1', pendingSync: true, syncReady: true,
+    autoSync: false, syncRevision: 0, registeredInputs: ['region'], observedBrowserRevision: 0,
+    syncFields: [], fields: [{ id: 'region', label: 'Region', value: 'Europe' }],
+  };
+  m.handlers['shinyhub-bookmark-capabilities'](capability);
+  await flush(m.window, 10);
+  assert.equal(requests(m).length, 0, 'an unobserved edit was eligible for stale serialization');
+  m.handlers['shinyhub-bookmark-capabilities']({ ...capability, observedBrowserRevision: 1, syncRevision: 1, autoSync: true, syncFields: ['region'] });
+  await flush(m.window, 10);
+  assert.equal(requests(m).length, 1, 'sync did not resume after server observation');
+});
+
 test('the Python bridge translates server capabilities into the versioned browser event', () => {
   const m = mountBridge();
   const received = [];
@@ -571,7 +644,7 @@ test('a transient sync error retries once, reports failure, and recovers on a la
     requestId: requests(m)[1].value.requestId,
     code: 'serialization_failed',
   });
-  assert.deepEqual(statuses, ['error']);
+  assert.deepEqual(statuses, ['pending', 'error']);
 
   m.handlers['shinyhub-bookmark-capabilities'](capability(2));
   await flush(m.window, 350);
@@ -583,7 +656,7 @@ test('a transient sync error retries once, reports failure, and recovers on a la
     syncRevision: 2,
     url: 'https://hub.test/app/demo/?_inputs_=recovered',
   });
-  assert.deepEqual(statuses, ['error', 'saved']);
+  assert.deepEqual(statuses, ['pending', 'error', 'pending', 'saved']);
   assert.equal(m.window.location.search, '?_inputs_=recovered');
 });
 
@@ -736,4 +809,54 @@ test('an initial discovery dispatch failure retries without disabling the bridge
 
   assert.equal(typeof m.handlers['shinyhub-bookmark-capabilities'], 'function');
   assert.ok(m.inputs.some((entry) => entry.id === '.shinyhub_bookmark_discover'));
+});
+
+
+test('unchanged filter events get server acknowledgement without value comparison', async () => {
+ const m = mountBridge({ timeoutMap: { 300: 0 } });
+ const caps = { version: 1, store: 'url', session: 's1', pendingSync: true, syncReady: true,
+  registeredInputs: ['region'], observedBrowserRevision: 0, syncRevision: 0, syncFields: [], fields: [] };
+ m.handlers['shinyhub-bookmark-capabilities'](caps);
+ await flush(m.window, 10);
+ const initial = requests(m).at(-1).value;
+ m.handlers['shinyhub-bookmark-result']({version:1,purpose:'sync',requestId:initial.requestId,url:'/app/demo/'});
+ m.window.document.dispatchEvent(new m.window.CustomEvent('shiny:inputchanged', {detail:{name:'region',value:'Europe'}}));
+ const counter = m.inputs.filter(e => e.id === '.shinyhub_bookmark_browser_revision').at(-1);
+ assert.equal(counter.value, 1);
+ assert.equal(counter.options, undefined, 'counter outran the original input batch');
+ m.handlers['shinyhub-bookmark-capabilities']({...caps, observedBrowserRevision:1});
+ await flush(m.window, 10);
+ assert.equal(requests(m).length, 2, 'same-value event left the page permanently pending');
+});
+
+test('a DOM edit awaiting blur stays pending even when the server acknowledges older changes', async () => {
+ const m = mountBridge({ timeoutMap: { 300: 0 } });
+ const caps = {version:1,store:'url',session:'s1',pendingSync:true,syncReady:true,registeredInputs:['region'],observedBrowserRevision:0,syncRevision:0,syncFields:[],fields:[]};
+ m.handlers['shinyhub-bookmark-capabilities'](caps);
+ await flush(m.window,10);
+ const initial=requests(m).at(-1).value;
+ m.handlers['shinyhub-bookmark-result']({version:1,purpose:'sync',requestId:initial.requestId,url:'/app/demo/'});
+ const input=m.window.document.createElement('input');input.id='region';m.window.document.body.appendChild(input);
+ input.dispatchEvent(new m.window.Event('input',{bubbles:true}));
+ m.handlers['shinyhub-bookmark-capabilities']({...caps,observedBrowserRevision:1});
+ await flush(m.window,10);
+ assert.equal(requests(m).length,1);
+ m.window.document.dispatchEvent(new m.window.CustomEvent('shiny:inputchanged',{detail:{name:'region',value:'Asia'}}));
+ m.handlers['shinyhub-bookmark-capabilities']({...caps,observedBrowserRevision:2});
+ await flush(m.window,10);
+ assert.equal(requests(m).length,2);
+});
+
+
+test('late capabilities cannot lower the observed browser revision in the same session', async () => {
+ const m=mountBridge({timeoutMap:{300:0}});
+ const caps={version:1,store:'url',session:'s1',pendingSync:true,syncReady:true,registeredInputs:['region'],observedBrowserRevision:0,syncRevision:0,syncFields:[],fields:[]};
+ m.handlers['shinyhub-bookmark-capabilities'](caps);await flush(m.window,10);
+ const initial=requests(m).at(-1).value;
+ m.handlers['shinyhub-bookmark-result']({version:1,purpose:'sync',requestId:initial.requestId,url:'/app/demo/'});
+ m.window.document.dispatchEvent(new m.window.CustomEvent('shiny:inputchanged',{detail:{name:'region',value:'Asia'}}));
+ m.handlers['shinyhub-bookmark-capabilities']({...caps,observedBrowserRevision:1,syncRevision:1,autoSync:true});
+ m.handlers['shinyhub-bookmark-capabilities']({...caps,observedBrowserRevision:0,syncRevision:1,autoSync:true});
+ await flush(m.window,10);
+ assert.equal(requests(m).length,2,'late acknowledgement stranded a clean input');
 });

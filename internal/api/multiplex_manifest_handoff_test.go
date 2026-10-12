@@ -48,6 +48,7 @@ on_success = "roll"
 		{name: "omitted-usage-policy-drift", status: http.StatusConflict, refusal: manifestRefusal},
 		{name: "changed-manifest", status: http.StatusOK, handoff: true},
 		{name: "changed-schedule", status: http.StatusOK, handoff: true},
+		{name: "version-switch", status: http.StatusOK, handoff: true},
 		{name: "changed-manifest-with-downtime", status: http.StatusOK, handoff: true, allowDowntime: true},
 		{name: "missing-previous-manifest", status: http.StatusConflict, refusal: manifestRefusal},
 		{name: "malformed-previous-manifest", status: http.StatusConflict, refusal: manifestRefusal},
@@ -112,6 +113,8 @@ on_success = "roll"
 				driftSQL = "UPDATE apps SET usage_identity_mode='disabled' WHERE id=?"
 			case "changed-manifest", "changed-manifest-with-downtime":
 				manifest = strings.Replace(manifest, "min_warm_replicas = 16", "min_warm_replicas = 8", 1)
+			case "version-switch":
+				manifest = strings.Replace(manifest, "[app]", "[app]\nversion_switch = \"when_hidden\"", 1)
 			case "changed-schedule":
 				manifest = strings.Replace(manifest, "0 5 * * *", "0 6 * * *", 1)
 			case "missing-previous-manifest":

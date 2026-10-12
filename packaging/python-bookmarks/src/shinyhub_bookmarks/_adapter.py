@@ -14,6 +14,7 @@ from ._restore import MISSING, Adjustment, ChoiceRestore, resolve_choice, values
 PROTOCOL_VERSION = 1
 REQUEST_INPUT_ID = ".shinyhub_bookmark_request"
 DISCOVER_INPUT_ID = ".shinyhub_bookmark_discover"
+BROWSER_REVISION_INPUT_ID = ".shinyhub_bookmark_browser_revision"
 SYNC_ACK_INPUT_ID = ".shinyhub_bookmark_sync_ack"
 CAPABILITIES_MESSAGE = "shinyhub-bookmark-capabilities"
 RESULT_MESSAGE = "shinyhub-bookmark-result"
@@ -418,7 +419,7 @@ def _selection_exclusions(
         .difference(selected_ids)
         .union(
             known_inputs.difference(selected_ids),
-            {REQUEST_INPUT_ID, DISCOVER_INPUT_ID, SYNC_ACK_INPUT_ID},
+            {REQUEST_INPUT_ID, DISCOVER_INPUT_ID, SYNC_ACK_INPUT_ID, BROWSER_REVISION_INPUT_ID},
         )
     )
 
@@ -616,6 +617,18 @@ def register(
                 # Do not learn from the first reactive effect: Shiny may already
                 # have applied URL state before the restore hook identifies it.
                 capture_observed_baseline(field, current)
+        browser_revision_read_failed = False
+        try:
+            observed_browser_revision = input[BROWSER_REVISION_INPUT_ID]()
+        except Exception:
+            browser_revision_read_failed = True
+            observed_browser_revision = 0
+        if (
+            not isinstance(observed_browser_revision, int)
+            or isinstance(observed_browser_revision, bool)
+            or observed_browser_revision < 0
+        ):
+            observed_browser_revision = 0
         await session.send_custom_message(
             CAPABILITIES_MESSAGE,
             {
@@ -625,6 +638,18 @@ def register(
                 "autoSync": capability_revision > acknowledged_revision,
                 "syncRevision": capability_revision,
                 "syncFields": sync_fields,
+                "pendingSync": True,
+                **(
+                    {}
+                    if browser_revision_read_failed
+                    else {"observedBrowserRevision": observed_browser_revision}
+                ),
+                "syncReady": (
+                    restore_inspected
+                    and not pending_restored_inputs
+                    and not restored_overrides
+                ),
+                "registeredInputs": sorted(resolved_ids),
                 "fields": values,
                 "adjustments": [item.as_message() for item in registration.adjustments],
             },

@@ -29,12 +29,12 @@ func cookieMap(raw string) map[string]string {
 // controlled) app backend, while unrelated app cookies pass through.
 func TestStripInternalCookies(t *testing.T) {
 	req := httptest.NewRequest("GET", "/app/demo/", nil)
-	req.Header.Set("Cookie", "shiny_session=THE_JWT; csrf_token=abc; shiny_oauth_state=xyz; shinyhub_rep_demo=2; theme=dark; sid=keepme")
+	req.Header.Set("Cookie", "shiny_session=THE_JWT; csrf_token=abc; shiny_oauth_state=xyz; shinyhub_rep_demo=2; shinyhub_switch_demo=auto; theme=dark; sid=keepme")
 
 	stripInternalCookies(req)
 
 	got := cookieMap(req.Header.Get("Cookie"))
-	for _, internal := range []string{"shiny_session", "csrf_token", "shiny_oauth_state", "shinyhub_rep_demo"} {
+	for _, internal := range []string{"shiny_session", "csrf_token", "shiny_oauth_state", "shinyhub_rep_demo", "shinyhub_switch_demo"} {
 		if _, present := got[internal]; present {
 			t.Errorf("internal cookie %q must be stripped before forwarding, got %v", internal, got)
 		}
@@ -73,6 +73,7 @@ func TestFilterReservedSetCookies_StripsBackendReservedCookies(t *testing.T) {
 	resp := &http.Response{Header: http.Header{}}
 	resp.Header.Add("Set-Cookie", clientCookiePrefix+"demo=VICTIMVALUE.deadbeefdeadbeef; Path=/app/demo/")
 	resp.Header.Add("Set-Cookie", cookiePrefix+"demo=9; Path=/app/demo/")
+	resp.Header.Add("Set-Cookie", versionSwitchCookiePrefix+"demo=1; Path=/app/demo/")
 	resp.Header.Add("Set-Cookie", "shiny_session=FORGED_JWT; Path=/")
 	resp.Header.Add("Set-Cookie", "app_pref=blue; Path=/") // legitimate app cookie
 
