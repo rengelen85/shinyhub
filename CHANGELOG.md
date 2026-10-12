@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **reload**: acknowledge local reloads with `shinyhub reload --wait`, reporting refusals and successor failures with a nonzero exit. Wait for temporary app transitions, parent retirement, or relay capacity; errors name the blocking apps and reasons. Standalone successors regain mutation readiness, while clustered successors may serve as healthy standbys.
+- **bookmarks**: `shinyhub-bookmarks` 0.5.4 adds `register(..., commit=input.apply)` so automatic version switches and copied links preserve applied filters. Draft edits keep the URL and saved status unchanged. Restore corrections, later-rendered fields, custom serializers, and Python 3.10 are covered.
+
+### Fixed
+
+- **bookmarks**: defer discovery until Shiny sends `init`, fixing immediate session closure on page load with adapter 0.5.3. Use adapter 0.5.4 or later for automatic hidden-tab switching.
+- **proxy**: count preserved relay sessions when checking WebSocket connectivity, avoiding false reverse-proxy warnings after a preserving reload.
+- **storage**: exclude ShinyHub's relay and configured reload-control directories from orphan warnings.
+
+### Changed
+
+- **upgrade**: log when a retiring process waits for the output pipes of replicas it launched, and document why it must remain alive.
+- **systemd**: use the acknowledged reload command and allow fourteen minutes for default transition and readiness budgets. When upgrading an older running process, use the existing signal-based unit once before installing the new unit; see [zero-downtime upgrades](docs/zero-downtime-upgrades.md).
+
 ## [0.20.4](https://github.com/rvben/shinyhub/compare/v0.20.3...v0.20.4) - 2026-10-12
 
 ### Added

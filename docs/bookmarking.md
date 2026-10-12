@@ -301,8 +301,9 @@ four-filter app.
 Filter-only dashboards can opt into switching to a newly deployed generation
 while their tab is hidden.
 
-Use ShinyHub 0.20.4 or later and `shinyhub-bookmarks` 0.5.3 or later. Older
-adapters do not advertise the pending-sync protocol, so switching stays manual.
+Use ShinyHub 0.20.4 or later and `shinyhub-bookmarks` 0.5.4 or later. Adapter
+0.5.3 has a discovery-ordering bug that closes sessions on page load. Adapters
+before 0.5.3 do not advertise the pending-sync protocol, so switching stays manual.
 
 In the app's `shinyhub.toml`:
 
