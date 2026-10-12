@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.20.5](https://github.com/rvben/shinyhub/compare/v0.20.4...v0.20.5) - 2026-10-12
+
 ### Added
 
 - **reload**: acknowledge local reloads with `shinyhub reload --wait`, reporting refusals and successor failures with a nonzero exit. Wait for temporary app transitions, parent retirement, or relay capacity; errors name the blocking apps and reasons. Standalone successors regain mutation readiness, while clustered successors may serve as healthy standbys.
@@ -16,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **bookmarks**: defer discovery until Shiny sends `init`, fixing immediate session closure on page load with adapter 0.5.3. Use adapter 0.5.4 or later for automatic hidden-tab switching.
 - **proxy**: count preserved relay sessions when checking WebSocket connectivity, avoiding false reverse-proxy warnings after a preserving reload.
 - **storage**: exclude ShinyHub's relay and configured reload-control directories from orphan warnings.
+- **deploy**: preserve committed views and acknowledge reload readiness ([6ef31e4](https://github.com/rvben/shinyhub/commit/6ef31e4165ab46c61fca2b439d211493fc6a6f2a))
 
 ### Changed
 
