@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.20.8](https://github.com/rvben/shinyhub/compare/v0.20.7...v0.20.8) - 2026-10-13
+
+### Fixed
+
+- **data**: prevent symlink races in file downloads ([3978864](https://github.com/rvben/shinyhub/commit/3978864924a3b5245baf8cce572204b4318098ac))
+
 ## [0.20.7](https://github.com/rvben/shinyhub/compare/v0.20.6...v0.20.7) - 2026-10-13
 
 ### Fixed
