@@ -189,6 +189,11 @@ func PrepareRecovery(store *db.Store) (*RecoveryInputs, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare recovery: list running apps: %w", err)
 	}
+	quarantinedApps, err := store.ListProducerQuarantinedApps()
+	if err != nil {
+		return nil, fmt.Errorf("prepare recovery: list producer quarantines: %w", err)
+	}
+	apps = append(apps, quarantinedApps...)
 	bundleDirs := make(map[int64]string, len(apps))
 	running := make(map[int64]bool, len(apps))
 	for _, app := range apps {
@@ -336,9 +341,20 @@ func RecoverProcesses(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, d
 			continue
 		}
 		if quarantined {
-			if err := store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "failed"}); err != nil {
+			if err := store.EnforceCompatibilityQuarantines(); err != nil {
 				slog.Error("process recovery: persist compatibility quarantine", "slug", app.Slug, "err", err)
 			}
+			reps, err := store.ListReplicas(app.ID)
+			if err != nil {
+				slog.Error("process recovery: load quarantined replicas", "slug", app.Slug, "err", err)
+			}
+			for _, r := range reps {
+				stopQuarantinedReplica(store, mgr, app, r)
+			}
+			if isolation, err := store.ServingWorkerIsolation(app, defaultWorkerIsolation); err == nil && isElasticIsolation(isolation) {
+				cleanupElasticDeploymentGenerations(store, mgr, prx, app, queue)
+			}
+			prx.Deregister(app.Slug)
 			slog.Warn("process recovery: skipped compatibility-quarantined app", "slug", app.Slug)
 			continue
 		}
@@ -492,6 +508,15 @@ func RecoverProcesses(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, d
 					}
 				} else {
 					markReplicaCrashed(store, app, r.Index, "activation start interrupted before health check", logRunID)
+				}
+				continue
+			}
+			if r.Status == "stopped" && r.DesiredState == "running" {
+				// Never adopt a quarantine victim with stale startup data. Keep
+				// the app healable until confirmed cleanup and replacement.
+				healable = true
+				if !stopQuarantinedReplica(store, mgr, app, r) {
+					indeterminate = true
 				}
 				continue
 			}
@@ -1793,4 +1818,87 @@ func cleanupElasticDeploymentGenerations(store *db.Store, mgr *process.Manager, 
 		clearIdentity(row)
 	}
 	return ok
+}
+
+// stopQuarantinedReplica retains identity until exit is confirmed. Recorded
+// native identities are checked against their deployment before signalling.
+func stopQuarantinedReplica(store *db.Store, mgr *process.Manager, app *db.App, r *db.Replica) bool {
+	if _, ok := mgr.GetReplica(app.Slug, r.Index); !ok {
+		rt := mgr.RuntimeForTier(r.Tier)
+		handle := process.RunHandle{}
+		found := false
+		if inv, ok := rt.(process.ReplicaInventory); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), inventoryRecoveryTimeout)
+			items, err := inv.Inventory(ctx)
+			cancel()
+			var partial *process.PartialInventoryError
+			if errors.As(err, &partial) {
+				for _, workerID := range partial.Workers {
+					if workerID == r.WorkerID {
+						return false
+					}
+				}
+			} else if err != nil {
+				return false
+			}
+			depID := ""
+			if r.DeploymentID != nil {
+				depID = strconv.FormatInt(*r.DeploymentID, 10)
+			}
+			if item := matchInventoryItem(items, app.Slug, r.Index, depID, r.WorkerID); item != nil && item.Running {
+				handle.ContainerID = item.WorkerID + "/" + item.ContainerID
+				found = true
+			}
+		} else if lister, ok := rt.(ContainerLister); ok {
+			containers, err := lister.ListByLabel(`{"label":["` + process.LabelSlug + `=` + app.Slug + `"]}`)
+			if err != nil {
+				return false
+			}
+			for _, container := range containers {
+				if container.Labels[process.LabelSlug] != app.Slug {
+					continue
+				}
+				if container.Labels[process.LabelReplicaIndex] != strconv.Itoa(r.Index) {
+					continue
+				}
+				if r.DeploymentID != nil && container.Labels[process.LabelDeploymentID] != strconv.FormatInt(*r.DeploymentID, 10) {
+					continue
+				}
+				if found {
+					return false
+				} // ambiguous runtime identity
+				handle.ContainerID = container.ID
+				found = true
+				if _, isolated := rt.(*process.SystemdRuntime); isolated {
+					handle.PID, err = lister.InspectPID(container.ID)
+					if err != nil {
+						return false
+					}
+				}
+			}
+		} else {
+			if r.Provider != "native" && r.Provider != "" && (r.EndpointURL != "" || r.WorkerID != "") {
+				return false
+			}
+			if !stopRecordedNativeReplica(store, app, r.PID, r.Provider, r.DeploymentID) {
+				return false
+			}
+		}
+		if found {
+			mgr.Adopt(app.Slug, process.ProcessInfo{Slug: app.Slug, AppID: app.ID, Index: r.Index,
+				PID: handle.PID, Status: process.StatusRunning, Tier: r.Tier, Provider: r.Provider,
+				EndpointURL: r.EndpointURL, WorkerID: r.WorkerID, DeploymentID: derefInt64(r.DeploymentID)}, handle)
+		}
+	}
+	if _, ok := mgr.GetReplica(app.Slug, r.Index); ok {
+		if err := mgr.StopReplicaConfirmed(app.Slug, r.Index); err != nil && !errors.Is(err, process.ErrReplicaNotFound) {
+			slog.Warn("producer quarantine: stop consumer unconfirmed", "slug", app.Slug, "index", r.Index, "err", err)
+			return false
+		}
+	}
+	if err := store.ClearReplicaRuntimeIdentity(app.ID, r.Index); err != nil && !errors.Is(err, db.ErrNotFound) {
+		slog.Warn("producer quarantine: clear stopped consumer identity", "slug", app.Slug, "index", r.Index, "err", err)
+		return false
+	}
+	return true
 }

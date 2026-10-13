@@ -501,6 +501,19 @@ generation-specific location, and atomically rename or switch the completed
 output into place immediately before exiting successfully. This also makes the
 recorded completion order faithfully represent writer order.
 
+A producer that fails after attempting a data write quarantines its app. Its
+status change is recorded as `app_status_changed` with the run ID and reason;
+`apps show` exposes the diagnostic. Repair every producer listed as requiring
+repair. Once all compatibility blockers clear, ShinyHub restores the lifecycle
+state displaced by the failure and replaces consumers stopped by quarantine.
+An operator stop or deletion takes precedence over that recovery. App visitors
+receive an unavailable page with HTTP 503 while repair is required.
+
+Failures recorded by older versions have no saved lifecycle intent. Upgrading
+does not guess whether such an app should be running or deliberately stopped:
+after repairing its producers, run `shinyhub apps start <slug>` once. New
+producer failures retain their recovery intent across server restarts.
+
 For a read-only fleet audit, run `shinyhub fleet verify`. It performs only two
 GETs and checks serving health plus every enabled schedule against the
 server-computed `stale` boolean

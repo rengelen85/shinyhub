@@ -1877,6 +1877,13 @@ func (w *Watcher) reconcileReplicas(apps []*db.App, repMap map[int64][]*db.Repli
 				continue
 			}
 			switch r.Status {
+			case "stopped":
+				// Producer quarantine stops consumers while preserving running intent.
+				// An operator-stopped app is outside this pass, and warm parked slots
+				// retain their distinct desired state and expand only on demand.
+				if r.DesiredState == "running" {
+					w.restartSlot(app, r.Index, false)
+				}
 			case "crashed":
 				w.restartSlot(app, r.Index, false)
 			case db.ReplicaStatusLost:
@@ -2169,6 +2176,24 @@ func (w *Watcher) restartSlotLocked(app *db.App, index int, fromLost bool) {
 		opErr = qerr
 		return
 	}
+	rows, rowErr := w.store.ListReplicas(app.ID)
+	if rowErr != nil {
+		return
+	}
+	for _, r := range rows {
+		if r.Index != index || r.Status != "stopped" {
+			continue
+		}
+		if store, ok := w.store.(*db.Store); ok {
+			if mgr, ok := w.mgr.(*process.Manager); ok && !stopQuarantinedReplica(store, mgr, app, r) {
+				return
+			}
+		}
+		// Quarantine removed the pool; ordinary crash restarts must preserve
+		// the sizing of any live rolling surge.
+		w.configureFixedProxyPool(app)
+	}
+
 	res, err := w.deploy(ctx, app.Slug, current.BundleDir, index)
 	if err != nil {
 		if errors.Is(err, process.ErrNoLiveWorker) || errors.Is(err, process.ErrReplicaAlreadyRunning) {
@@ -2289,7 +2314,25 @@ func (w *Watcher) reconcileAppStatus(app *db.App, reps []*db.Replica) {
 	// multiplex replica-count rule below would mechanically mark every grouped
 	// or per-session app degraded. Worker spawn failures are surfaced by the
 	// elastic admission path; replica rows are not a health signal here.
-	if w.servingIsolation(app) != "multiplex" {
+	isolation := w.servingIsolation(app)
+	if isolation == "unknown" {
+		return
+	}
+	if isElasticIsolation(isolation) {
+		// Producer quarantine removes the whole pool. Elastic apps have no
+		// durable slots for replica healing, so restore demand-driven routing
+		// once compatibility is repaired, including on single-node hosts.
+		if blocked, err := w.store.AppCompatibilityQuarantined(app.ID); err != nil || blocked {
+			return
+		}
+		if pools, ok := w.prx.(interface {
+			ServingMode(string) (config.WorkerIsolationMode, bool)
+		}); ok {
+			if _, exists := pools.ServingMode(app.Slug); !exists {
+				w.configureProxyPool(app, isolation)
+				w.prx.ReconcileElasticWarmSpares(app.Slug)
+			}
+		}
 		// Preserve a real deploy/restore failure. The special case below only
 		// repairs the false replica-derived degradation of a successfully deployed
 		// demand-driven app; it must not erase an independent failure signal.
@@ -2541,6 +2584,22 @@ func (w *Watcher) reviveIfHealable(app *db.App) {
 		"slug", app.Slug, "lostSlots", len(lostSlots), "clearedError", app.LastError)
 }
 
+func (w *Watcher) configureFixedProxyPool(app *db.App) {
+	if w.servingIsolation(app) != "multiplex" {
+		return
+	}
+	w.configureProxyPool(app, "multiplex")
+}
+
+func (w *Watcher) configureProxyPool(app *db.App, isolation string) {
+	w.prx.SetPoolAppID(app.Slug, app.ID)
+	w.prx.SetPoolSize(app.Slug, app.Replicas)
+	w.prx.SetPoolCap(app.Slug, deploy.ResolveMaxSessionsPerReplica(app.MaxSessionsPerReplica, w.cfg.DefaultMaxSessionsPerReplica))
+	w.prx.SetPoolIdentityHeaders(app.Slug, deploy.ResolveIdentityHeaders(app.IdentityHeaders, w.cfg.IdentityHeadersGlobal))
+	w.prx.SetPoolMode(app.Slug, config.WorkerIsolationMode(isolation), app.WorkerGroupedSize, app.WorkerMaxWorkers)
+	w.prx.SetPoolWarmSpares(app.Slug, app.WorkerWarmSpares)
+}
+
 // restoreProxyPool rebuilds the proxy-side routing state that crash-loop
 // terminalization tore down (handleCrashedLocked deregisters the app's whole
 // pool). The configuration mirrors what wake sets, so the healing deploys
@@ -2553,13 +2612,7 @@ func (w *Watcher) restoreProxyPool(app *db.App) {
 	if w.servingIsolation(app) != "multiplex" {
 		return
 	}
-	w.prx.SetPoolAppID(app.Slug, app.ID)
-	w.prx.SetPoolSize(app.Slug, app.Replicas)
-	w.prx.SetPoolCap(app.Slug, deploy.ResolveMaxSessionsPerReplica(app.MaxSessionsPerReplica, w.cfg.DefaultMaxSessionsPerReplica))
-	w.prx.SetPoolIdentityHeaders(app.Slug, deploy.ResolveIdentityHeaders(app.IdentityHeaders, w.cfg.IdentityHeadersGlobal))
-	resolvedIso := w.servingIsolation(app)
-	w.prx.SetPoolMode(app.Slug, config.WorkerIsolationMode(resolvedIso), app.WorkerGroupedSize, app.WorkerMaxWorkers)
-	w.prx.SetPoolWarmSpares(app.Slug, app.WorkerWarmSpares)
+	w.configureFixedProxyPool(app)
 	for _, info := range w.mgr.All() {
 		if info.Slug != app.Slug || info.Index < 0 || info.Index >= app.Replicas {
 			continue

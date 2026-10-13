@@ -1168,3 +1168,17 @@ func TestRunOnce_RevivePreservesForgivenSlotBudget(t *testing.T) {
 		t.Errorf("forgiven slot attempts = %d, want 5 (no re-grant from the sibling's revive)", forgivenSpent)
 	}
 }
+
+func TestReconcileReplicas_RestartsStoppedRunningIntentAfterProducerRepair(t *testing.T) {
+	st := newFakeStore(map[string]*db.App{"app": {ID: 1, Slug: "app", Status: "running", Replicas: 1}}, []*db.Deployment{{ID: 7, BundleDir: "/bundles/v1"}})
+	st.replicas = map[int64][]*db.Replica{1: {{AppID: 1, Index: 0, Status: "stopped", DesiredState: "running"}}}
+	var calls []int
+	w := newTestWatcher(Config{RestartMaxAttempts: 5}, &fakeManager{}, newFakeProxy(), st, healingDeploy(&calls))
+	w.reconcileReplicas([]*db.App{st.apps["app"]}, st.replicas, map[replicaKey]bool{})
+	if len(calls) != 1 || calls[0] != 0 {
+		t.Fatalf("stopped producer consumer restart calls=%v", calls)
+	}
+	if upsert, ok := upsertFor(st, 0); !ok || upsert.Status != "running" {
+		t.Fatalf("replacement replica=%+v ok=%v", upsert, ok)
+	}
+}

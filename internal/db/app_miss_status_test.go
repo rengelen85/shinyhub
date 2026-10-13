@@ -20,6 +20,16 @@ func TestAppMissStatus(t *testing.T) {
 		wantReason     string
 	}{
 		{
+			name:           "pending overrides failed during corrective deploy",
+			app:            App{Status: "failed", LastError: "private failure", LastDeploymentStatus: DeploymentPending},
+			deployInFlight: true, wantStatus: "deploying",
+		},
+		{
+			name:       "stale pending never masks failed app",
+			app:        App{Status: "failed", LastError: "private failure", LastDeploymentStatus: DeploymentPending},
+			wantStatus: "failed", wantReason: "private failure",
+		},
+		{
 			name:           "pending overrides stopped while the deploy executes (first deploy in flight)",
 			app:            App{Status: "stopped", LastDeploymentStatus: DeploymentPending},
 			deployInFlight: true,

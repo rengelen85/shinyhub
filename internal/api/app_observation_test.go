@@ -131,3 +131,14 @@ func TestMultiplexObservationWithRetainedGroupedDrainer(t *testing.T) {
 		t.Fatalf("status=%s replicas=%d", app.Status, app.ReplicasRunning)
 	}
 }
+
+func TestDecorateAppObservation_FailedProducerDiagnostic(t *testing.T) {
+	s := &Server{}
+	for _, pool := range []elasticPool{{}, {Known: true}} {
+		app := &db.App{Status: "failed", LastError: "producer run 1413 failed after a data write"}
+		s.decorateAppObservation(app, nil, pool)
+		if app.Status != "failed" || app.DesiredStatus != "failed" || app.LastReplicaError != app.LastError {
+			t.Fatalf("failed producer observation: %+v", app)
+		}
+	}
+}

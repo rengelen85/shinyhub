@@ -910,13 +910,13 @@ func (p *Proxy) SetWakeHoldTimeout(d time.Duration) {
 // inline instead of via the loading page. It returns true when the pool is ready
 // (the caller routes the request) and false when the hold expired, the client
 // disconnected, or the app is down (the caller serves the miss page). A
-// crashed/stopped app is never held. ctx is the request context, so a client
+// crashed/failed/stopped app is never held. ctx is the request context, so a client
 // that gives up frees the hold immediately rather than polling to the deadline.
 func (p *Proxy) holdForWake(ctx context.Context, slug string, trigger func(context.Context, string)) bool {
 	syncSuppressed := false
 	if fn := p.getAppStatusLookup(); fn != nil {
 		switch status, _ := fn(slug); status {
-		case "crashed", "stopped":
+		case "crashed", "failed", "stopped":
 			return false // will not come up; let the caller serve the down page now
 		case "deploying":
 			// A deployment is in flight: suppress the clustered on-miss sync,
@@ -1416,8 +1416,11 @@ func (p *Proxy) getWakeTrigger() func(context.Context, string) {
 func renderAppDownPage(state, slug, reason string) string {
 	esc := html.EscapeString
 	heading, body := "This app is stopped", `<p>It has been stopped and is not currently running.</p>`
-	if state == "crashed" {
+	if state == "crashed" || state == "failed" {
 		heading = "This app crashed"
+		if state == "failed" {
+			heading = "This app is unavailable"
+		}
 		if strings.TrimSpace(reason) != "" {
 			body = `<pre class="reason">` + esc(reason) + `</pre>`
 		} else {
@@ -1558,13 +1561,19 @@ func (p *Proxy) serveMissPage(w http.ResponseWriter, r *http.Request, slug strin
 	}
 	if fn := p.getAppStatusLookup(); fn != nil {
 		switch status, reason := fn(slug); status {
-		case "crashed":
+		case "crashed", "failed":
 			if sr, ok := w.(*statusRecorder); ok {
-				sr.fallbackReason = "app-crashed"
+				sr.fallbackReason = "app-" + status
 			}
+			// Failed deploy diagnostics can carry private log tails. Operators see
+			// those through the authenticated API; visitors receive a generic reason.
+			if status == "failed" {
+				reason = "A data producer or deployment failed. An operator must repair the app before it can serve requests."
+			}
+
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(p.decorateAppPage(renderAppDownPage("crashed", slug, reason), slug, r))) //nolint:errcheck
+			w.Write([]byte(p.decorateAppPage(renderAppDownPage(status, slug, reason), slug, r))) //nolint:errcheck
 			return
 		case "stopped":
 			if sr, ok := w.(*statusRecorder); ok {

@@ -2356,3 +2356,25 @@ func TestPrepareRecovery_FailsClosedOnCorruptedDeploymentRow(t *testing.T) {
 		t.Fatalf("PrepareRecovery: want nil inputs on error, got %+v", inputs)
 	}
 }
+
+func TestReconcileInflightProducerDeploymentPreservesDeletingApp(t *testing.T) {
+	store := mustOpenStore(t)
+	app := mustCreateApp(t, store, "deleting-barrier")
+	pending, err := store.BeginDeployment(app.ID, "v1", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDeploymentProducerBarrierEntered(pending.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "deleting"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.ReconcileInflightDeployments(store); err != nil {
+		t.Fatal(err)
+	}
+	app, err = store.GetAppByID(app.ID)
+	if err != nil || app.Status != "deleting" {
+		t.Fatalf("startup lost deletion: app=%+v err=%v", app, err)
+	}
+}

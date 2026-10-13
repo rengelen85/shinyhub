@@ -75,9 +75,12 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 		return nil, fmt.Errorf("complete schedule run: begin: %w", err)
 	}
 	committed := false
+	var statusChange *producerStatusChange
 	defer func() {
 		if !committed {
 			_ = tx.Rollback()
+		} else {
+			statusChange.log()
 		}
 	}()
 
@@ -238,6 +241,16 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 				currentDeploymentID, currentVersion, currentDigest); err != nil {
 				return nil, fmt.Errorf("complete schedule run: reconcile current producer: %w", err)
 			}
+		}
+	}
+	if dataWriteSequence > 0 {
+		reason := ""
+		if p.Status != "succeeded" {
+			reason = fmt.Sprintf("producer run %d (%s) ended %s after attempting a data write; rerun the producer successfully to repair compatibility", p.RunID, scheduleName, p.Status)
+		}
+		statusChange, err = reconcileProducerStatusTx(ctx, tx, appID, p.RunID, reason)
+		if err != nil {
+			return nil, fmt.Errorf("complete schedule run: reconcile app status: %w", err)
 		}
 	}
 	// Publication and serving rollout are separate. Every successful immutable

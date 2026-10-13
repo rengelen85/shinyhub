@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -203,5 +204,29 @@ func TestServeMissPage_HibernatedStillFiresWake(t *testing.T) {
 	case <-fired:
 	case <-time.After(2 * time.Second):
 		t.Fatal("wake trigger did not fire for a hibernated app")
+	}
+}
+
+func TestServeMissPage_FailedShowsUnavailable(t *testing.T) {
+	p := proxy.New()
+	p.SetPoolSize("failed", 1)
+	p.SetAppStatusLookup(func(string) (string, string) { return "failed", "producer run 1413 failed: <upstream>" })
+	var wakes atomic.Int64
+	p.SetWakeTrigger(func(context.Context, string) { wakes.Add(1) })
+	p.SetWakeHoldTimeout(250 * time.Millisecond)
+	p.SetOnMissSync(func(string) { t.Error("failed app must not synchronize stale backends") })
+	var entry proxy.AccessLogEntry
+	p.SetAccessLogger(func(e proxy.AccessLogEntry) { entry = e })
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/app/failed/", nil))
+	body := rec.Body.String()
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(body, "This app is unavailable") || strings.Contains(body, "producer run 1413") || strings.Contains(body, "upstream") || !strings.Contains(body, "An operator must repair") {
+		t.Fatalf("response %d: %s", rec.Code, body)
+	}
+	if wakes.Load() != 0 || strings.Contains(body, `id="shinyhub-box"`) {
+		t.Fatalf("failed app was treated as starting: wakes=%d", wakes.Load())
+	}
+	if !entry.Fallback || entry.FallbackReason != "app-failed" || entry.Status != http.StatusServiceUnavailable {
+		t.Fatalf("failed app access log: %+v", entry)
 	}
 }

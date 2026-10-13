@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -633,18 +634,19 @@ func (s *Server) SetJobs(j *jobs.Manager, sc *scheduler.Scheduler) {
 			slog.Warn("producer write did not complete; stopping consumers and quarantining app",
 				"app_id", appID, "slug", slug, "run_status", status)
 			if s.manager != nil {
-				if err := s.manager.Stop(slug); err != nil {
-					slog.Error("stop consumers after uncertain producer write", "slug", slug, "err", err)
+				consumers := s.manager.AllForSlug(slug)
+				if err := s.manager.StopConfirmed(slug); err != nil && !errors.Is(err, process.ErrReplicaNotFound) {
+					slog.Error("stop consumers after producer failure", "app_id", appID, "slug", slug, "run_status", status, "err", err)
+				} else {
+					for _, info := range consumers {
+						if err := s.store.ClearReplicaRuntimeIdentity(appID, info.Index); err != nil && !errors.Is(err, db.ErrNotFound) {
+							slog.Error("clear producer quarantine consumer identity", "slug", slug, "index", info.Index, "err", err)
+						}
+					}
 				}
 			}
 			if s.proxy != nil {
 				s.proxy.Deregister(slug)
-			}
-			if err := s.store.UpdateAppStatus(db.UpdateAppStatusParams{
-				Slug: slug, Status: "failed",
-			}); err != nil {
-				slog.Error("persist compatibility quarantine after producer failure",
-					"app_id", appID, "slug", slug, "run_status", status, "err", err)
 			}
 		})
 	}

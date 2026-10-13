@@ -1274,7 +1274,7 @@ func (s *Store) AppElasticOrphanRisk(appID int64) (bool, error) {
 func (a *App) MissStatus(deployInFlight bool) (status, reason string) {
 	if a.LastDeploymentStatus == DeploymentPending {
 		switch a.Status {
-		case "stopped", "crashed":
+		case "stopped", "crashed", "failed":
 			if deployInFlight {
 				return "deploying", ""
 			}
@@ -2026,12 +2026,12 @@ func (s *Store) UpdateAppStatus(p UpdateAppStatusParams) error {
 	var err error
 	if p.Status == "crashed" {
 		res, err = s.db.Exec(
-			`UPDATE apps SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE slug = ?`,
+			`UPDATE apps SET status = ?, producer_recovery_status = '', updated_at = CURRENT_TIMESTAMP WHERE slug = ?`,
 			p.Status, p.Slug,
 		)
 	} else {
 		res, err = s.db.Exec(
-			`UPDATE apps SET status = ?, last_error = ?, crashed_at = 0, updated_at = CURRENT_TIMESTAMP WHERE slug = ?`,
+			`UPDATE apps SET status = ?, producer_recovery_status = '', last_error = ?, crashed_at = 0, updated_at = CURRENT_TIMESTAMP WHERE slug = ?`,
 			p.Status, p.LastError, p.Slug,
 		)
 	}
@@ -2245,7 +2245,7 @@ func (s *Store) MarkAppCrashed(slug, reason string) error {
 		return fmt.Errorf("mark app crashed: %w", err)
 	}
 	res, err := s.db.Exec(
-		`UPDATE apps SET status = 'crashed', last_error = ?, crashed_at = ?, updated_at = CURRENT_TIMESTAMP
+		`UPDATE apps SET status = 'crashed', producer_recovery_status = '', last_error = ?, crashed_at = ?, updated_at = CURRENT_TIMESTAMP
 		   WHERE slug = ? AND status != 'deleting'`,
 		reason, epoch, slug,
 	)
@@ -2929,23 +2929,43 @@ const compatibilityQuarantineReason = "the server restarted while a data-affecti
 // EnforceCompatibilityQuarantines repairs app soft status from every durable
 // compatibility fence. Startup runs it before process or scheduler recovery.
 func (s *Store) EnforceCompatibilityQuarantines() error {
-	_, err := s.db.Exec(`
-		UPDATE apps SET status = 'failed', last_error = ?, crashed_at = 0, updated_at = CURRENT_TIMESTAMP
-		WHERE apps.status <> 'stopped' AND (EXISTS (
-			SELECT 1 FROM deployments failed
-			WHERE failed.app_id = apps.id AND `+deploymentRepairConditionSQL+`
-		) OR EXISTS (
-			SELECT 1 FROM schedule_runs r
-			JOIN app_schedules sc ON sc.id = r.schedule_id
-			WHERE sc.app_id = apps.id AND r.publishes_data = 1
-			  AND r.status = 'running'
-		) OR EXISTS (
-			SELECT 1 FROM schedule_data_uncertainty uncertainty
-			JOIN app_schedules sc ON sc.id = uncertainty.schedule_id
-			WHERE sc.app_id = apps.id
-		))`, compatibilityQuarantineReason)
+	ctx := context.Background()
+	tx, err := s.d.beginWrite(ctx, s.rawDB(), scheduleActivationLockKey)
 	if err != nil {
-		return fmt.Errorf("enforce compatibility quarantines: %w", err)
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM apps WHERE status NOT IN ('stopped', 'deleting') AND ((`+appCompatibilityBlockersSQL+`) OR (status = 'failed' AND producer_recovery_status <> ''))`)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	var changes []*producerStatusChange
+	for _, id := range ids {
+		change, err := reconcileProducerStatusTx(ctx, tx, id, 0, compatibilityQuarantineReason)
+		if err != nil {
+			return err
+		}
+		changes = append(changes, change)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, change := range changes {
+		change.log()
 	}
 	return nil
 }
@@ -3001,7 +3021,8 @@ func (s *Store) QuarantineAndFailDeploymentWithAppStatus(id int64, reason, lastE
 	}
 	defer tx.Rollback() //nolint:errcheck
 	res, err := tx.Exec(`
-		UPDATE apps SET status = ?, last_error = ?, crashed_at = 0, updated_at = CURRENT_TIMESTAMP
+		UPDATE apps SET status = CASE WHEN status = 'deleting' THEN status ELSE ? END, producer_recovery_status = '',
+        last_error = CASE WHEN status = 'deleting' THEN last_error ELSE ? END, crashed_at = 0, updated_at = CURRENT_TIMESTAMP
 		WHERE id = (SELECT app_id FROM deployments
 		            WHERE id = ? AND status = ? AND
 		                  (producer_barrier_entered = 1 OR prior_schedule_snapshot_recorded = 0))`, appStatus, lastError, id, DeploymentPending)

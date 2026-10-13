@@ -484,12 +484,17 @@ func (s *Server) decorateAppObservation(app *db.App, replicas []*db.Replica, poo
 		switch {
 		case pool.Running > 0:
 			app.Status = appstatus.Running
+		case app.DesiredStatus == "failed":
+			app.Status = "failed"
 		case pool.Booting > 0:
 			app.Status = appstatus.Starting
 		case app.DesiredStatus == appstatus.Running || app.DesiredStatus == appstatus.Degraded:
 			app.Status = appstatus.Idle
 		default:
 			app.Status = app.DesiredStatus
+		}
+		if app.Status == "failed" {
+			app.LastReplicaError = app.LastError
 		}
 		return
 	}
@@ -545,6 +550,8 @@ func (s *Server) decorateAppObservation(app *db.App, replicas []*db.Replica, poo
 		app.Status = appstatus.Degraded
 	case app.ReplicasRunning > 0:
 		app.Status = appstatus.Running
+	case app.DesiredStatus == "failed":
+		app.Status = "failed"
 	case crashed > 0:
 		app.Status = appstatus.Crashed
 	case lost > 0:
@@ -558,7 +565,7 @@ func (s *Server) decorateAppObservation(app *db.App, replicas []*db.Replica, poo
 	default:
 		app.Status = app.DesiredStatus
 	}
-	if app.LastReplicaError == "" && app.Status == appstatus.Crashed {
+	if app.LastReplicaError == "" && (app.Status == appstatus.Crashed || app.Status == "failed") {
 		app.LastReplicaError = app.LastError
 	}
 }
