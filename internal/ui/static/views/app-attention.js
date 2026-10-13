@@ -38,6 +38,13 @@ export function appAttention(app, live = null) {
       detail: 'The app is unavailable. Review its logs and restart when ready.',
     };
   }
+  if (status === 'failed') {
+    return {
+      severity: 'danger',
+      label: 'Unavailable',
+      detail: 'A producer or deployment failed. Review the app details and repair the failure.',
+    };
+  }
   if (status === 'degraded') {
     const detail = capacity
       ? `${capacity.ready} of ${capacity.configured} replicas are ready.`

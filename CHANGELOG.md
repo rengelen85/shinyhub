@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **schedules**: avoid a hub panic when producer-failure cleanup encounters empty replica slots, and restore repaired apps when the last queued publisher ends without writing data.
+- **diagnostics**: recognize failed apps in CLI readiness checks and the dashboard's Needs attention list, with immediate failure reporting instead of timeout and CLI upgrade advice.
+
 ## [0.20.8](https://github.com/rvben/shinyhub/compare/v0.20.7...v0.20.8) - 2026-10-13
 
 ### Fixed

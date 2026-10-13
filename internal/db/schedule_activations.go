@@ -243,9 +243,12 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 			}
 		}
 	}
-	if dataWriteSequence > 0 {
+	// Every publisher's terminalization removes its running-run blocker, even
+	// if it was cancelled or superseded before writing. That final blocker may
+	// have kept an otherwise repaired app quarantined.
+	if publishesData != 0 {
 		reason := ""
-		if p.Status != "succeeded" {
+		if dataWriteSequence > 0 && p.Status != "succeeded" {
 			reason = fmt.Sprintf("producer run %d (%s) ended %s after attempting a data write; rerun the producer successfully to repair compatibility", p.RunID, scheduleName, p.Status)
 		}
 		statusChange, err = reconcileProducerStatusTx(ctx, tx, appID, p.RunID, reason)

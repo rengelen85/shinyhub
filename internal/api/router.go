@@ -639,6 +639,10 @@ func (s *Server) SetJobs(j *jobs.Manager, sc *scheduler.Scheduler) {
 					slog.Error("stop consumers after producer failure", "app_id", appID, "slug", slug, "run_status", status, "err", err)
 				} else {
 					for _, info := range consumers {
+						// Partial deployments and crashed replicas leave empty slots.
+						if info == nil {
+							continue
+						}
 						if err := s.store.ClearReplicaRuntimeIdentity(appID, info.Index); err != nil && !errors.Is(err, db.ErrNotFound) {
 							slog.Error("clear producer quarantine consumer identity", "slug", slug, "index", info.Index, "err", err)
 						}

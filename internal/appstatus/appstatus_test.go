@@ -28,7 +28,7 @@ func TestClass_CoversEveryObservedStatus(t *testing.T) {
 func TestServing(t *testing.T) {
 	want := map[string]bool{
 		Running: true, Idle: true,
-		Starting: false, Degraded: false, Crashed: false, Hibernated: false,
+		Starting: false, Degraded: false, Crashed: false, Failed: false, Hibernated: false,
 		Suspended: false, Stopped: false, Deleting: false, Waking: false,
 		Deploying: false, "": false, "bogus": false,
 	}

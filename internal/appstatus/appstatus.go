@@ -25,6 +25,8 @@ const (
 	Degraded = "degraded"
 	// Crashed: the app's replicas exited unexpectedly and none serves.
 	Crashed = "crashed"
+	// Failed: serving is quarantined after a producer or deployment failure.
+	Failed = "failed"
 	// Hibernated: parked warm after an idle period; the next request wakes it.
 	Hibernated = "hibernated"
 	// Suspended: parked by the runtime (frozen replicas); resumes on demand.
@@ -42,7 +44,7 @@ const (
 // Observed lists every status the server can report. Class must classify each
 // one; TestClass_CoversEveryObservedStatus enforces it.
 var Observed = []string{
-	Running, Idle, Starting, Degraded, Crashed, Hibernated, Suspended,
+	Running, Idle, Starting, Degraded, Crashed, Failed, Hibernated, Suspended,
 	Stopped, Deleting, Waking, Deploying,
 }
 
@@ -60,7 +62,7 @@ const (
 	KindTransitional
 	// KindParked: intentionally asleep and wakes on demand (hibernated, suspended).
 	KindParked
-	// KindFailed: down because something broke (crashed).
+	// KindFailed: down because something broke (crashed or failed).
 	KindFailed
 	// KindDown: intentionally not serving (stopped, deleting).
 	KindDown
@@ -79,7 +81,7 @@ func Class(status string) Kind {
 		return KindTransitional
 	case Hibernated, Suspended:
 		return KindParked
-	case Crashed:
+	case Crashed, Failed:
 		return KindFailed
 	case Stopped, Deleting:
 		return KindDown

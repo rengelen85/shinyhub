@@ -877,7 +877,7 @@ func waitForHealthyWithContext(parent context.Context, cfg *cliConfig, slug stri
 // for a health wait. It deliberately says nothing about when the failure
 // happened; callers derive timing from timestamped replica diagnostics.
 func isTerminalStatus(status string) bool {
-	return status == "crashed"
+	return appstatus.Class(status) == appstatus.KindFailed
 }
 
 // logTailLines is the default number of app-log lines surfaced on a deploy
