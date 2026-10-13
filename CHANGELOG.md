@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **schedules**: preserve active jobs during history pruning so their outcomes and producer repair requirements remain recoverable; active jobs no longer consume the completed-history retention allowance.
+
 - **recovery**: target the recorded Docker container during consumer cleanup, and preserve replacement replica identities written while an older consumer is stopping.
 
 - **recovery**: adopt healthy remote replicas owned by unfinished schedule rolls, ignore terminated inventory tasks when locating a live replacement, and retain ownership when multiple live tasks claim the same slot instead of adopting or stopping an arbitrary task.

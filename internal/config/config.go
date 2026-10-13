@@ -301,8 +301,8 @@ type MaintenanceConfig struct {
 	// AuditRetentionDays deletes audit_events older than this many days. 0 (the
 	// default) keeps them forever.
 	AuditRetentionDays int `yaml:"audit_retention_days"`
-	// ScheduleRunRetentionCount keeps this many newest runs per schedule and
-	// deletes older ones. 0 (the default) keeps all runs.
+	// ScheduleRunRetentionCount keeps this many newest completed runs per schedule
+	// in addition to active runs and protected provenance. 0 keeps all runs.
 	ScheduleRunRetentionCount int `yaml:"schedule_run_retention_count"`
 	// AppLogRunRetentionCount keeps this many newest immutable runs per app
 	// replica and deletes older metadata, chunks, and local files. 0 selects the

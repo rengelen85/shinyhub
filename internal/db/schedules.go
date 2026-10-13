@@ -494,10 +494,9 @@ func (s *Store) ListAllScheduleIDs() ([]int64, error) {
 	return ids, rows.Err()
 }
 
-// PruneScheduleRuns keeps the newest keep runs for the given schedule and
-// deletes the rest, returning the number removed. A non-positive keep is a
-// no-op so callers can disable bounding. Called after each run completes so a
-// frequently-firing schedule cannot accumulate run history without bound.
+// PruneScheduleRuns keeps the newest keep completed runs for the given schedule,
+// returning the number removed. Active runs and records referenced by activations
+// or write uncertainty are always retained. A non-positive keep disables pruning.
 func (s *Store) PruneScheduleRuns(scheduleID int64, keep int) (int64, error) {
 	if keep <= 0 {
 		return 0, nil
@@ -505,6 +504,7 @@ func (s *Store) PruneScheduleRuns(scheduleID int64, keep int) (int64, error) {
 	res, err := s.db.Exec(`
 		DELETE FROM schedule_runs
 		WHERE schedule_id = ?
+		  AND status <> 'running'
 		  AND id NOT IN (
 		    SELECT schedule_run_id FROM schedule_activations
 		    WHERE schedule_run_id IS NOT NULL
@@ -515,7 +515,7 @@ func (s *Store) PruneScheduleRuns(scheduleID int64, keep int) (int64, error) {
 		  )
 		  AND id NOT IN (
 		    SELECT id FROM schedule_runs
-		    WHERE schedule_id = ?
+		    WHERE schedule_id = ? AND status <> 'running'
 		    ORDER BY started_at DESC, id DESC
 		    LIMIT ?
 		  )`, scheduleID, scheduleID, keep)
