@@ -91,7 +91,7 @@ func discardRecoveredRoute(prx *proxy.Proxy, app *db.App, r *db.Replica) {
 		target = fmt.Sprintf("http://127.0.0.1:%d", *r.Port)
 	}
 	if target != "" {
-		prx.DeregisterReplicaIfTarget(app.Slug, r.Index, target)
+		prx.DeregisterReplicaIfIdentity(app.Slug, r.Index, target, derefInt64(r.DeploymentID))
 	}
 }
 

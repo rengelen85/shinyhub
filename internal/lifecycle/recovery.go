@@ -429,9 +429,19 @@ func RecoverProcesses(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, d
 		}
 
 		reps, err := store.ListReplicas(app.ID)
-		if err != nil || len(reps) == 0 {
+		if err != nil {
+			slog.Error("process recovery: list replicas; preserving app state", "slug", app.Slug, "err", err)
+			continue
+		}
+		if len(reps) == 0 {
 			CleanupObsoleteDeploymentGenerations(store, mgr, prx, app)
-			markRecoveryStopped(store, app.Slug)
+			if servingErr == nil && serving.Status == db.DeploymentSucceeded {
+				// Missing rows do not revoke a previously serving app's intent.
+				// Restore its warm floor, or leave it available for a cold wake.
+				markRecoveryDown(store, app.Slug)
+			} else {
+				markRecoveryStopped(store, app.Slug)
+			}
 			continue
 		}
 		unfinishedRuns, err := store.ListUnfinishedAppLogRuns(app.ID)

@@ -152,6 +152,15 @@ func TestFrozenRestoreDoesNotFreezeServingFloor(t *testing.T) {
 }
 
 func TestRecoveryThenStartupWarmFloorWithRealStore(t *testing.T) {
+	checkRecoveryThenStartupWarmFloor(t, true)
+}
+
+func TestRecoveryRestoresWarmFloorWithoutReplicaRows(t *testing.T) {
+	checkRecoveryThenStartupWarmFloor(t, false)
+}
+
+func checkRecoveryThenStartupWarmFloor(t *testing.T, persistedRows bool) {
+	t.Helper()
 	store, app := seedWarmApp(t)
 	bundle := t.TempDir()
 	dep, err := store.CreateDeployment(db.CreateDeploymentParams{AppID: app.ID, Version: "v1", BundleDir: bundle, Status: db.DeploymentSucceeded})
@@ -169,7 +178,7 @@ func TestRecoveryThenStartupWarmFloorWithRealStore(t *testing.T) {
 	}
 	// The surplus slot has no persisted row; startup must still make it warm
 	// capacity that the ordinary expansion path can discover later.
-	for i := 0; i < 2; i++ {
+	for i := 0; persistedRows && i < 2; i++ {
 		if err := store.UpsertReplica(db.UpsertReplicaParams{
 			AppID: app.ID, Index: i, Status: "running", Provider: "native", Tier: "default",
 			DesiredState: "running", DeploymentID: &dep.ID,
