@@ -77,7 +77,7 @@ func TestManager_ForgetSchedule_SafeWithAConcurrentHolder(t *testing.T) {
 // TestManager_ForgetApp_RemovesOnlyThatAppsPublicationGate mirrors the
 // schedule-scoped test for the app-keyed publicationGates map.
 func TestManager_ForgetApp_RemovesOnlyThatAppsPublicationGate(t *testing.T) {
-	m := &Manager{publicationGates: map[int64]*sync.RWMutex{10: {}, 20: {}}}
+	m := &Manager{publicationGates: map[int64]*publicationGate{10: {}, 20: {}}}
 
 	m.ForgetApp(10)
 

@@ -131,7 +131,7 @@ type Manager struct {
 	// publicationGates serialize every serving-data writer against consumer
 	// startup for the app. Writers hold the exclusive side through durable run
 	// completion; fresh consumers hold the shared side through replica upsert.
-	publicationGates   map[int64]*sync.RWMutex
+	publicationGates   map[int64]*publicationGate
 	publicationLockDir string
 	active             map[int64]context.CancelFunc // in-flight run cancels, keyed by run ID
 	activeApps         map[int64]int64              // run ID -> app ID for app-scoped deletion drains
@@ -221,7 +221,7 @@ func NewManager(procMgr *process.Manager, tierOrder []string, defaultTier string
 		queues:             make(map[int64]chan struct{}),
 		admissionLocks:     make(map[int64]*sync.Mutex),
 		producerGates:      make(map[int64]*sync.RWMutex),
-		publicationGates:   make(map[int64]*sync.RWMutex),
+		publicationGates:   make(map[int64]*publicationGate),
 		publicationLockDir: publicationLockDir,
 		active:             make(map[int64]context.CancelFunc),
 		activeApps:         make(map[int64]int64),
@@ -1124,11 +1124,33 @@ func (m *Manager) producerGateFor(scheduleID int64) *sync.RWMutex {
 	return gate
 }
 
+// publicationGate makes writer waits cancellable without allowing newly
+// booting consumers to overtake a waiting writer. The admission mutex stays
+// held until the writer acquires the RW lock or abandons its wait.
+type publicationGate struct {
+	sync.RWMutex
+	admission sync.Mutex
+}
+
+func (g *publicationGate) RLock() {
+	g.admission.Lock()
+	g.RWMutex.RLock()
+	g.admission.Unlock()
+}
+
+func (g *publicationGate) lockContext(ctx context.Context) error {
+	if err := waitAdmission(ctx, g.admission.TryLock); err != nil {
+		return err
+	}
+	defer g.admission.Unlock()
+	return waitAdmission(ctx, g.RWMutex.TryLock)
+}
+
 // publicationGateFor must be called with m.mu held.
-func (m *Manager) publicationGateFor(appID int64) *sync.RWMutex {
+func (m *Manager) publicationGateFor(appID int64) *publicationGate {
 	gate := m.publicationGates[appID]
 	if gate == nil {
-		gate = &sync.RWMutex{}
+		gate = &publicationGate{}
 		m.publicationGates[appID] = gate
 	}
 	return gate
@@ -1174,12 +1196,14 @@ func (m *Manager) AcquireCompatibleConsumerBootGate(appID int64) (func(), error)
 	return release, nil
 }
 
-func (m *Manager) acquirePublicationWriter(appID int64) (func(), *os.File, error) {
+func (m *Manager) acquirePublicationWriter(ctx context.Context, appID int64) (func(), *os.File, error) {
 	m.mu.Lock()
 	gate := m.publicationGateFor(appID)
 	m.mu.Unlock()
-	gate.Lock()
-	releaseFile, file, err := m.acquirePublicationFileLock(appID, unix.LOCK_EX)
+	if err := gate.lockContext(ctx); err != nil {
+		return nil, nil, err
+	}
+	releaseFile, file, err := m.acquirePublicationFileLockContext(ctx, appID, unix.LOCK_EX)
 	if err != nil {
 		gate.Unlock()
 		return nil, nil, err
@@ -1251,7 +1275,13 @@ func (m *Manager) AcquirePublicationRecoveryFences(ctx context.Context, appIDs [
 		m.mu.Lock()
 		gate := m.publicationGateFor(appID)
 		m.mu.Unlock()
-		gate.Lock()
+		if err := gate.lockContext(ctx); err != nil {
+			releaseExecution()
+			for i := len(releases) - 1; i >= 0; i-- {
+				releases[i]()
+			}
+			return nil, err
+		}
 		releaseFile, _, err := m.acquirePublicationFileLockContext(ctx, appID, unix.LOCK_EX)
 		if err != nil {
 			gate.Unlock()
@@ -1586,7 +1616,11 @@ func (m *Manager) execute(ctx context.Context, sched *db.Schedule, app *db.App, 
 	releaseExecution, executionLifetimeFile, err := m.acquireJobExecution(ctx, app.ID)
 	if err != nil {
 		slog.Error("schedule run: acquire physical execution fence", "schedule", sched.ID, "run", runID, "err", err)
-		m.finishRun(sched, runID, "failed", nil, trigger, userID, false)
+		status := "failed"
+		if ctx.Err() != nil {
+			status = m.cancelStatus(runID)
+		}
+		m.finishRun(sched, runID, status, nil, trigger, userID, false)
 		return
 	}
 	defer releaseExecution()
@@ -1604,10 +1638,14 @@ func (m *Manager) execute(ctx context.Context, sched *db.Schedule, app *db.App, 
 	}
 	var publicationLifetimeFile, candidateConsumerFenceFile *os.File
 	if schedulePublishesData(sched, trigger) {
-		releasePublication, lifetimeFile, err := m.acquirePublicationWriter(app.ID)
+		releasePublication, lifetimeFile, err := m.acquirePublicationWriter(ctx, app.ID)
 		if err != nil {
 			slog.Error("schedule run: acquire publication fence", "schedule", sched.ID, "run", runID, "err", err)
-			m.finishRun(sched, runID, "failed", nil, trigger, userID, false)
+			status := "failed"
+			if ctx.Err() != nil {
+				status = m.cancelStatus(runID)
+			}
+			m.finishRun(sched, runID, status, nil, trigger, userID, false)
 			return
 		}
 		defer releasePublication()
@@ -1616,7 +1654,11 @@ func (m *Manager) execute(ctx context.Context, sched *db.Schedule, app *db.App, 
 			releaseConsumers, consumerFile, err := m.acquireConsumerLifetimeFileLockContext(ctx, app.ID, unix.LOCK_EX)
 			if err != nil {
 				slog.Error("schedule run: acquire candidate consumer lifetime fence", "schedule", sched.ID, "run", runID, "err", err)
-				m.finishRun(sched, runID, "failed", nil, trigger, userID, false)
+				status := "failed"
+				if ctx.Err() != nil {
+					status = m.cancelStatus(runID)
+				}
+				m.finishRun(sched, runID, status, nil, trigger, userID, false)
 				return
 			}
 			defer releaseConsumers()

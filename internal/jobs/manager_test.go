@@ -516,6 +516,155 @@ func TestManager_AdmittedProducerSurvivesSameBundleServingRoll(t *testing.T) {
 	}
 }
 
+func TestManager_RecoveryDeadlineInterruptsConsumerBootWait(t *testing.T) {
+	st := newFakeStore(makeSchedule("concurrent", 30), makeApp())
+	m := newTestManager(t, &fakeRuntime{}, st)
+	release, err := m.AcquireConsumerBootGate(st.app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		unlock, err := m.AcquirePublicationRecoveryFences(ctx, []int64{st.app.ID})
+		if unlock != nil {
+			unlock()
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("recovery ignored deadline: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ownership recovery hung behind consumer boot after its deadline")
+	}
+}
+
+func TestManager_HandoffInterruptsCandidateWaitingForConsumers(t *testing.T) {
+	sched := makeSchedule("concurrent", 30)
+	sched.DeployTrigger = "bundle_change"
+	st := newFakeStore(sched, makeApp())
+	st.inserted = make(chan struct{}, 1)
+	m := newTestManager(t, &fakeRuntime{}, st)
+	release, _, err := m.AcquireConsumerLifetime(st.app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		m.Stop(ctx)
+	}()
+	dep := &db.Deployment{ID: 2, AppID: st.app.ID, BundleDir: t.TempDir(), Version: "v2"}
+	done := make(chan int64, 1)
+	go func() { id, _ := m.RunCandidateProducerLocked(sched, st.app, dep); done <- id }()
+	select {
+	case <-st.inserted:
+	case <-time.After(time.Second):
+		t.Fatal("candidate was not admitted")
+	}
+	time.Sleep(30 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.InterruptAndDrain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-done:
+		run, err := st.GetScheduleRun(id)
+		if err != nil || run.Status != "interrupted" {
+			t.Fatalf("candidate cancelled before writing must be interrupted: %+v, %v", run, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("candidate did not return after handoff")
+	}
+}
+
+func TestManager_CancelProducerWaitingForConsumerBoot(t *testing.T) {
+	for _, separateManager := range []bool{false, true} {
+		t.Run(fmt.Sprintf("separate_manager=%t", separateManager), func(t *testing.T) {
+			sched := makeSchedule("concurrent", 30)
+			sched.DeployTrigger = "first_deploy"
+			st := newFakeStore(sched, makeApp())
+			dir := t.TempDir()
+			m, err := jobs.NewManager(process.NewManager(dir, &fakeRuntime{}), nil, process.DefaultTier, st, nil, dir, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			holder := m
+			if separateManager {
+				holder, err = jobs.NewManager(process.NewManager(dir, &fakeRuntime{}), nil, process.DefaultTier, st, nil, dir, dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			release, err := holder.AcquireConsumerBootGate(st.app.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				release()
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				m.Stop(ctx)
+			}()
+			runID, err := m.Run(sched.ID, "manual", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Let the admitted execution reach the publication fence held above.
+			time.Sleep(30 * time.Millisecond)
+			bootDone := make(chan error, 1)
+			if !separateManager {
+				go func() {
+					unlock, err := holder.AcquireConsumerBootGate(st.app.ID)
+					if unlock != nil {
+						unlock()
+					}
+					bootDone <- err
+				}()
+				select {
+				case err := <-bootDone:
+					t.Fatalf("new consumer overtook waiting producer: %v", err)
+				case <-time.After(30 * time.Millisecond):
+				}
+			}
+			if err := m.Cancel(runID); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				run, err := st.GetScheduleRun(runID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if run.Status == "cancelled" {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("producer cancellation did not finalize behind consumer boot: status %s", run.Status)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if !separateManager {
+				select {
+				case err := <-bootDone:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("cancelled writer still blocked new consumer boot")
+				}
+			}
+		})
+	}
+}
+
 func TestManager_PublicationGateSerializesProducerAndConsumerBoot(t *testing.T) {
 	t.Run("pre-admitted old writer is superseded after waiting behind new consumer", func(t *testing.T) {
 		rt := &fakeRuntime{exitInfo: process.ExitInfo{Code: 0}}

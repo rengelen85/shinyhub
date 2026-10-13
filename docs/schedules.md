@@ -127,6 +127,13 @@ writer whose `deploy_trigger` is `never`) or a deployment that supplies and
 successfully runs a replacement producer policy. Merely deploying unrelated
 code or rolling back does not erase an uncertain physical write.
 
+A producer waiting for consumer startup or an earlier process to release a
+publication lock can still be canceled. Operator cancellation records
+`cancelled`; ownership retirement records `interrupted`, including deployment
+producers waiting for old consumers to exit. Cancellation before execution does
+not create write uncertainty. Once a producer may have written data, the
+quarantine and repair rules above still apply.
+
 Quarantine also applies while a designated producer is still writing, and after
 an interrupted or failed deployment crossed its producer barrier. A later
 successful corrective deploy repairs the deployment barrier; schedule write
