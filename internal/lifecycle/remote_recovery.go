@@ -94,15 +94,17 @@ func recoverRemoteReplica(
 	// once the task acquires an IP.
 	if item.URL == "" && fargate.IsECSManagedWorkerID(item.WorkerID) {
 		mgr.Adopt(app.Slug, process.ProcessInfo{
-			Slug:        app.Slug,
-			AppID:       app.ID,
-			Index:       r.Index,
-			Status:      process.StatusRunning,
-			Tier:        r.Tier,
-			Provider:    r.Provider,
-			EndpointURL: r.EndpointURL, // preserve DB value if present
-			WorkerID:    r.WorkerID,
-			LogRunID:    logRunID,
+			Slug:         app.Slug,
+			AppID:        app.ID,
+			Index:        r.Index,
+			Status:       process.StatusRunning,
+			Tier:         r.Tier,
+			Provider:     r.Provider,
+			EndpointURL:  r.EndpointURL, // preserve DB value if present
+			WorkerID:     r.WorkerID,
+			AppVersion:   r.AppVersion,
+			DeploymentID: derefInt64(r.DeploymentID),
+			LogRunID:     logRunID,
 		}, process.RunHandle{ContainerID: r.WorkerID + "/" + item.ContainerID})
 		slog.Info("recovery: partial-adopt ecs replica (no ip yet)",
 			"slug", app.Slug, "idx", r.Index, "container", item.ContainerID,
@@ -117,15 +119,17 @@ func recoverRemoteReplica(
 
 	// Phase 2: full adoption with proxy registration (task is routable).
 	mgr.Adopt(app.Slug, process.ProcessInfo{
-		Slug:        app.Slug,
-		AppID:       app.ID,
-		Index:       r.Index,
-		Status:      process.StatusRunning,
-		Tier:        r.Tier,
-		Provider:    r.Provider,
-		EndpointURL: item.URL,
-		WorkerID:    r.WorkerID,
-		LogRunID:    logRunID,
+		Slug:         app.Slug,
+		AppID:        app.ID,
+		Index:        r.Index,
+		Status:       process.StatusRunning,
+		Tier:         r.Tier,
+		Provider:     r.Provider,
+		EndpointURL:  item.URL,
+		WorkerID:     r.WorkerID,
+		AppVersion:   r.AppVersion,
+		DeploymentID: derefInt64(r.DeploymentID),
+		LogRunID:     logRunID,
 	}, process.RunHandle{ContainerID: r.WorkerID + "/" + item.ContainerID})
 	base := mgr.TransportForWorker(r.Tier, r.WorkerID)
 	if err := prx.RegisterReplica(app.Slug, r.Index, item.URL, recoveredRouteTransport(prx, store, r, base, item.URL), derefInt64(r.DeploymentID), app.ID); err != nil {

@@ -1087,8 +1087,13 @@ func workerDeclaredGone(store *db.Store, workerID string) bool {
 	}
 	w, err := store.GetWorker(workerID)
 	if err != nil {
-		// Row missing/reaped, or a read error: do not assume the worker is up.
-		return true
+		if errors.Is(err, db.ErrNotFound) {
+			return true
+		}
+		// A failed registry read says nothing about physical liveness. Keep
+		// the identity until a later scan can establish that the owner is gone.
+		slog.Warn("recovery: worker registry state unknown", "worker_id", workerID, "err", err)
+		return false
 	}
 	return w.Status == "down"
 }
