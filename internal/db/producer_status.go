@@ -10,15 +10,20 @@ import (
 	"time"
 )
 
-// All durable compatibility blockers must clear before consumers may return.
-const appCompatibilityBlockersSQL = `EXISTS (
+// Deployment barriers and failed writes invalidate existing consumers. A healthy
+// running publisher only fences new consumer boots, which must wait to load a
+// complete publication.
+const appCompatibilityFailuresSQL = `EXISTS (
  SELECT 1 FROM deployments failed WHERE failed.app_id = apps.id AND ` + deploymentRepairConditionSQL + `
-) OR EXISTS (
- SELECT 1 FROM schedule_runs r JOIN app_schedules sc ON sc.id = r.schedule_id
- WHERE sc.app_id = apps.id AND r.publishes_data = 1 AND r.status = 'running'
 ) OR EXISTS (
  SELECT 1 FROM schedule_data_uncertainty u JOIN app_schedules sc ON sc.id = u.schedule_id
  WHERE sc.app_id = apps.id
+)`
+
+// All durable compatibility blockers must clear before consumers may return.
+const appCompatibilityBlockersSQL = appCompatibilityFailuresSQL + ` OR EXISTS (
+ SELECT 1 FROM schedule_runs r JOIN app_schedules sc ON sc.id = r.schedule_id
+ WHERE sc.app_id = apps.id AND r.publishes_data = 1 AND r.status = 'running'
 )`
 
 type producerStatusChange struct {

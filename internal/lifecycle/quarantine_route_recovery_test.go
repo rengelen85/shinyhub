@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,12 @@ type quarantineHTTPTransport struct{}
 
 func (quarantineHTTPTransport) TransportForReplica(*db.Replica) (http.RoundTripper, error) {
 	return http.DefaultTransport, nil
+}
+
+type unavailableReplicaTransport struct{}
+
+func (unavailableReplicaTransport) TransportForReplica(*db.Replica) (http.RoundTripper, error) {
+	return nil, errors.New("replacement worker is unavailable")
 }
 
 func seedSurvivingReplica(t *testing.T) (*db.Store, *db.App) {
@@ -129,6 +136,125 @@ func TestPoolSyncWithdrawsAlreadyAdoptedQuarantinedRoute(t *testing.T) {
 	p.ServeHTTP(after, httptest.NewRequest("GET", "/app/demo/", nil))
 	if after.Body.String() == "unsafe data" || p.ReplicaTargetURL(app.Slug, 0) != "" {
 		t.Fatalf("previously adopted route still serves quarantined data: %d %s", after.Code, after.Body.String())
+	}
+}
+
+func TestPoolSyncKeepsServingDuringHealthyProducerRun(t *testing.T) {
+	store, app := seedSurvivingReplica(t)
+	p := proxy.New()
+	syncer := proxy.NewPoolSyncer(p, store, quarantineHTTPTransport{}, slog.Default(), false)
+	syncer.SetReplicaValidator(ReplicaRouteValidator(store, process.NewManager(t.TempDir(), stubNonNativeRuntime{})))
+	syncer.RunOnce(context.Background())
+	schedule, err := store.CreateSchedule(db.CreateScheduleParams{AppID: app.ID, Name: "refresh", CronExpr: "0 * * * *", CommandJSON: `["refresh"]`, Enabled: true, DeployTrigger: "first_deploy", OnSuccess: "roll", RollFallback: "defer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertScheduleRun(db.InsertScheduleRunParams{ScheduleID: schedule, Status: "running", Trigger: "schedule", StartedAt: time.Now().UTC(), PublishesData: true, OnSuccess: "roll", RollFallback: "defer"}); err != nil {
+		t.Fatal(err)
+	}
+	syncer.RunOnce(context.Background())
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/app/demo/", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "unsafe data" {
+		t.Fatalf("healthy refresh interrupted the existing consumer: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPoolSyncDoesNotKeepRetiredEndpointWhenReplacementIsNotReady(t *testing.T) {
+	store, app := seedSurvivingReplica(t)
+	p := proxy.New()
+	syncer := proxy.NewPoolSyncer(p, store, quarantineHTTPTransport{}, slog.Default(), false)
+	syncer.SetReplicaValidator(ReplicaRouteValidator(store, process.NewManager(t.TempDir(), stubNonNativeRuntime{})))
+	syncer.RunOnce(context.Background())
+	old := p.ReplicaTargetURL(app.Slug, 0)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	defer backend.Close()
+	r := replicaAt(t, store, app.ID, 0)
+	if err := store.UpsertReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, Status: "running", Provider: "docker", Tier: process.DefaultTier, EndpointURL: backend.URL, WorkerID: "replacement-worker", DesiredState: "running", DeploymentID: r.DeploymentID}); err != nil {
+		t.Fatal(err)
+	}
+	syncer.RunOnce(context.Background())
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/app/demo/", nil))
+	if rec.Body.String() == "unsafe data" || p.ReplicaTargetURL(app.Slug, 0) == old {
+		t.Fatalf("unready replacement left retired endpoint routable: status=%d target=%s", rec.Code, p.ReplicaTargetURL(app.Slug, 0))
+	}
+}
+
+func TestPoolSyncDoesNotKeepRetiredEndpointWhenReplacementTransportFails(t *testing.T) {
+	store, app := seedSurvivingReplica(t)
+	p := proxy.New()
+	proxy.NewPoolSyncer(p, store, quarantineHTTPTransport{}, slog.Default(), false).RunOnce(context.Background())
+	r := replicaAt(t, store, app.ID, 0)
+	if err := store.UpsertReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, Status: "running", Provider: "docker", Tier: process.DefaultTier, EndpointURL: "http://127.0.0.1:1", WorkerID: "replacement-worker", DesiredState: "running", DeploymentID: r.DeploymentID}); err != nil {
+		t.Fatal(err)
+	}
+	proxy.NewPoolSyncer(p, store, unavailableReplicaTransport{}, slog.Default(), false).RunOnce(context.Background())
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/app/demo/", nil))
+	if rec.Body.String() == "unsafe data" {
+		t.Fatalf("unavailable replacement worker left retired endpoint serving: %d", rec.Code)
+	}
+}
+
+func TestFailedAdoptionPreservesConcurrentReplacement(t *testing.T) {
+	t.Run("new endpoint", func(t *testing.T) { checkConcurrentReplacement(t, false) })
+	t.Run("reused endpoint", func(t *testing.T) { checkConcurrentReplacement(t, true) })
+}
+
+func checkConcurrentReplacement(t *testing.T, reuseEndpoint bool) {
+	t.Helper()
+	store, app := seedSurvivingReplica(t)
+	p := proxy.New()
+	syncer := proxy.NewPoolSyncer(p, store, quarantineHTTPTransport{}, slog.Default(), false)
+	syncer.SetReplicaValidator(ReplicaRouteValidator(store, process.NewManager(t.TempDir(), stubNonNativeRuntime{})))
+	syncer.RunOnce(context.Background())
+	oldEndpoint := p.ReplicaTargetURL(app.Slug, 0)
+	entered, release := make(chan struct{}), make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer backend.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	r := replicaAt(t, store, app.ID, 0)
+	if err := store.UpsertReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, Status: "running", Provider: "docker", Tier: process.DefaultTier, EndpointURL: backend.URL, WorkerID: "replacement-worker", DesiredState: "running", DeploymentID: r.DeploymentID}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { syncer.RunOnce(context.Background()); close(done) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement readiness did not start")
+	}
+	current := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("current generation")) }))
+	defer current.Close()
+	endpoint, want := current.URL, "current generation"
+	if reuseEndpoint {
+		endpoint, want = oldEndpoint, "unsafe data"
+	}
+	latestDeployment := *r.DeploymentID + 1
+	if err := p.RegisterReplica(app.Slug, 0, endpoint, nil, latestDeployment); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement readiness did not finish")
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/app/demo/", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != want || p.ReplicaDeploymentID(app.Slug, 0) != latestDeployment {
+		t.Fatalf("failed stale adoption discarded a concurrent replacement: %d %s", rec.Code, rec.Body.String())
 	}
 }
 

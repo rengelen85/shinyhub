@@ -258,14 +258,10 @@ func (s *PoolSyncer) reconcileSlug(ctx context.Context, slug string, rows []db.R
 			continue
 		}
 
-		// Diff: only re-register when endpoint or deployment changed. The two
-		// reads (ReplicaTargetURL + ReplicaDeploymentID) and the subsequent
-		// RegisterReplica are not atomic across lock acquisitions. A concurrent
-		// deploy could update the slot between the read and the register. In
-		// that case the syncer's stale read causes at worst a harmless extra
-		// re-register (which clears wsReady), never incorrect routing: the
-		// deploy path always registers the new URL before persisting the row,
-		// so the syncer's next tick will see the deployed state and stabilise.
+		// Diff: only re-register when endpoint or deployment changed. Production
+		// reconciliation holds the fleet guard across the snapshot, readiness
+		// check, and registration so a deploy cannot invalidate the snapshot.
+		// Failed adoption additionally removes only the identity observed here.
 		curURL := s.prx.ReplicaTargetURL(slug, idx)
 		curDepID := s.prx.ReplicaDeploymentID(slug, idx)
 		if curURL == d.endpointURL && curDepID == d.deploymentID {
@@ -277,12 +273,21 @@ func (s *PoolSyncer) reconcileSlug(ctx context.Context, slug string, rows []db.R
 		// Build the per-replica transport from the DB row.
 		tr, err := s.transport.TransportForReplica(d.rr.Replica)
 		if err != nil {
+			if curURL != "" {
+				s.prx.DeregisterReplicaIfIdentity(slug, idx, curURL, curDepID)
+			}
 			s.log.Warn("pool_sync_transport_error",
 				"slug", slug, "index", idx, "err", err)
 			continue
 		}
 		if s.validate != nil {
 			if err := s.validate(ctx, d.rr, tr); err != nil {
+				// The durable slot has replaced this endpoint. Failed adoption
+				// must not keep requests on the superseded process; preserve a
+				// concurrent registration by removing only the observed target.
+				if curURL != "" {
+					s.prx.DeregisterReplicaIfIdentity(slug, idx, curURL, curDepID)
+				}
 				s.log.Info("pool_adoption_deferred", "slug", slug, "index", idx, "reason", "replica-not-ready", "err", err)
 				continue
 			}

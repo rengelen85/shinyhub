@@ -2646,6 +2646,16 @@ func singleJoiningSlash(a, b string) string {
 // deregistering it. Unknown pools, out-of-range indices, and empty slots are
 // no-ops.
 func (p *Proxy) DeregisterReplicaIfTarget(slug string, index int, expectURL string) bool {
+	return p.deregisterReplicaIfTarget(slug, index, expectURL, nil)
+}
+
+// DeregisterReplicaIfIdentity also checks the deployment, preserving a new
+// generation that reused the endpoint while a stale readiness probe finished.
+func (p *Proxy) DeregisterReplicaIfIdentity(slug string, index int, expectURL string, expectDeploymentID int64) bool {
+	return p.deregisterReplicaIfTarget(slug, index, expectURL, &expectDeploymentID)
+}
+
+func (p *Proxy) deregisterReplicaIfTarget(slug string, index int, expectURL string, expectDeploymentID *int64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pool, ok := p.pools[slug]
@@ -2654,6 +2664,9 @@ func (p *Proxy) DeregisterReplicaIfTarget(slug string, index int, expectURL stri
 	}
 	rb := pool.replicas[index]
 	if rb == nil || rb.targetURL != expectURL {
+		return false
+	}
+	if expectDeploymentID != nil && rb.deploymentID != *expectDeploymentID {
 		return false
 	}
 	pool.replicas[index] = nil

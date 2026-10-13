@@ -5123,7 +5123,7 @@ func (s *Store) ListRoutableReplicas() ([]RoutableReplica, error) {
 		FROM replicas r
 		JOIN apps a ON a.id = r.app_id
 		WHERE r.status IN ('running', 'draining')
-		  AND NOT EXISTS (SELECT 1 FROM apps WHERE id = r.app_id AND (` + appCompatibilityBlockersSQL + `))
+		  AND NOT EXISTS (SELECT 1 FROM apps WHERE id = r.app_id AND (` + appCompatibilityFailuresSQL + `))
 		ORDER BY a.slug, r.idx`)
 	if err != nil {
 		return nil, fmt.Errorf("list routable replicas: %w", err)

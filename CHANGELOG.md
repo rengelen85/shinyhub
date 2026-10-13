@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **routing**: retain existing healthy consumers while scheduled producers run, and remove superseded endpoints when replacement readiness or worker transport fails without discarding concurrent replacement routes.
+
 - **recovery**: exclude compatibility-quarantined consumers from startup and clustered routing, recheck quarantine after readiness probes, and clean up failed or operator-stopped apps without a producer recovery marker. Invalidate draining consumers while retaining runtime identity until shutdown is confirmed.
 - **diagnostics**: refresh producer failure reasons after additional failures and partial repairs so they identify an outstanding blocker instead of an already-repaired producer.
 - **schedules**: avoid a hub panic when producer-failure cleanup encounters empty replica slots, and restore repaired apps when the last queued publisher ends without writing data.
