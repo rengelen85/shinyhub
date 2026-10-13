@@ -1,5 +1,5 @@
 ---
-description: "Upgrade ShinyHub with acknowledged reloads with listener handoff, a separate session drain budget, and opt-in WebSocket continuity for native multiplex apps."
+description: "Upgrade ShinyHub with acknowledged listener handoff, session drain budgets, and opt-in WebSocket continuity for native multiplex apps."
 ---
 
 # Zero-downtime upgrades (systemd)

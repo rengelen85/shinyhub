@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **schedules**: restore the app's lifecycle state after all failed producers are repaired, and replace quarantined consumers across multiplex, grouped, and per-session worker isolation. Operator stops and deletion take precedence. Recovery intent survives hub restarts; failures recorded by older versions still need one manual `shinyhub apps start` after repair.
+- **diagnostics**: audit and log producer-driven app status changes with the run ID and reason, expose the failure in app details, and return an unavailable page with HTTP 503 while the app is failed.
+- **reload**: finish admitted producers before preserving handoff and require ready successor replicas before acknowledging reload success.
+
 ## [0.20.6](https://github.com/rvben/shinyhub/compare/v0.20.5...v0.20.6) - 2026-10-13
 
 ### Added

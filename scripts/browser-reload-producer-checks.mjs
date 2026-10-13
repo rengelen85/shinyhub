@@ -11,10 +11,13 @@ export async function checkReloadProducers({ context, page, appURL, state, work,
   const pidFile = join(state, 'hub.pid');
   const currentPID = async () => Number((await readFile(pidFile, 'utf8')).trim());
   const exists = path => access(path).then(() => true, () => false);
-  const rollEntered = join(state, 'roll-producer-entered');
-  const rollRelease = join(state, 'roll-producer-release');
-  const writerEntered = join(state, 'cron-producer-entered');
-  const writerRelease = join(state, 'cron-producer-release');
+  // Producers run inside the native sandbox; checkpoint files must live in
+  // their writable app-data directory, not the control plane's private state.
+  const checkpoints = join(state, 'app-data', 'browser');
+  const rollEntered = join(checkpoints, 'roll-producer-entered');
+  const rollRelease = join(checkpoints, 'roll-producer-release');
+  const writerEntered = join(checkpoints, 'cron-producer-entered');
+  const writerRelease = join(checkpoints, 'cron-producer-release');
   const producer = (entered, release, exitCode = 0) => [python, '-c', `
 import os, sys, time
 from pathlib import Path
@@ -56,7 +59,11 @@ sys.exit(${exitCode})
       // the first roll is correctly refused before this regression can occur.
       await writeFile(writerRelease, 'prime');
       const primed = await request('POST', `/api/apps/browser/schedules/${writer.id}/run`, {}, 202);
-      await poll(async () => (await api(`/schedules/${writer.id}/runs/${primed.run_id}`)).status === 'succeeded', 'writer policy has a successful publication');
+      await poll(async () => {
+        const run = await api(`/schedules/${writer.id}/runs/${primed.run_id}`);
+        assert.ok(['running', 'succeeded'].includes(run.status), `writer priming ended ${run.status}: ${JSON.stringify(run)}`);
+        return run.status === 'succeeded';
+      }, 'writer policy has a successful publication');
       await rm(writerRelease);
       await rm(writerEntered);
       const started = await request('POST', `/api/apps/browser/schedules/${roll.id}/run`, {}, 202);
@@ -157,8 +164,8 @@ sys.exit(${exitCode})
   assert.deepEqual(failures, [], 'every app page probe succeeded during the schedule roll and reload');
 
   await check('acknowledged reload fails when a previously serving app has no ready successor replica', async () => {
-    const entered = join(state, 'failed-producer-entered');
-    const release = join(state, 'failed-producer-release');
+    const entered = join(checkpoints, 'failed-producer-entered');
+    const release = join(checkpoints, 'failed-producer-release');
     const failed = await schedule('failed-reload-writer', entered, release, 'none', 1);
     const started = await request('POST', `/api/apps/browser/schedules/${failed.id}/run`, {}, 202);
     await poll(() => exists(entered), 'failing producer has begun its physical write');

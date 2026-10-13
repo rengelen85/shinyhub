@@ -26,8 +26,9 @@ const { chromium } = require('playwright');
 const results = join(root, 'loadtest/results');
 await mkdir(results, { recursive: true });
 const work = await mkdtemp(join(results, 'browser-lifecycle-'));
-const state = join(work, 'state');
-await mkdir(state, { mode: 0o700 });
+// Reload uses a Unix socket below state; repository paths can exceed macOS's
+// socket-path limit. mkdtemp creates a private directory on both native hosts.
+const state = await mkdtemp('/tmp/shinyhub-e2e-');
 const binary = process.env.SHINYHUB_E2E_BINARY ? resolve(process.env.SHINYHUB_E2E_BINARY) : join(work, 'shinyhub');
 const config = join(state, 'shinyhub.yaml');
 const clientConfig = join(state, 'client.json');
