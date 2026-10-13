@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **recovery**: adopt healthy remote replicas owned by unfinished schedule rolls, ignore terminated inventory tasks when locating a live replacement, and retain ownership when multiple live tasks claim the same slot instead of adopting or stopping an arbitrary task.
+
 - **recovery**: retain remote consumers' deployment ownership, including ECS tasks awaiting an IP, and avoid treating worker registry read errors as confirmed loss that permits duplicate placement.
 - **proxy**: reject new traffic to failed apps even while their backends survive cleanup, override stale readiness success, and retain the failure fence until a corrective deployment actually succeeds.
 - **recovery**: restore previously serving apps with missing replica rows instead of leaving them stopped, preserve app state on replica lookup errors, and retain replacement routes when a retired generation reused the same endpoint.

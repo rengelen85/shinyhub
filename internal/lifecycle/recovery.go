@@ -560,8 +560,11 @@ func RecoverProcesses(store *db.Store, mgr *process.Manager, prx *proxy.Proxy, d
 					}
 					continue
 				}
-				if recoverRemoteReplica(store, mgr, prx, app, r, ti.items, logRunID) {
+				if adopted, uncertain := recoverRemoteReplica(store, mgr, prx, app, r, ti.items, logRunID); adopted {
 					anyAlive = true
+					continue
+				} else if uncertain {
+					indeterminate = true
 					continue
 				}
 				// The replica was not adopted from a reachable inventory: the
@@ -1946,7 +1949,12 @@ func stopQuarantinedReplica(store *db.Store, mgr *process.Manager, app *db.App, 
 			if r.DeploymentID != nil {
 				depID = strconv.FormatInt(*r.DeploymentID, 10)
 			}
-			if item := matchInventoryItem(items, app.Slug, r.Index, depID, r.WorkerID); item != nil && item.Running {
+			item, ambiguous := matchInventoryItem(items, app.Slug, r.Index, depID, r.WorkerID)
+			if ambiguous {
+				slog.Warn("recovery: ambiguous quarantine victim; retaining runtime identity", "slug", app.Slug, "idx", r.Index, "worker_id", r.WorkerID)
+				return false
+			}
+			if item != nil {
 				handle.ContainerID = item.WorkerID + "/" + item.ContainerID
 				found = true
 			}

@@ -20,7 +20,7 @@ func TestMatchInventoryItem(t *testing.T) {
 	}
 
 	// Current deployment: matches.
-	got := matchInventoryItem(items, "app", 0, "7", wantWorker)
+	got, _ := matchInventoryItem(items, "app", 0, "7", wantWorker)
 	if got == nil {
 		t.Fatal("current-deployment replica not matched")
 	}
@@ -28,15 +28,15 @@ func TestMatchInventoryItem(t *testing.T) {
 		t.Errorf("URL = %q", got.URL)
 	}
 	// Superseded deployment (same slug+index, different deployment) must NOT match.
-	if stale := matchInventoryItem(items, "app", 0, "9", wantWorker); stale != nil {
+	if stale, _ := matchInventoryItem(items, "app", 0, "9", wantWorker); stale != nil {
 		t.Errorf("stale-deployment container was matched: %+v", stale)
 	}
 	// Wrong index does not match.
-	if mismatch := matchInventoryItem(items, "app", 1, "7", wantWorker); mismatch != nil {
+	if mismatch, _ := matchInventoryItem(items, "app", 1, "7", wantWorker); mismatch != nil {
 		t.Errorf("wrong-index match: %+v", mismatch)
 	}
 	// Empty deploymentID (legacy replica row) matches on slug+index alone.
-	if legacy := matchInventoryItem(items, "app", 0, "", wantWorker); legacy == nil {
+	if legacy, _ := matchInventoryItem(items, "app", 0, "", wantWorker); legacy == nil {
 		t.Error("legacy empty-deployment replica should match on slug+index")
 	}
 }
@@ -57,7 +57,7 @@ func TestMatchInventoryItem_RequiresOwningWorker(t *testing.T) {
 		{ContainerID: "c-mine", Running: true, URL: "https://b:8443/v1/data/bbb", WorkerID: "node-b", Labels: labels},
 	}
 
-	got := matchInventoryItem(items, "app", 0, "7", "node-b")
+	got, _ := matchInventoryItem(items, "app", 0, "7", "node-b")
 	if got == nil {
 		t.Fatal("replica owned by node-b not matched against node-b's container")
 	}
@@ -67,7 +67,7 @@ func TestMatchInventoryItem_RequiresOwningWorker(t *testing.T) {
 
 	// A worker that reports no matching container yields no match, even though
 	// another worker has a same-labeled container.
-	if cross := matchInventoryItem(items, "app", 0, "7", "node-c"); cross != nil {
+	if cross, _ := matchInventoryItem(items, "app", 0, "7", "node-c"); cross != nil {
 		t.Fatalf("matched a container from a non-owning worker: %+v", cross)
 	}
 }
@@ -121,7 +121,7 @@ func TestRecoverRemoteReplica_PersistsLiveEndpoint(t *testing.T) {
 	prx.SetPoolAppID("app", app.ID)
 	prx.SetPoolSize("app", 1)
 
-	if !recoverRemoteReplica(store, mgr, prx, app, r, items, "") {
+	if adopted, _ := recoverRemoteReplica(store, mgr, prx, app, r, items, ""); !adopted {
 		t.Fatal("recoverRemoteReplica returned false for a live replica")
 	}
 

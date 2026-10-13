@@ -22,10 +22,14 @@ import (
 // a same-labeled container reported by another worker must not be adopted, or
 // recovery would register that worker's URL while encoding the handle and
 // selecting the transport for the owning worker. An empty workerID disables the
-// owner check for callers that do not bind to a worker.
-func matchInventoryItem(items []process.InventoryItem, slug string, index int, deploymentID, workerID string) *process.InventoryItem {
+// owner check for callers that do not bind to a worker. Multiple live matches
+// are ambiguous: callers must preserve ownership rather than treating them as absent.
+func matchInventoryItem(items []process.InventoryItem, slug string, index int, deploymentID, workerID string) (item *process.InventoryItem, ambiguous bool) {
 	idx := strconv.Itoa(index)
 	for i := range items {
+		if !items[i].Running {
+			continue
+		}
 		l := items[i].Labels
 		if l[process.LabelSlug] != slug || l[process.LabelReplicaIndex] != idx {
 			continue
@@ -36,21 +40,25 @@ func matchInventoryItem(items []process.InventoryItem, slug string, index int, d
 		if workerID != "" && items[i].WorkerID != workerID {
 			continue
 		}
-		return &items[i]
+		if item != nil {
+			return nil, true
+		}
+		item = &items[i]
 	}
-	return nil
+	return item, false
 }
 
 // recoverRemoteReplica re-adopts one replica on a remote tier by matching the
 // tier's agent inventory. It returns true when the replica is adopted. A
 // missing or stale container leaves the replica unadopted so the next deploy
-// re-places it. The run handle is encoded as workerID + "/" + containerID to
-// match the remote runtime's handle format, so later signal and stop calls
+// re-places it. Ambiguous live matches are indeterminate, so the caller must
+// retain ownership and keep the app reconcilable. The run handle is encoded as
+// workerID + "/" + containerID to match the remote runtime's handle format, so later signal and stop calls
 // resolve the owning worker and container.
 func recoverRemoteReplica(
 	store *db.Store, mgr *process.Manager, prx *proxy.Proxy,
 	app *db.App, r *db.Replica, items []process.InventoryItem, logRunID string,
-) (adopted bool) {
+) (adopted, indeterminate bool) {
 	defer func() {
 		if !adopted {
 			discardRecoveredRoute(prx, app, r)
@@ -58,33 +66,33 @@ func recoverRemoteReplica(
 	}()
 	if r.DesiredState == db.ReplicaDesiredWarm {
 		// Warm-parked by the idle shrink: deliberately stopped; expansion boots it, not recovery.
-		return false
+		return false, false
 	}
-	if r.Index >= app.Replicas {
+	// RecoverProcesses has already rejected surges owned by terminal activations.
+	// An unfinished roll may still own a healthy replica beyond the normal pool.
+	if r.Index >= app.Replicas && r.ActivationID == nil {
 		slog.Warn("recovery: remote replica index beyond pool; skipping",
 			"slug", app.Slug, "idx", r.Index, "pool", app.Replicas)
-		return false
+		return false, false
 	}
 	if r.WorkerID == "" {
 		slog.Warn("recovery: remote replica has no worker_id; skipping",
 			"slug", app.Slug, "idx", r.Index)
-		return false
+		return false, false
 	}
 	depID := ""
 	if r.DeploymentID != nil {
 		depID = strconv.FormatInt(*r.DeploymentID, 10)
 	}
-	item := matchInventoryItem(items, app.Slug, r.Index, depID, r.WorkerID)
+	item, ambiguous := matchInventoryItem(items, app.Slug, r.Index, depID, r.WorkerID)
+	if ambiguous {
+		slog.Warn("recovery: ambiguous live remote replica identity; preserving ownership", "slug", app.Slug, "idx", r.Index, "worker_id", r.WorkerID)
+		return false, true
+	}
 
 	// item == nil: no matching task in inventory; do not adopt.
 	if item == nil {
-		return false
-	}
-
-	// item.Running is false only when the task is STOPPED (see process.InventoryItem
-	// godoc). A STOPPED task is genuinely gone; do not adopt.
-	if !item.Running {
-		return false
+		return false, false
 	}
 
 	// Phase 1: task is running but not yet routable (no URL). Normal for ECS tasks
@@ -109,12 +117,12 @@ func recoverRemoteReplica(
 		slog.Info("recovery: partial-adopt ecs replica (no ip yet)",
 			"slug", app.Slug, "idx", r.Index, "container", item.ContainerID,
 			"launch_type", item.WorkerID, "log_run_id", logRunID)
-		return true // slot is claimed; caller sets anyAlive=true
+		return true, false // slot is claimed; caller sets anyAlive=true
 	}
 
 	// item.URL == "" for a non-Fargate remote runtime: genuine worker error.
 	if item.URL == "" {
-		return false
+		return false, false
 	}
 
 	// Phase 2: full adoption with proxy registration (task is routable).
@@ -134,7 +142,7 @@ func recoverRemoteReplica(
 	base := mgr.TransportForWorker(r.Tier, r.WorkerID)
 	if err := prx.RegisterReplica(app.Slug, r.Index, item.URL, recoveredRouteTransport(prx, store, r, base, item.URL), derefInt64(r.DeploymentID), app.ID); err != nil {
 		slog.Error("recovery: register remote proxy", "slug", app.Slug, "idx", r.Index, "err", err)
-		return false
+		return false, false
 	}
 	// Persist the URL the route was registered with so the stored endpoint_url
 	// tracks the live route. The worker-loss path (down-sweep or admin revoke)
@@ -147,7 +155,7 @@ func recoverRemoteReplica(
 		}
 	}
 	slog.Info("recovery: re-adopted remote replica", "slug", app.Slug, "idx", r.Index, "container", item.ContainerID, "log_run_id", logRunID)
-	return true
+	return true, false
 }
 
 // LoseWorkerReplicas transitions every running or crashed replica owned by

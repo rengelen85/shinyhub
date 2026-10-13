@@ -77,7 +77,7 @@ func TestRecoverRemoteReplica_FargatePartialAdoptWhenNoURL(t *testing.T) {
 		WorkerID: fargate.WorkerID,
 	}}
 
-	adopted := recoverRemoteReplica(store, mgr, prx, app, r, items, "")
+	adopted, _ := recoverRemoteReplica(store, mgr, prx, app, r, items, "")
 	if !adopted {
 		t.Fatal("recoverRemoteReplica returned false for a partial-adopt; want true so anyAlive is set")
 	}
@@ -128,7 +128,7 @@ func TestRecoverRemoteReplica_FargateFullAdoptWhenURLPresent(t *testing.T) {
 		WorkerID: fargate.WorkerID,
 	}}
 
-	adopted := recoverRemoteReplica(store, mgr, prx, app, r, items, "")
+	adopted, _ := recoverRemoteReplica(store, mgr, prx, app, r, items, "")
 	if !adopted {
 		t.Fatal("recoverRemoteReplica returned false for a full-adopt; want true")
 	}
@@ -164,7 +164,7 @@ func TestRecoverRemoteReplica_RemoteDockerEmptyURLReturnsFalse(t *testing.T) {
 		WorkerID: "worker-node-1",
 	}}
 
-	adopted := recoverRemoteReplica(store, mgr, prx, app, r, items, "")
+	adopted, _ := recoverRemoteReplica(store, mgr, prx, app, r, items, "")
 	if adopted {
 		t.Fatal("recoverRemoteReplica returned true for remote_docker with empty URL; regression - must return false")
 	}
@@ -195,7 +195,7 @@ func TestRecoverRemoteReplica_StoppedTaskReturnsFalse(t *testing.T) {
 		WorkerID: fargate.WorkerID,
 	}}
 
-	adopted := recoverRemoteReplica(store, mgr, prx, app, r, items, "")
+	adopted, _ := recoverRemoteReplica(store, mgr, prx, app, r, items, "")
 	if adopted {
 		t.Fatal("recoverRemoteReplica returned true for STOPPED Fargate task; want false")
 	}
@@ -210,7 +210,7 @@ func TestRecoverRemoteReplica_NilItemReturnsFalse(t *testing.T) {
 	r := buildTestReplica(app.ID, 0, fargate.WorkerID, &depID)
 
 	// Pass empty inventory - no matching item, matchInventoryItem returns nil.
-	adopted := recoverRemoteReplica(store, mgr, prx, app, r, nil, "")
+	adopted, _ := recoverRemoteReplica(store, mgr, prx, app, r, nil, "")
 	if adopted {
 		t.Fatal("recoverRemoteReplica returned true for nil inventory item; want false")
 	}
