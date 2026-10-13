@@ -22,6 +22,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/rvben/shinyhub/internal/activation"
 	"github.com/rvben/shinyhub/internal/appmetaspec"
 	"github.com/rvben/shinyhub/internal/auth"
 	"github.com/rvben/shinyhub/internal/bundle"
@@ -664,6 +665,9 @@ func (s *Server) handleGetApp(w http.ResponseWriter, r *http.Request) {
 			"raw_retention_days":       s.cfg.Usage.RawRetentionDays,
 			"aggregate_retention_days": s.cfg.Usage.AggregateRetentionDays,
 		},
+	}
+	if update := s.blockedUpdateStatus(slug); update != nil {
+		envelope["update_status"] = update
 	}
 	if fleetState, err := s.appFleetState(app); err == nil && fleetState != nil {
 		envelope["fleet_state"] = fleetState
@@ -2842,6 +2846,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	var capacityBlock *activation.CapacityError
 	var releaseGenerationLaunch func()
 	if generationHandoff && unsupportedReason == "" {
 		// Hold the host-wide launch reservation from the final capacity sample
@@ -2860,6 +2865,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		}
 		if capacityErr := s.generationHandoffCapacityCheck(&projected); capacityErr != nil {
 			unsupportedReason = capacityErr.Error()
+			errors.As(capacityErr, &capacityBlock)
 		}
 	}
 	// Admission above is advisory until preparation finishes. Release the
@@ -2876,6 +2882,12 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 	if liveUpgrade && !generationHandoff && !allowDowntime {
 		if s.metrics != nil {
 			s.metrics.RecordGenerationHandoff("deferred")
+		}
+		if capacityBlock != nil {
+			_ = s.store.FailDeploymentWithReason(pendingDep.ID, capacityFailureReason(capacityBlock))
+			w.Header().Set("X-ShinyHub-Conflict", "generation-handoff-deferred")
+			writeCapacityConflict(w, capacityBlock)
+			return
 		}
 		_ = s.store.FailDeploymentWithReason(pendingDep.ID, "no-downtime deployment deferred: "+unsupportedReason)
 		w.Header().Set("X-ShinyHub-Conflict", "generation-handoff-deferred")
@@ -3210,6 +3222,11 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 			err = errors.Join(err, fmt.Errorf("restore previous schedule declarations: %w", declarationRestoreErr))
 		}
 		reason := deployFailureMessage(err)
+		var lateCapacity *activation.CapacityError
+		preservedCapacityBlock := generationHandoff && !producerBarrierEntered && declarationRestoreErr == nil && errors.As(err, &lateCapacity)
+		if preservedCapacityBlock {
+			reason = capacityFailureReason(lateCapacity)
+		}
 		// diagnostic is apps.last_error: the raw boot error plus the tail of the
 		// app's own log, not deployFailureMessage's generic classification text.
 		// deployments.failure_reason (reason, above) is a separate column the
@@ -3333,7 +3350,16 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		}
 		deployResponse.event(deployevent.Phase("recovery", deployevent.StatusCompleted, recoveryMessage))
 		s.recordDeploy("failure")
-		deployResponse.fail(http.StatusInternalServerError, reason, kind, "deploy")
+		if preservedCapacityBlock {
+			if deployResponse.stream {
+				deployResponse.fail(http.StatusConflict, capacityConflictMessage(lateCapacity), "", "capacity")
+			} else {
+				w.Header().Set("X-ShinyHub-Conflict", "generation-handoff-deferred")
+				writeCapacityConflict(w, lateCapacity)
+			}
+		} else {
+			deployResponse.fail(http.StatusInternalServerError, reason, kind, "deploy")
+		}
 		return
 	}
 	// The pool is now serving the new bundle; from here onwards the on-disk

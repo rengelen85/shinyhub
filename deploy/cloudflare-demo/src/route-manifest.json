@@ -649,6 +649,7 @@
     "views/boot-prefetch.js",
     "views/branding.js",
     "views/bundle-filter.js",
+    "views/capacity-banner.js",
     "views/cli-connect.js",
     "views/connectivity-banner.js",
     "views/cpu-capacity.js",

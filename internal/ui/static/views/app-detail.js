@@ -24,6 +24,7 @@ import { formatStatus } from '/static/views/status-label.js';
 import { appStatusView } from '/static/views/app-card-badge.js';
 import { awaitingFirstDeploy, firstDeployFailed } from '/static/views/app-deploy-state.js';
 import { crashBanner } from '/static/views/crash-banner.js';
+import { capacityBanner } from '/static/views/capacity-banner.js';
 import { connectivityBanner } from '/static/views/connectivity-banner.js';
 import { renderTrendsCard } from '/static/views/trends-card.js';
 import { createTablistNav } from '/static/views/tablist-keys.js';
@@ -1077,7 +1078,7 @@ function syncOverviewSignals(panel, app, envelope, ctx) {
   if (!health) return;
   const state = envelope || {};
   const key = JSON.stringify([app.status, app.last_error, state.fleet_state,
-    state.connectivity, state.rejects_by_reason]);
+    state.connectivity, state.rejects_by_reason, state.update_status]);
   if (panel.dataset.signalsKey === key) return;
   panel.dataset.signalsKey = key;
 
@@ -1088,8 +1089,10 @@ function syncOverviewSignals(panel, app, envelope, ctx) {
     onRestart: () => ctx.restart(app.slug),
   });
   const connectivity = connectivityBanner(document, state);
+  const capacity = capacityBanner(document, state);
   if (crash) alerts.append(crash);
   if (connectivity) alerts.append(connectivity);
+  if (capacity) alerts.append(capacity);
 
   const grid = panel.querySelector('.overview-grid');
   const previousFleet = grid.querySelector('.overview-fleet-state');

@@ -276,7 +276,7 @@ Important behavior:
 - Only `succeeded` runs activate. Failed, timed-out, cancelled, interrupted, or
   overlap-skipped runs leave serving processes unchanged.
 - The configured replica count and `runtime.max_replicas` are steady-state
-  limits. A roll admits exactly one temporary, memory-checked surge
+  limits. A roll admits exactly one temporary, memory- and CPU-checked surge
   (`max_surge = 1`) above that count. If safe headroom cannot be proved,
   `roll_fallback = "defer"` records `deferred_capacity` and retries without
   dropping the warm floor; `roll_fallback = "restart"` instead stops the old
@@ -289,6 +289,10 @@ Important behavior:
   startups do not replace the stored peak, and status-only lifecycle changes do
   not erase it. The replica API/metrics field is `startup_peak_rss_bytes`, and
   capacity errors and feasibility advisories identify the estimate source.
+- CPU admission reserves at least one core per new worker (more for a higher
+  configured CPU ceiling), plus 10% of node capacity for existing work. CPU
+  saturation and unknown measurements defer the roll just like a memory
+  shortage. See [capacity during live updates](deployment-plan.md#capacity-during-live-updates).
 - Capacity deferrals back off at 1, 2, 4, 8, then 15-minute intervals. The
   persisted `capacity_deferrals` count is separate from rollout `attempts`.
   With `max_defer_age` set, the deadline starts at the first capacity defer,
@@ -312,7 +316,7 @@ Important behavior:
   as the terminal `cancelled` activation state; it is not reported as a failure.
 - Schedule create/update responses, deploy results, the dashboard, and
   `shinyhub doctor --remote --slug <app>` surface a roll-feasibility advisory
-  when the current surge estimate plus host floor exceeds available memory.
+  when memory or CPU headroom cannot admit a surge worker.
   This is a warning rather than a rejection because host capacity can change
   before the next run; the text names whether the configured outcome is a
   capacity defer or an in-place restart availability gap.

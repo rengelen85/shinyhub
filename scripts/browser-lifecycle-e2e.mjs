@@ -17,8 +17,10 @@ import { checkBrowserSettings } from './browser-settings-checks.mjs';
 import { checkSessionRelays } from './browser-session-relay-checks.mjs';
 import { checkBookmarkContinuity } from './browser-bookmark-continuity-checks.mjs';
 import { checkReloadProducers } from './browser-reload-producer-checks.mjs';
+import { checkUpdateCapacity } from './browser-update-capacity-checks.mjs';
+const capacityMode = process.env.SHINYHUB_E2E_UPDATE_CAPACITY === '1';
 const producerReloadMode = process.env.SHINYHUB_E2E_RELOAD_PRODUCERS === '1';
-const relayMode = producerReloadMode || process.env.SHINYHUB_E2E_SESSION_RELAYS === '1';
+const relayMode = capacityMode || producerReloadMode || process.env.SHINYHUB_E2E_SESSION_RELAYS === '1';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(new URL('../loadtest/render/driver/package.json', import.meta.url));
@@ -139,7 +141,7 @@ try {
   await new Promise(resolve => reservation.close(resolve));
   const host = `http://127.0.0.1:${port}`;
   await writeFile(passwordFile, password, { mode: 0o600 });
-  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: ${relayMode ? 16 : 4}\n  drain_timeout: ${producerReloadMode ? '20s' : '5s'}\n${producerReloadMode ? '  reload_drain_timeout: 2s\n  upgrade_timeout: 5s\n' : ''}${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
+  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: ${relayMode ? 16 : 4}\n${capacityMode ? '  host_capacity_cores: 0.5\n' : ''}  drain_timeout: ${producerReloadMode ? '20s' : '5s'}\n${producerReloadMode ? '  reload_drain_timeout: 2s\n  upgrade_timeout: 5s\n' : ''}${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
   await command([binary, 'init', '--config', config, '--admin-user', username, '--admin-password-file', passwordFile], 'init', { cwd: state });
   const log = createWriteStream(join(work, 'server.log'), { mode: 0o600 });
   server = spawn(binary, ['serve', '--config', config, '--no-browser'], { cwd: state, env, detached: true });
@@ -194,8 +196,11 @@ try {
   await writeFile(join(app, 'requirements.txt'), requirements.replace(/^shinyhub-identity==[^\n]+$/m, `./${wheel}`));
   // The CLI uses its own config resolution; XDG_CONFIG_HOME alone does not
   // isolate it from an existing operator config or an inaccessible home.
-  const deploy = (slug = 'browser') => command([binary, 'deploy', app, '--config', clientConfig, '--slug', slug, '--visibility', 'private', '--output', 'json'], 'deploy',
-    { env: { ...env, SHINYHUB_HOST: host, SHINYHUB_TOKEN: token } });
+  const deploy = (slug = 'browser', extra = {}) => {
+    const { flags = [], ...execution } = extra;
+    return command([binary, 'deploy', app, '--config', clientConfig, '--slug', slug, '--visibility', 'private', '--output', 'json', ...flags], 'deploy',
+      { ...execution, env: { ...env, SHINYHUB_HOST: host, SHINYHUB_TOKEN: token } });
+  };
   await check('deploy real Shiny v1', deploy);
   const viewerRecord = await request('POST', '/api/users', { username: viewer, password: viewerPassword, role: 'viewer' }, 201);
   await request('POST', '/api/apps/browser/members', { username: viewer, role: 'viewer' }, 204);
@@ -237,7 +242,13 @@ try {
     await page.getByRole('button', { name: 'Recalculate' }).click();
     await output(page, 'v1', 2, 500, original);
   });
-  if (producerReloadMode) {
+  if (capacityMode) {
+    await checkUpdateCapacity({ browser, context, page, original, appURL, host, app, work,
+      binary, config, command, api, deploy, check, poll, output, sockets, report, username, password });
+    assert.deepEqual(report.browserErrors, [], 'no browser script errors');
+    report.status = 'passed';
+    console.log('BROWSER UPDATE CAPACITY E2E PASS');
+  } else if (producerReloadMode) {
     await checkReloadProducers({ context, page, appURL, state, work, binary, config, python,
       command, api, request, check, poll, output, sockets, report });
     assert.deepEqual(report.browserErrors, [], 'no browser script errors');

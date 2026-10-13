@@ -596,21 +596,22 @@ func (s *Server) activationCapacityCheck(app *db.App, sampleIndex int) error {
 	estimate := s.activationSurgeMemoryEstimate(app, sampleIndex)
 	neededMB := estimate.MemoryMB
 	if neededMB <= 0 {
-		return &activation.CapacityError{Reason: "surge memory is unknown; configure memory_limit_mb or enable runtime metrics", RetryAfter: time.Minute}
+		return &activation.CapacityError{Resource: "memory", Units: "MiB", Reason: "surge memory is unknown; configure memory_limit_mb or enable runtime metrics", RetryAfter: time.Minute}
 	}
 	vm, err := gopsmem.VirtualMemory()
 	if err != nil || vm == nil {
-		return &activation.CapacityError{Reason: "host available memory could not be measured", RetryAfter: time.Minute}
+		return &activation.CapacityError{Resource: "memory", Units: "MiB", Reason: "host available memory could not be measured", RetryAfter: time.Minute}
 	}
 	availableMB := int(vm.Available / (1024 * 1024))
 	requiredMB := s.cfg.MinAvailableMemoryMB() + neededMB
 	if availableMB < requiredMB {
-		return &activation.CapacityError{
+		available, required := float64(availableMB), float64(requiredMB)
+		return &activation.CapacityError{Resource: "memory", Units: "MiB", Available: &available, Required: &required,
 			Reason:     fmt.Sprintf("%d MiB available; need %d MiB for one surge replica plus the %d MiB host floor (%s)", availableMB, requiredMB, s.cfg.MinAvailableMemoryMB(), estimate.Provenance),
 			RetryAfter: time.Minute,
 		}
 	}
-	return nil
+	return s.checkUpdateCPU(app, 1)
 }
 
 // generationHandoffCapacityCheck admits the complete candidate pool beside
@@ -620,7 +621,7 @@ func (s *Server) activationCapacityCheck(app *db.App, sampleIndex int) error {
 func (s *Server) generationHandoffCapacityCheck(app *db.App) error {
 	estimate := s.activationSurgeMemoryEstimate(app, 0)
 	if estimate.MemoryMB <= 0 {
-		return &activation.CapacityError{Reason: "parallel-generation memory is unknown; configure memory_limit_mb or enable runtime metrics", RetryAfter: time.Minute}
+		return &activation.CapacityError{Resource: "memory", Units: "MiB", Reason: "parallel-generation memory is unknown; configure memory_limit_mb or enable runtime metrics", RetryAfter: time.Minute}
 	}
 	replicas := app.Replicas
 	if replicas < 1 {
@@ -629,17 +630,18 @@ func (s *Server) generationHandoffCapacityCheck(app *db.App) error {
 	neededMB := estimate.MemoryMB * replicas
 	availableMB, err := s.availableMemoryMB()
 	if err != nil {
-		return &activation.CapacityError{Reason: "host available memory could not be measured", RetryAfter: time.Minute}
+		return &activation.CapacityError{Resource: "memory", Units: "MiB", Reason: "host available memory could not be measured", RetryAfter: time.Minute}
 	}
 	requiredMB := s.cfg.MinAvailableMemoryMB() + neededMB
 	if availableMB < requiredMB {
-		return &activation.CapacityError{
+		available, required := float64(availableMB), float64(requiredMB)
+		return &activation.CapacityError{Resource: "memory", Units: "MiB", Available: &available, Required: &required,
 			Reason: fmt.Sprintf("%d MiB available; need %d MiB for %d parallel-generation replicas plus the %d MiB host floor (%s)",
 				availableMB, requiredMB, replicas, s.cfg.MinAvailableMemoryMB(), estimate.Provenance),
 			RetryAfter: time.Minute,
 		}
 	}
-	return nil
+	return s.checkUpdateCPU(app, replicas)
 }
 
 func hostAvailableMemoryMB() (int, error) {
@@ -671,6 +673,15 @@ func (s *Server) rollFeasibilityAdvisory(app *db.App, onSuccess, fallback string
 	availableMB := int(vm.Available / (1024 * 1024))
 	msg := formatRollFeasibilityAdvisory(neededMB, availableMB, s.cfg.MinAvailableMemoryMB(), fallback)
 	if msg == "" {
+		if cpuErr := s.checkUpdateCPU(app, 1); cpuErr != nil {
+			msg = "Surge roll is currently infeasible: " + cpuErr.Error() + "."
+			if fallback == "restart" {
+				msg += " The configured restart fallback stops the old pool first and accepts an availability gap."
+			} else {
+				msg += " Activation will defer until CPU capacity becomes available."
+			}
+			return &msg
+		}
 		return nil
 	}
 	msg += " Memory estimate: " + estimate.Provenance + "."

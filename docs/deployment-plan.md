@@ -151,6 +151,35 @@ producers itself; the recovery lists the `shinyhub schedule run <slug>
 <schedule>` commands to run first, and only for schedules that are plainly
 overdue rather than already refreshing.
 
+### Capacity during live updates
+
+A live code update admits the complete replacement pool alongside the current
+pool. Admission checks available memory and CPU before preparation and again
+under the host-wide launch reservation immediately before starting workers.
+A scheduled roll budgets one surge worker instead of a complete second pool.
+
+CPU headroom is sampled over 200 ms. Each new worker reserves at least one core
+(or its configured CPU ceiling if higher), plus a 10% node margin shared by the
+candidate pool. A binding detected cgroup CPU quota also accounts for CPU time
+consumed inside that cgroup. Missing or invalid readings refuse parallel starts.
+These conservative budgets reduce contention; they do not guarantee response
+times or bound a multithreaded app's startup consumption. A one-core node cannot
+admit a parallel worker with the safety margin, even when otherwise idle.
+
+A refused upload returns HTTP 409 with `update_state: "blocked_capacity"`, the
+resource, available and required budgets when known, and `automatic_retry: false`.
+The working version keeps serving. App details show the most recent capacity
+block separately from app health, and a successful retry clears it. Free or add
+capacity, then retry the deployment. `--allow-downtime` explicitly permits
+stop-first replacement when simultaneous pools cannot fit. Independently
+draining generations and reload-relayed sessions must retire first; this flag
+does not bypass their existing ownership fence. ShinyHub does not
+provision additional instances automatically.
+
+Scheduled rolls use their existing durable `deferred_capacity` queue and retry
+backoff for both memory and CPU shortages; their `roll_fallback` policy controls
+whether an explicit stop-first fallback is allowed.
+
 ### Worker isolation and generation handoff
 
 Code updates to an app using `grouped` isolation can deploy without stopping

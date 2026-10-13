@@ -143,6 +143,7 @@ type Server struct {
 	promoteDeployment       func(int64) error
 	activateProxyGeneration func(string, int64) (int64, error)
 	availableMemoryMB       func() (int, error)
+	availableCPUCores       func() (float64, error)
 	// deployReplica boots a single replica at one index, used by the autoscale
 	// scale-up primitive to grow a pool by one without cycling the whole pool.
 	// Defaults to deploy.RunReplica; overridable in tests.
@@ -774,6 +775,13 @@ func (s *Server) SetGenerationCutoverForTest(
 func (s *Server) SetAvailableMemoryForTest(fn func() (int, error)) {
 	if fn != nil {
 		s.availableMemoryMB = fn
+	}
+}
+
+// SetAvailableCPUForTest replaces node CPU headroom sampling before requests start.
+func (s *Server) SetAvailableCPUForTest(fn func() (float64, error)) {
+	if fn != nil {
+		s.availableCPUCores = fn
 	}
 }
 

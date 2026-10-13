@@ -197,6 +197,7 @@ func buildManifestE2EServer(t *testing.T, runtime config.RuntimeConfig) (srv *Se
 	fakeRuntime = newManifestFakeRuntime()
 	mgr = process.NewManager(appsDir, fakeRuntime)
 	srv = New(cfg, store, mgr, proxy.New())
+	srv.SetAvailableCPUForTest(func() (float64, error) { return 64, nil })
 
 	// Replace the deploy runner to inject a no-op health check so tests
 	// complete instantly instead of waiting for the 120 s timeout. Sync hooks

@@ -21,6 +21,10 @@ var (
 )
 
 type CapacityError struct {
+	Resource   string
+	Available  *float64
+	Required   *float64
+	Units      string
 	Reason     string
 	RetryAfter time.Duration
 }

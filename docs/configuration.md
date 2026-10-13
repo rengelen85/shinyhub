@@ -600,6 +600,10 @@ server:
   host_capacity_memory_mb: 0    # 0 = detect
 ```
 
+`host_capacity_cores` also sets the effective CPU budget for parallel worker
+admission during live updates and scheduled rolls. An override replaces detection;
+keep it within the actual allocation. See [update capacity](deployment-plan.md#capacity-during-live-updates).
+
 Env vars: `SHINYHUB_HOST_CAPACITY_CORES`, `SHINYHUB_HOST_CAPACITY_MEMORY_MB`.
 
 The startup log records what was found and which source supplied it:
