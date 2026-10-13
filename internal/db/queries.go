@@ -5110,7 +5110,7 @@ type RoutableReplica struct {
 
 // ListRoutableReplicas returns every replica whose status is 'running' or
 // 'draining', joined to the parent app to carry the slug and pool settings.
-// The result spans all apps regardless of the parent app's own status, so a
+// The result spans compatible apps regardless of the parent's own status, so a
 // degraded app (the watcher marks apps degraded when a replica crashes) with
 // surviving running replicas stays routable. Ordered by app slug then replica
 // index.
@@ -5123,6 +5123,7 @@ func (s *Store) ListRoutableReplicas() ([]RoutableReplica, error) {
 		FROM replicas r
 		JOIN apps a ON a.id = r.app_id
 		WHERE r.status IN ('running', 'draining')
+		  AND NOT EXISTS (SELECT 1 FROM apps WHERE id = r.app_id AND (` + appCompatibilityBlockersSQL + `))
 		ORDER BY a.slug, r.idx`)
 	if err != nil {
 		return nil, fmt.Errorf("list routable replicas: %w", err)

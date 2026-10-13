@@ -19,6 +19,15 @@ import (
 func ReplicaRouteValidator(store *db.Store, mgr *process.Manager) func(context.Context, db.RoutableReplica, http.RoundTripper) error {
 	return func(ctx context.Context, rr db.RoutableReplica, transport http.RoundTripper) error {
 		r := rr.Replica
+		// Readiness proves that an endpoint is alive, not that its shared data
+		// remains compatible. Check the durable fence before probing a survivor.
+		quarantined, err := store.AppCompatibilityQuarantined(r.AppID)
+		if err != nil {
+			return err
+		}
+		if quarantined {
+			return fmt.Errorf("app compatibility is quarantined")
+		}
 		bundleDir, err := replicaBundleDir(store, r)
 		if err != nil {
 			return err
@@ -42,7 +51,19 @@ func ReplicaRouteValidator(store *db.Store, mgr *process.Manager) func(context.C
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
-		return deploy.ProbeReadiness(probeCtx, r.EndpointURL, bundleDir, transport)
+		if err := deploy.ProbeReadiness(probeCtx, r.EndpointURL, bundleDir, transport); err != nil {
+			return err
+		}
+		// A producer can enter its durable fence while the HTTP probe is in
+		// flight. Do not publish the endpoint using the pre-probe verdict.
+		quarantined, err = store.AppCompatibilityQuarantined(r.AppID)
+		if err != nil {
+			return err
+		}
+		if quarantined {
+			return fmt.Errorf("app compatibility is quarantined")
+		}
+		return nil
 	}
 }
 

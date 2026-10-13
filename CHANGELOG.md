@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **recovery**: exclude compatibility-quarantined consumers from startup and clustered routing, recheck quarantine after readiness probes, and clean up failed or operator-stopped apps without a producer recovery marker. Invalidate draining consumers while retaining runtime identity until shutdown is confirmed.
+- **diagnostics**: refresh producer failure reasons after additional failures and partial repairs so they identify an outstanding blocker instead of an already-repaired producer.
 - **schedules**: avoid a hub panic when producer-failure cleanup encounters empty replica slots, and restore repaired apps when the last queued publisher ends without writing data.
 - **diagnostics**: recognize failed apps in CLI readiness checks and the dashboard's Needs attention list, with immediate failure reporting instead of timeout and CLI upgrade advice.
 

@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -70,18 +72,31 @@ func reconcileProducerStatusTx(ctx context.Context, tx writeTx, appID, runID int
 	// The failure callback stops these consumers. Leave their placement and
 	// PID identity intact until a confirmed stop, but remove stale serving
 	// status durably so the watcher can replace desired-running slots on repair.
-	if target == "failed" && previous != "" && blocked != 0 {
+	if target == "failed" && blocked != 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE replicas SET status = 'stopped', updated_at = ?
-   WHERE app_id = ? AND status IN ('running', 'starting', 'booting', 'resuming', 'suspended')`, time.Now().UTC().Unix(), appID); err != nil {
+   WHERE app_id = ? AND status IN ('running', 'draining', 'starting', 'booting', 'resuming', 'suspended')`, time.Now().UTC().Unix(), appID); err != nil {
 			return nil, err
 		}
-	}
-	if target == status {
-		return nil, nil
 	}
 	diagnostic := failureReason
 	if target != "failed" {
 		diagnostic = ""
+	} else if previous != "" && blocked != 0 {
+		// A later failure or partial repair can change the outstanding blocker
+		// without changing app status. Derive the diagnostic from durable state,
+		// including uncertainty whose run history has already been pruned.
+		var err error
+		diagnostic, err = producerQuarantineDiagnosticTx(ctx, tx, appID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if target == status {
+		if target == "failed" && previous != "" && blocked != 0 {
+			_, err := tx.ExecContext(ctx, `UPDATE apps SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND last_error <> ?`, diagnostic, appID, diagnostic)
+			return nil, err
+		}
+		return nil, nil
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE apps SET status = ?, producer_recovery_status = ?, last_error = ?, crashed_at = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, target, previous, diagnostic, appID); err != nil {
 		return nil, err
@@ -96,11 +111,37 @@ func reconcileProducerStatusTx(ctx context.Context, tx writeTx, appID, runID int
 	return &producerStatusChange{slug: slug, from: status, to: target, reason: reason, runID: runID}, nil
 }
 
-// ListProducerQuarantinedApps includes failed apps in startup cleanup: their
+func producerQuarantineDiagnosticTx(ctx context.Context, tx writeTx, appID int64) (string, error) {
+	var runID int64
+	var name, status string
+	err := tx.QueryRowContext(ctx, `SELECT u.schedule_run_id, sc.name, u.status
+ FROM schedule_data_uncertainty u JOIN app_schedules sc ON sc.id = u.schedule_id
+ WHERE sc.app_id = ? ORDER BY u.data_write_sequence DESC, u.schedule_id DESC LIMIT 1`, appID).Scan(&runID, &name, &status)
+	if err == nil {
+		return fmt.Sprintf("producer run %d (%s) ended %s after attempting a data write; rerun the producer successfully to repair compatibility", runID, name, status), nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("read producer uncertainty diagnostic: %w", err)
+	}
+	err = tx.QueryRowContext(ctx, `SELECT r.id, sc.name FROM schedule_runs r
+ JOIN app_schedules sc ON sc.id = r.schedule_id WHERE sc.app_id = ?
+ AND r.publishes_data = 1 AND r.status = 'running' ORDER BY r.id DESC LIMIT 1`, appID).Scan(&runID, &name)
+	if err == nil {
+		return fmt.Sprintf("producer run %d (%s) is still running; compatibility cannot be confirmed while this producer is active", runID, name), nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("read running producer diagnostic: %w", err)
+	}
+	return "compatibility remains quarantined by a data-affecting deployment; complete a corrective deployment to repair compatibility", nil
+}
+
+// ListProducerQuarantinedApps includes failed and operator-stopped apps in cleanup: their
 // consumers may have survived the hub before the failure callback could stop them.
+// Recovery intent is not a quarantine predicate: deployment failures and older
+// producer failures may have no marker while retaining a durable data fence.
 func (s *Store) ListProducerQuarantinedApps() ([]*App, error) {
 	rows, err := s.db.Query(`SELECT ` + appColumns + deploymentSummarySQL + ` FROM apps
- WHERE status = 'failed' AND producer_recovery_status <> ''`)
+ WHERE status IN ('failed', 'stopped') AND (producer_recovery_status <> '' OR (` + appCompatibilityBlockersSQL + `))`)
 	if err != nil {
 		return nil, err
 	}
