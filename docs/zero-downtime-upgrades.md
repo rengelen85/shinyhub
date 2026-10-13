@@ -93,6 +93,7 @@ returns success only after the successor acknowledges readiness and its PID
 matches `server.pid_file`. Standalone successors must regain mutation ownership;
 session-preserving standalone reloads also verify that previously serving apps
 have reachable, adopted replicas meeting their warm floor (at least one replica).
+This includes apps that begin serving while the command waits for admitted work.
 An unavailable app is named in the readiness failure rather than reporting success.
 Clustered successors may be healthy standbys after their first pool sync. A refusal
 or failed readiness check returns nonzero, so `systemctl reload` reports failure.

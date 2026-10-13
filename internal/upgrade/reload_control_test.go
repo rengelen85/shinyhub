@@ -157,6 +157,84 @@ func TestReloadControlChecksServingAppsAfterControlPlaneReady(t *testing.T) {
 	}
 }
 
+func TestReloadAcknowledgementIncludesAppsThatStartedServingWhileWaiting(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sh-reload-new-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	pidFile := filepath.Join(dir, "pid")
+	var completed atomic.Bool
+	upg := &reloadTestUpgrader{fakeUpgrader: newFakeUpgrader(), run: func() error {
+		// An already-admitted deployment finishes before handoff is accepted.
+		completed.Store(true)
+		return os.WriteFile(pidFile, []byte(fmt.Sprint(os.Getpid()+1)), 0600)
+	}}
+	original := ReloadApp{ID: 1, Slug: "original", MinimumReady: 1}
+	newApp := ReloadApp{ID: 2, Slug: "new-app", MinimumReady: 2}
+	stop, err := StartReloadControl(context.Background(), pidFile, time.Second, upg, &SignalState{}, func() bool { return true }, quietLogger(), ReloadServingCheck{Snapshot: func() ([]ReloadApp, error) {
+		if completed.Load() {
+			// Keep the initial obligation even if it vanishes during the wait.
+			return []ReloadApp{newApp}, nil
+		}
+		return []ReloadApp{original}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	result, err := exchangeReload(context.Background(), reloadSocket(pidFile, os.Getpid()), reloadRequest{Version: 1})
+	if err != nil || result.Error != "" {
+		t.Fatalf("reload: %+v, %v", result, err)
+	}
+	if len(result.Apps) != 2 || result.Apps[0] != original || result.Apps[1] != newApp {
+		t.Fatalf("successor obligations omit a serving app: %+v", result.Apps)
+	}
+}
+
+func TestReloadAcknowledgementRechecksWarmFloorAndReportsSnapshotFailure(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("snapshot_failure=%t", fail), func(t *testing.T) {
+			dir, err := os.MkdirTemp("", "sh-reload-floor-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			pidFile := filepath.Join(dir, "pid")
+			var completed atomic.Bool
+			upg := &reloadTestUpgrader{fakeUpgrader: newFakeUpgrader(), run: func() error {
+				completed.Store(true)
+				return os.WriteFile(pidFile, []byte(fmt.Sprint(os.Getpid()+1)), 0600)
+			}}
+			stop, err := StartReloadControl(context.Background(), pidFile, time.Second, upg, &SignalState{}, func() bool { return true }, quietLogger(), ReloadServingCheck{Snapshot: func() ([]ReloadApp, error) {
+				minimum := 1
+				if completed.Load() {
+					if fail {
+						return nil, errors.New("store unavailable")
+					}
+					minimum = 3
+				}
+				return []ReloadApp{{ID: 1, Slug: "dashboard", MinimumReady: minimum}}, nil
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stop()
+			result, err := exchangeReload(context.Background(), reloadSocket(pidFile, os.Getpid()), reloadRequest{Version: 1})
+			if err != nil || result.PID != os.Getpid()+1 {
+				t.Fatalf("handoff acknowledgement: %+v, %v", result, err)
+			}
+			if fail {
+				if !strings.Contains(result.Error, "handoff accepted") || !strings.Contains(result.Error, "store unavailable") {
+					t.Fatalf("lost snapshot failure after handoff: %+v", result)
+				}
+			} else if result.Error != "" || len(result.Apps) != 1 || result.Apps[0].MinimumReady != 3 {
+				t.Fatalf("warm floor changed during wait was not enforced: %+v", result)
+			}
+		})
+	}
+}
+
 func TestReloadWaitRetriesOnlyTransitionsAndReportsTimeout(t *testing.T) {
 	var calls atomic.Int32
 	u := &reloadTestUpgrader{fakeUpgrader: newFakeUpgrader(), run: func() error {

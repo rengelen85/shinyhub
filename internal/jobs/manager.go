@@ -570,6 +570,10 @@ func (m *Manager) beginAdmission(admittedAppOperation bool) error {
 		return ErrManagerStopped
 	}
 	m.pendingAdmissions++
+	// Shutdown must join row insertion and rejection cleanup as well as
+	// registered executions. Add while holding the shutdown gate's mutex so
+	// no new admission can race a zero-count Wait after retirement begins.
+	m.wg.Add(1)
 	return nil
 }
 
@@ -577,6 +581,7 @@ func (m *Manager) endAdmission() {
 	m.mu.Lock()
 	m.pendingAdmissions--
 	m.mu.Unlock()
+	m.wg.Done()
 }
 
 // ReloadBlockers includes admitted work waiting for execution or publication

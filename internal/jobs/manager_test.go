@@ -1334,6 +1334,51 @@ func TestManager_Stop_InFlightRunMarkedInterrupted(t *testing.T) {
 	}
 }
 
+func TestManager_ShutdownWaitsForAdmissionAlreadyInsertingRun(t *testing.T) {
+	for _, mode := range []string{"stop", "handoff"} {
+		t.Run(mode, func(t *testing.T) {
+			st := newFakeStore(makeSchedule("concurrent", 30), makeApp())
+			st.inserted = make(chan struct{}, 1)
+			release := make(chan struct{})
+			st.releaseInsert = release
+			m := newTestManager(t, &fakeRuntime{}, st)
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+			runDone := make(chan error, 1)
+			go func() { _, err := m.Run(1, "schedule", nil); runDone <- err }()
+			select {
+			case <-st.inserted:
+			case <-time.After(time.Second):
+				t.Fatal("run did not reach insertion")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			if mode == "stop" {
+				if m.Stop(ctx) {
+					t.Fatal("shutdown reported durable completion while a run was still inserting")
+				}
+			} else if err := m.InterruptAndDrain(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("handoff returned before pending admission finalized: %v", err)
+			}
+			unblock()
+			select {
+			case err := <-runDone:
+				if !errors.Is(err, jobs.ErrManagerStopped) {
+					t.Fatalf("retired owner admitted a run: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("rejected admission did not finalize")
+			}
+			if mode == "handoff" {
+				if err := m.InterruptAndDrain(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestManager_ReloadPauseRejectsAdmissionAlreadyInsertingRun(t *testing.T) {
 	rt := &fakeRuntime{}
 	st := newFakeStore(makeSchedule("concurrent", 30), makeApp())

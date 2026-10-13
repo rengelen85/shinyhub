@@ -166,6 +166,17 @@ func StartReloadControl(ctx context.Context, pidFile string, upgradeTimeout time
 						result.Error = fmt.Sprintf("handoff succeeded but reading successor PID failed: %v", err)
 					} else {
 						result.PID = pid
+						// Admitted deployments may have finished while --wait
+						// held the reload. Verify those apps too, while retaining
+						// obligations captured before any transition could stop them.
+						if len(serving) > 0 && serving[0].Snapshot != nil {
+							apps, err := serving[0].Snapshot()
+							if err != nil {
+								result.Error = "handoff accepted, but capturing serving apps after waiting failed: " + err.Error()
+							} else {
+								result.Apps = mergeReloadApps(result.Apps, apps)
+							}
+						}
 						log.Info("reload handoff accepted; caller will verify successor readiness", "pid", pid)
 					}
 				}
@@ -183,6 +194,27 @@ func StartReloadControl(ctx context.Context, pidFile string, upgradeTimeout time
 			handlers.Wait()
 		})
 	}, nil
+}
+
+func mergeReloadApps(original, latest []ReloadApp) []ReloadApp {
+	type identity struct {
+		id   int64
+		slug string
+	}
+	indices := make(map[identity]int, len(original)+len(latest))
+	for i, app := range original {
+		indices[identity{app.ID, app.Slug}] = i
+	}
+	for _, app := range latest {
+		key := identity{app.ID, app.Slug}
+		if i, ok := indices[key]; ok {
+			original[i].MinimumReady = max(original[i].MinimumReady, app.MinimumReady)
+		} else {
+			indices[key] = len(original)
+			original = append(original, app)
+		}
+	}
+	return original
 }
 
 // RequestReload sends one correlated request to the PID currently published by
