@@ -96,7 +96,11 @@ func runAppsList(cmd *cobra.Command, f *listFlags) error {
 func writeAppsTable(w io.Writer, items []map[string]any) {
 	t := newTable("SLUG", "STATUS", "DEPLOYS").alignRight(2)
 	for _, a := range items {
-		t.row(txt(a["slug"]), statusTxt(a["status"]), txt(a["deploy_count"]))
+		status := cellString(a["status"])
+		if quarantined, _ := a["compatibility_quarantined"].(bool); quarantined {
+			status += " (quarantined)"
+		}
+		t.row(txt(a["slug"]), statusTxt(status), txt(a["deploy_count"]))
 	}
 	t.render(w)
 }
@@ -203,9 +207,11 @@ func runAppsShow(cmd *cobra.Command, args []string, f *appsShowFlags) error {
 			LastError        string `json:"last_error"`
 			DeferReason      string `json:"defer_reason"`
 		} `json:"latest_schedule_activations"`
-		ScheduleConvergenceSatisfied bool `json:"schedule_convergence_satisfied"`
-		CompatibilityQuarantined     bool `json:"compatibility_quarantined"`
-		ProducerRepairRequired       bool `json:"producer_repair_required"`
+		ScheduleConvergenceSatisfied bool     `json:"schedule_convergence_satisfied"`
+		CompatibilityQuarantined     bool     `json:"compatibility_quarantined"`
+		ProducerRepairSchedules      []string `json:"producer_repair_schedules"`
+		RunningDataProducers         []string `json:"running_data_producers"`
+		ProducerRepairRequired       bool     `json:"producer_repair_required"`
 		DeployTriggerSchedules       []struct {
 			Name                   string `json:"name"`
 			DeployTrigger          string `json:"deploy_trigger"`
@@ -290,6 +296,12 @@ func runAppsShow(cmd *cobra.Command, args []string, f *appsShowFlags) error {
 	}
 	if resp2.ProducerRepairRequired {
 		fmt.Fprintln(w, "Producer data: repair required after an uncertain write")
+		for _, name := range resp2.ProducerRepairSchedules {
+			fmt.Fprintf(w, "  Repair: shinyhub schedule run %s %s --follow\n", a.Slug, name)
+		}
+	}
+	if len(resp2.RunningDataProducers) > 0 {
+		fmt.Fprintf(w, "Active data producers: %s\n", strings.Join(resp2.RunningDataProducers, ", "))
 	}
 	if a.DesiredStatus != "" && a.DesiredStatus != a.Status {
 		fmt.Fprintf(w, "Desired:     %s\n", stylerFor(w).status(a.DesiredStatus))

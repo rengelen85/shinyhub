@@ -1259,3 +1259,41 @@ func TestReapElasticOrphansPreservesRecordedFixedGeneration(t *testing.T) {
 		t.Fatal("desired isolation reinterpreted adopted fixed process")
 	}
 }
+
+func TestGroupedRecoveryServesFirstRequestWithoutManualRestart(t *testing.T) {
+	store := mustOpenStore(t)
+	app := mustCreateElasticApp(t, store, "grouped-recovery")
+	if _, err := store.DB().Exec(`UPDATE apps SET worker_isolation='grouped',worker_grouped_size=4 WHERE id=?`, app.ID); err != nil {
+		t.Fatal(err)
+	}
+	mustCreateDeploymentInDir(t, store, app.ID, mustMinimalBundle(t))
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "recovered") }))
+	defer backend.Close()
+	rt := &recordingRuntime{endpointURL: backend.URL, exitOnSignal: true}
+	t.Cleanup(rt.closeExits)
+	mgr := process.NewManager(t.TempDir(), rt)
+	defer mgr.StopAll()
+	p := proxy.New()
+	defer p.Deregister(app.Slug)
+	spawned := make(chan struct{}, 1)
+	spawner := &lifecycle.ElasticSpawner{Store: store, Manager: mgr, Proxy: p, HealthCheck: noopHealthCheck}
+	p.SetSpawnFunc(func(slug string, slot int) { spawner.Spawn(slug, slot); spawned <- struct{}{} })
+	lifecycle.RecoverProcesses(store, mgr, p, 0, false, "", nil, mustPrepareRecovery(t, store))
+	request := httptest.NewRequest(http.MethodGet, "/app/"+app.Slug+"/", nil)
+	first := httptest.NewRecorder()
+	p.ServeHTTP(first, request)
+	select {
+	case <-spawned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not spawn grouped worker after recovery")
+	}
+	retry := httptest.NewRequest(http.MethodGet, request.URL.String(), nil)
+	for _, cookie := range first.Result().Cookies() {
+		retry.AddCookie(cookie)
+	}
+	response := httptest.NewRecorder()
+	p.ServeHTTP(response, retry)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "recovered") {
+		t.Fatalf("response=%d %s", response.Code, response.Body.String())
+	}
+}

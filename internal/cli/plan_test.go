@@ -391,3 +391,30 @@ func TestRenderDeploymentPlanExplainsIdenticalRedeploy(t *testing.T) {
 		t.Fatalf("default plan should keep implementation detail progressive:\n%s", out.String())
 	}
 }
+
+func TestPlanWarnsAboutQuarantineAndNamesRepairProducers(t *testing.T) {
+	dir := planTestBundle(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/server-info":
+			http.NotFound(w, r)
+		case "/api/apps/demo":
+			_, _ = io.WriteString(w, `{"app":{"slug":"demo","status":"running","deploy_count":1},"can_manage":true,"compatibility_quarantined":true,"producer_repair_schedules":["refresh-data"]}`)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	writeTestCLIConfig(t, server.URL)
+	stdout, _, err := execCLISplit(t, "plan", dir, "--slug", "demo", "-o", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan deploymentPlan
+	if err := json.Unmarshal([]byte(stdout), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Remote.CompatibilityQuarantined || !containsSubstring(plan.Warnings, "compatibility-quarantined") || !containsSubstring(plan.Warnings, "refresh-data") {
+		t.Fatalf("plan=%+v", plan)
+	}
+}

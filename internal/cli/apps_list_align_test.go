@@ -31,3 +31,11 @@ func TestAppsTableAligns(t *testing.T) {
 		}
 	}
 }
+
+func TestAppsTableShowsServingQuarantine(t *testing.T) {
+	var out bytes.Buffer
+	writeAppsTable(&out, []map[string]any{{"slug": "demo", "status": "running", "deploy_count": 1, "compatibility_quarantined": true}})
+	if !strings.Contains(out.String(), "running (quarantined)") {
+		t.Fatal(out.String())
+	}
+}

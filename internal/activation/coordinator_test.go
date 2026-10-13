@@ -218,3 +218,66 @@ func TestCoordinatorContainsRunnerPanicAndDefersRepair(t *testing.T) {
 
 func int64ptr(v int64) *int64        { return &v }
 func timePtr(v time.Time) *time.Time { return &v }
+
+func TestPauseAllowsAdmittedRollToFinishAndKeepsQueueUntouched(t *testing.T) {
+	entered, finish := make(chan struct{}), make(chan struct{})
+	store := &fakeStore{queue: []*db.ScheduleActivation{{ID: 1}, {ID: 2}}}
+	c := New(store, blockingRunner{entered: entered, finish: finish}, time.Second)
+	done := make(chan error, 1)
+	go func() { _, err := c.ProcessNext(context.Background()); done <- err }()
+	<-entered
+	resume := c.Pause()
+	close(finish)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if worked, err := c.ProcessNext(context.Background()); worked || err != nil {
+		t.Fatalf("paused work=%t err=%v", worked, err)
+	}
+	if len(store.queue) != 1 || len(store.finished) != 1 {
+		t.Fatalf("queue=%v finished=%v", store.queue, store.finished)
+	}
+	resume()
+	resume()
+	c.runner = fakeRunner{}
+	if worked, err := c.ProcessNext(context.Background()); !worked || err != nil {
+		t.Fatalf("resumed work=%t err=%v", worked, err)
+	}
+}
+
+type blockingRunner struct{ entered, finish chan struct{} }
+
+func (r blockingRunner) Roll(context.Context, *db.ScheduleActivation) error {
+	close(r.entered)
+	<-r.finish
+	return nil
+}
+
+type repairClaimStore struct {
+	fakeStore
+	repair *db.ScheduleActivation
+}
+
+func (s *repairClaimStore) ClaimNextScheduleActivationRepair(time.Time) (*db.ScheduleActivation, error) {
+	if s.repair == nil {
+		return nil, db.ErrNotFound
+	}
+	a := s.repair
+	s.repair = nil
+	return a, nil
+}
+func TestPausedCoordinatorContinuesAdmittedRepair(t *testing.T) {
+	store := &repairClaimStore{fakeStore: fakeStore{queue: []*db.ScheduleActivation{{ID: 2}}}, repair: &db.ScheduleActivation{ID: 1, Status: "repairing"}}
+	c := New(store, fakeRunner{}, time.Second)
+	resume := c.Pause()
+	defer resume()
+	if worked, err := c.ProcessNext(context.Background()); !worked || err != nil {
+		t.Fatalf("repair work=%t err=%v", worked, err)
+	}
+	if worked, err := c.ProcessNext(context.Background()); worked || err != nil {
+		t.Fatalf("queued work=%t err=%v", worked, err)
+	}
+	if len(store.queue) != 1 || len(store.finished) != 1 {
+		t.Fatalf("queue=%v finished=%v", store.queue, store.finished)
+	}
+}

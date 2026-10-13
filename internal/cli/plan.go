@@ -52,15 +52,17 @@ type deploymentLaunchPreview struct {
 }
 
 type deploymentRemotePreview struct {
-	Exists               bool   `json:"exists"`
-	Status               string `json:"status,omitempty"`
-	Access               string `json:"access,omitempty"`
-	DeployCount          int    `json:"deploy_count,omitempty"`
-	ContentDigest        string `json:"content_digest,omitempty"`
-	LastDeploymentStatus string `json:"last_deployment_status,omitempty"`
-	ManagedBy            string `json:"managed_by,omitempty"`
-	RedeployInFlight     bool   `json:"redeploy_in_flight,omitempty"`
-	ResourceRevision     string `json:"resource_revision,omitempty"`
+	Exists                   bool     `json:"exists"`
+	CompatibilityQuarantined bool     `json:"compatibility_quarantined,omitempty"`
+	ProducerRepairSchedules  []string `json:"producer_repair_schedules,omitempty"`
+	Status                   string   `json:"status,omitempty"`
+	Access                   string   `json:"access,omitempty"`
+	DeployCount              int      `json:"deploy_count,omitempty"`
+	ContentDigest            string   `json:"content_digest,omitempty"`
+	LastDeploymentStatus     string   `json:"last_deployment_status,omitempty"`
+	ManagedBy                string   `json:"managed_by,omitempty"`
+	RedeployInFlight         bool     `json:"redeploy_in_flight,omitempty"`
+	ResourceRevision         string   `json:"resource_revision,omitempty"`
 }
 
 type deploymentManifestPreview struct {
@@ -358,6 +360,13 @@ func runPlan(cmd *cobra.Command, args []string, f *planFlags) error {
 	if remote.ManagedBy != "" {
 		warnings = append(warnings, fmt.Sprintf("this app is managed by %s; a later fleet apply may overwrite manifest-managed settings", remote.ManagedBy))
 	}
+	if remote.CompatibilityQuarantined {
+		message := "app is compatibility-quarantined; new consumers are blocked until active producer writes finish and uncertain producer state is repaired"
+		if len(remote.ProducerRepairSchedules) > 0 {
+			message += "; producers requiring successful reruns: " + strings.Join(remote.ProducerRepairSchedules, ", ")
+		}
+		warnings = append(warnings, message)
+	}
 	if remote.RedeployInFlight {
 		warnings = append(warnings, "a replica redeploy is already in flight; wait for it to finish before deploying")
 	}
@@ -418,10 +427,12 @@ func fetchDeploymentTarget(cfg *cliConfig, slug string) (deploymentRemotePreview
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusOK {
 		var envelope struct {
-			App              db.App `json:"app"`
-			CanManage        *bool  `json:"can_manage"`
-			RedeployInFlight bool   `json:"redeploy_in_flight"`
-			ResourceRevision string `json:"resource_revision"`
+			CompatibilityQuarantined bool     `json:"compatibility_quarantined"`
+			ProducerRepairSchedules  []string `json:"producer_repair_schedules"`
+			App                      db.App   `json:"app"`
+			CanManage                *bool    `json:"can_manage"`
+			RedeployInFlight         bool     `json:"redeploy_in_flight"`
+			ResourceRevision         string   `json:"resource_revision"`
 		}
 		if err := json.Unmarshal(body, &envelope); err != nil {
 			return remote, "", protocolFailure(cfg, &protocolError{op: "decode app", err: err})
@@ -447,7 +458,9 @@ func fetchDeploymentTarget(cfg *cliConfig, slug string) (deploymentRemotePreview
 			DeployCount: envelope.App.DeployCount, ContentDigest: envelope.App.ContentDigest,
 			LastDeploymentStatus: envelope.App.LastDeploymentStatus,
 			ManagedBy:            managedBy, RedeployInFlight: envelope.RedeployInFlight,
-			ResourceRevision: resourceRevision,
+			ResourceRevision:         resourceRevision,
+			CompatibilityQuarantined: envelope.CompatibilityQuarantined,
+			ProducerRepairSchedules:  envelope.ProducerRepairSchedules,
 		}, permission, nil
 	}
 	if resp.StatusCode != http.StatusNotFound {

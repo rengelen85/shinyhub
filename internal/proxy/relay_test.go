@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,7 +64,7 @@ func TestRelayCountsProtectGenerationAndExactReplacement(t *testing.T) {
 	if err := p.RegisterReplica("dashboard", 0, backend.TargetURL, nil, 7); err != nil {
 		t.Fatal(err)
 	}
-	seedServedAt(p, "dashboard", 2*wsWarnGrace)
+	seedFailedWSAt(p, "dashboard", 2*wsWarnGrace)
 	p.RecordActivity("dashboard")
 	if ever, warning := p.ConnectivityHealth("dashboard"); !ever || warning {
 		t.Fatalf("relayed connectivity = %t, %t", ever, warning)
@@ -116,5 +117,33 @@ func TestRelayUpgradeBlockersNamesAndClassifiesAllPools(t *testing.T) {
 	blockers, temporary := p.RelayUpgradeBlockers()
 	if temporary || !reflect.DeepEqual(blockers, []string{"candidate: candidate generation", "elastic: elastic pool"}) {
 		t.Fatalf("blockers = %v, temporary=%t", blockers, temporary)
+	}
+}
+
+func TestRelayConnectionBlockersNameExactRetiredConnection(t *testing.T) {
+	p := New()
+	p.SetPoolSize("dashboard", 1)
+	if err := p.RegisterReplica("dashboard", 0, "http://127.0.0.1:1234", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	local, peer := net.Pipe()
+	defer peer.Close()
+	session := &wsSession{connectionID: "0123456789abcdef01234567"}
+	tracked := p.conns.trackWithSession(local, ConnPrincipal{Slug: "dashboard"}, nil, session, upgrade.RelayBackend{Slug: "dashboard", DeploymentID: 7, Index: 0, TargetURL: "http://127.0.0.1:1234"})
+	defer tracked.Close()
+	if blockers := p.RelayConnectionBlockers(); len(blockers) != 0 {
+		t.Fatal(blockers)
+	}
+	if err := p.RegisterReplica("dashboard", 0, "http://127.0.0.1:5678", nil, 8); err != nil {
+		t.Fatal(err)
+	}
+	blockers := p.RelayConnectionBlockers()
+	if len(blockers) != 1 {
+		t.Fatal(blockers)
+	}
+	for _, want := range []string{"dashboard", session.connectionID, "deployment 7", "replica 0"} {
+		if !strings.Contains(blockers[0], want) {
+			t.Fatalf("missing %q in %q", want, blockers[0])
+		}
 	}
 }

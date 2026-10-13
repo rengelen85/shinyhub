@@ -54,6 +54,7 @@ on_success = "roll"
 		{name: "malformed-previous-manifest", status: http.StatusConflict, refusal: manifestRefusal},
 		{name: "hooks", status: http.StatusConflict, refusal: manifestRefusal},
 		{name: "bundle-change", status: http.StatusConflict, refusal: producerRefusal},
+		{name: "omitted-producer", status: http.StatusConflict, refusal: "not in the manifest"},
 		{name: "missing-producer-state", status: http.StatusConflict, refusal: producerRefusal},
 		{name: "capacity", status: http.StatusConflict, refusal: "need 256 MiB for 16 parallel-generation replicas"},
 		{name: "provider", status: http.StatusConflict, refusal: "uses provider \"docker\""},
@@ -69,7 +70,7 @@ on_success = "roll"
 			srv.SetAvailableMemoryForTest(func() (int, error) { return 16 * 16, nil })
 			app := createGenerationTestApp(t, store, "multiplex-manifest", 16, 16)
 			manifest := baseManifest
-			if tc.name == "bundle-change" {
+			if tc.name == "bundle-change" || tc.name == "omitted-producer" {
 				manifest = strings.Replace(manifest, "first_deploy", "bundle_change", 1)
 			}
 			if tc.name == "hooks" {
@@ -103,6 +104,8 @@ on_success = "roll"
 			}
 			var driftSQL string
 			switch tc.name {
+			case "omitted-producer":
+				manifest = strings.Split(manifest, "[[schedule]]")[0]
 			case "format-only":
 				manifest = "# Same declarations\n\n" + manifest
 			case "live-drift":
@@ -184,6 +187,9 @@ on_success = "roll"
 			beforeProducers := len(runtime.producerCommands)
 			runtime.mu.Unlock()
 			rec := upload("print('app') # v2", manifest, tc.allowDowntime)
+			if tc.name == "omitted-producer" && !strings.Contains(rec.Body.String(), "shinyhub schedule rm multiplex-manifest refresh") {
+				t.Fatalf("missing orphan removal guidance: %s", rec.Body.String())
+			}
 			if rec.Code != tc.status {
 				t.Fatalf("redeploy: %d, want %d: %s", rec.Code, tc.status, rec.Body.String())
 			}

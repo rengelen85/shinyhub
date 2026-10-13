@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/rvben/shinyhub/internal/db"
@@ -68,6 +69,8 @@ type Runner interface {
 }
 
 type Coordinator struct {
+	admissionMu  sync.Mutex
+	pauses       int
 	store        Store
 	runner       Runner
 	pollInterval time.Duration
@@ -106,9 +109,35 @@ func (c *Coordinator) Start(ctx context.Context) {
 	}
 }
 
+// Pause prevents new activation claims while an already-admitted roll finishes.
+// The caller releases it after a canceled/failed reload; a successful retiring
+// process keeps it held until its coordinator stops.
+func (c *Coordinator) Pause() func() {
+	c.admissionMu.Lock()
+	c.pauses++
+	c.admissionMu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { c.admissionMu.Lock(); c.pauses--; c.admissionMu.Unlock() }) }
+}
+
 func (c *Coordinator) ProcessNext(ctx context.Context) (bool, error) {
+	c.admissionMu.Lock()
 	now := c.now()
-	a, err := c.store.ClaimNextScheduleActivation(now)
+	var a *db.ScheduleActivation
+	var err error
+	if c.pauses > 0 {
+		repairs, ok := c.store.(interface {
+			ClaimNextScheduleActivationRepair(time.Time) (*db.ScheduleActivation, error)
+		})
+		if !ok {
+			c.admissionMu.Unlock()
+			return false, nil
+		}
+		a, err = repairs.ClaimNextScheduleActivationRepair(now)
+	} else {
+		a, err = c.store.ClaimNextScheduleActivation(now)
+	}
+	c.admissionMu.Unlock()
 	if errors.Is(err, db.ErrNotFound) {
 		return false, nil
 	}

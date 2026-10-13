@@ -1006,8 +1006,12 @@ type App struct {
 	// DesiredStatus is the persisted lifecycle intent before the API overlays
 	// live replica/worker reality onto Status. It is computed by the API layer;
 	// database reads leave it empty.
-	DesiredStatus string `json:"desired_status,omitempty"`
-	Replicas      int    `json:"replicas"`
+	DesiredStatus            string   `json:"desired_status,omitempty"`
+	CompatibilityQuarantined bool     `json:"compatibility_quarantined"`
+	ProducerRepairRequired   bool     `json:"producer_repair_required"`
+	ProducerRepairSchedules  []string `json:"producer_repair_schedules"`
+	RunningDataProducers     []string `json:"running_data_producers"`
+	Replicas                 int      `json:"replicas"`
 	// ReplicasRunning and WorkersRunning are live process counts computed by the
 	// API layer. Replicas remains the configured/desired replica count.
 	ReplicasRunning       int `json:"replicas_running"`

@@ -104,6 +104,16 @@ For a local invocation without systemd:
 shinyhub reload --config /etc/shinyhub/shinyhub.yaml --wait 10m
 ```
 
+During a waiting session-preserving reload, new scheduled activation claims are
+paused so queued hourly rolls do not extend the wait. An already-admitted roll
+finishes normally, and retries for work that already owns runtime state remain
+admitted. A canceled or failed reload resumes the activation queue;
+the successor resumes durable queued work after a successful handoff. Producer
+schedules can still run and enqueue work during the wait. Draining replicas
+remain a reload blocker; preserving their sessions across reload is not yet
+supported. Connection-identity blockers name the app, connection ID, deployment,
+and replica so they can be matched to WebSocket logs.
+
 Without `--wait`, temporary blockers fail immediately. With it, the command
 waits up to that duration for app operations, candidates, draining generations,
 serving activations, parent retirement, or relay capacity. Elastic pools and successor errors fail
@@ -292,3 +302,16 @@ limit, deploys a replacement, and revokes access to a relayed session.
   Docker, Fargate, remote-worker). Multi-pod Kubernetes rolling upgrades are part
   of the separate high-availability project.
 - **Platform.** Linux and macOS only (tableflip does not support Windows).
+
+## Page polling during a handoff
+
+`/app/APP/.shinyhub/version.json` returns 503 while the active version is not
+locally routable, including the successor's route recovery window.
+`/app/APP/.shinyhub/ready` returns 503 with `ready: false` until local readiness
+is satisfied. The readiness response includes `Retry-After: 1`. Both responses
+are temporary polling outcomes; the page overlay retries without showing an
+error. A persistent 503 requires investigating readiness or recovery.
+
+HTTP-only probes never produce the “no WebSocket has connected” warning. The
+warning requires an upstream WebSocket upgrade to fail and no successful
+upgrade to clear the diagnostic during the grace window.

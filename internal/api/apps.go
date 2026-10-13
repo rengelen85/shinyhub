@@ -125,8 +125,18 @@ func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load deployment repair state")
 		return
 	}
+	producerByApp, err := s.store.ProducerCompatibilityForApps(appIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load producer compatibility state")
+		return
+	}
 	disp := s.loadProjectDisplay()
 	for _, a := range apps {
+		producer := producerByApp[a.ID]
+		a.ProducerRepairSchedules = producer.RepairProducers
+		a.RunningDataProducers = producer.RunningProducers
+		a.ProducerRepairRequired = len(producer.RepairProducers) > 0
+		a.CompatibilityQuarantined = repairByApp[a.ID] || a.ProducerRepairRequired || len(producer.RunningProducers) > 0
 		repair := repairByApp[a.ID]
 		a.DeploymentRepairRequired = &repair
 		s.decorateApp(a)
@@ -280,7 +290,7 @@ func (s *Server) elasticObservation(slug string) elasticPool {
 		return elasticPool{}
 	}
 	snap, ok := s.proxy.ElasticWorkersSnapshot(slug)
-	if !ok {
+	if !ok || (snap.Mode != "grouped" && snap.Mode != "per_session") {
 		return elasticPool{}
 	}
 	pool := elasticPool{Known: true}
@@ -573,7 +583,7 @@ func (s *Server) handleGetApp(w http.ResponseWriter, r *http.Request) {
 			producerRepairRequired = true
 			scheduleConvergenceSatisfied = false
 		}
-		if !fr.Enabled || (fr.DeployTrigger == "never" && !fr.ProducerRepairRequired) {
+		if (!fr.Enabled || fr.DeployTrigger == "never") && !fr.ProducerRepairRequired {
 			continue
 		}
 		if !fr.DeployTriggerSatisfied {
@@ -610,6 +620,16 @@ func (s *Server) handleGetApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	app.DeploymentRepairRequired = &deploymentRepairRequired
+	producerByApp, producerErr := s.store.ProducerCompatibilityForApps([]int64{app.ID})
+	if producerErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load producer compatibility state")
+		return
+	}
+	producer := producerByApp[app.ID]
+	app.CompatibilityQuarantined = compatibilityQuarantined
+	app.ProducerRepairRequired = producerRepairRequired
+	app.ProducerRepairSchedules = producer.RepairProducers
+	app.RunningDataProducers = producer.RunningProducers
 
 	envelope := map[string]any{
 		"app":                                 app,
@@ -625,6 +645,8 @@ func (s *Server) handleGetApp(w http.ResponseWriter, r *http.Request) {
 		"schedule_convergence_satisfied":      scheduleConvergenceSatisfied,
 		"compatibility_quarantined":           compatibilityQuarantined,
 		"producer_repair_required":            producerRepairRequired,
+		"producer_repair_schedules":           producer.RepairProducers,
+		"running_data_producers":              producer.RunningProducers,
 		"deploy_trigger_schedules":            deployScheduleState,
 		// Schedule capabilities are computed server-side because app-manager
 		// membership can come from direct or group grants the browser cannot
@@ -2794,7 +2816,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		case s.hasUnownedGenerationRows(slug, durableGenerationRows, prevActive.ID, previousGrouped):
 			unsupportedReason = "a previous generation still has pending process cleanup"
 		case producerBarrierEntered || prestartPlan.deploymentRepairRequired || len(prestartPlan.producers) > 0:
-			unsupportedReason = "this deployment changes shared producer state and requires an explicit stop-first deploy"
+			unsupportedReason = prestartPlan.downtimeReason(manifest, slug)
 		case !supportedHandoffIsolation(currentIsolation) || !supportedHandoffIsolation(targetIsolation):
 			unsupportedReason = fmt.Sprintf("worker isolation is %q (target: %q); parallel handoff supports grouped and multiplex isolation only", currentIsolation, targetIsolation)
 		case manifest != nil && !s.manifestHandoffSafe(app, prevActive, manifest):

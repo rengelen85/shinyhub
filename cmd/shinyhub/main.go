@@ -3276,7 +3276,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 			temporary = temporary && poolTemporary
 			if len(poolBlockers) == 0 {
 				if _, stable := prx.RelaySnapshot(); !stable {
-					blockers = append(blockers, "upgraded connection does not match a stable active replica")
+					blockers = append(blockers, prx.RelayConnectionBlockers()...)
 				}
 			}
 			apps, err := store.ListAppsLean(0, 0)
@@ -3329,6 +3329,16 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		}
 		return release, nil
 	})
+	if cfg.Server.ReloadSessions == "preserve" {
+		upgradeSignals.SetReloadWaitHook(func() func(bool) {
+			resume := activationCoordinator.Pause()
+			return func(succeeded bool) {
+				if !succeeded {
+					resume()
+				}
+			}
+		})
+	}
 	var reloadStartupReady atomic.Bool
 	reloadReady := reloadReadyPredicate(isClustered(cfg), prx, reloadStartupReady.Load, elector.IsOwner, ownerAndReady, srv.AppOperationsPaused)
 	stopReloadControl, err := upgrade.StartReloadControl(ctx, cfg.Server.PIDFile, cfg.Server.UpgradeTimeout, upg, upgradeSignals, reloadReady, logger)

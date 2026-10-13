@@ -46,3 +46,47 @@ func (s *Store) DeploymentRepairRequiredForApps(appIDs []int64) (map[int64]bool,
 	}
 	return result, nil
 }
+
+// AppProducerCompatibility names independent physical-writer blockers. A
+// completed deployment does not imply that these per-schedule facts are repaired.
+type AppProducerCompatibility struct {
+	RepairProducers  []string
+	RunningProducers []string
+}
+
+func (s *Store) ProducerCompatibilityForApps(appIDs []int64) (map[int64]AppProducerCompatibility, error) {
+	result := make(map[int64]AppProducerCompatibility, len(appIDs))
+	if len(appIDs) == 0 {
+		return result, nil
+	}
+	args := make([]any, len(appIDs))
+	for i, id := range appIDs {
+		args[i] = id
+		result[id] = AppProducerCompatibility{RepairProducers: []string{}, RunningProducers: []string{}}
+	}
+	rows, err := s.db.Query(`SELECT sc.app_id, sc.name,
+ CASE WHEN EXISTS (SELECT 1 FROM schedule_data_uncertainty u WHERE u.schedule_id=sc.id) THEN 1 ELSE 0 END,
+ CASE WHEN EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id=sc.id AND r.publishes_data=1 AND r.status='running') THEN 1 ELSE 0 END
+ FROM app_schedules sc WHERE sc.app_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(appIDs)), ",")+`) ORDER BY sc.app_id, sc.name`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load producer compatibility: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var appID int64
+		var name string
+		var repair, running int
+		if err := rows.Scan(&appID, &name, &repair, &running); err != nil {
+			return nil, err
+		}
+		state := result[appID]
+		if repair != 0 {
+			state.RepairProducers = append(state.RepairProducers, name)
+		}
+		if running != 0 {
+			state.RunningProducers = append(state.RunningProducers, name)
+		}
+		result[appID] = state
+	}
+	return result, rows.Err()
+}

@@ -519,6 +519,23 @@ func prefixedActivationColumns(alias string) string {
 // new work. That makes transient finish/defer failures self-healing without
 // permitting two live rollout owners.
 func (s *Store) ClaimNextScheduleActivation(now time.Time) (*ScheduleActivation, error) {
+	return s.claimNextScheduleActivation(now, false)
+}
+
+// ClaimNextScheduleActivationRepair admits only work that already owns runtime
+// state. Waiting reloads can finish interrupted repairs without starting queued
+// hourly rolls and extending their drain budget.
+func (s *Store) ClaimNextScheduleActivationRepair(now time.Time) (*ScheduleActivation, error) {
+	return s.claimNextScheduleActivation(now, true)
+}
+
+func (s *Store) claimNextScheduleActivation(now time.Time, repairOnly bool) (*ScheduleActivation, error) {
+	runtimeFilter := ""
+	if repairOnly {
+		runtimeFilter = ` AND (a.status IN ('running','repairing') OR EXISTS (
+   SELECT 1 FROM replicas r WHERE r.app_id=a.app_id AND r.activation_id=a.id
+   AND (r.pid IS NOT NULL OR r.worker_id<>'' OR r.endpoint_url<>''))) `
+	}
 	ctx := context.Background()
 	tx, err := s.d.beginWrite(ctx, s.rawDB(), scheduleActivationLockKey)
 	if err != nil {
@@ -543,7 +560,7 @@ func (s *Store) ClaimNextScheduleActivation(now time.Time) (*ScheduleActivation,
 		 WHERE older.app_id=a.app_id AND older.id<>a.id
 		 AND (older.status IN ('running','repairing') OR
 		 (older.id<a.id AND older.status IN ('pending','deferred_interval','deferred_capacity')))))
-		ORDER BY CASE a.status WHEN 'running' THEN 0 WHEN 'repairing' THEN 1 ELSE 2 END,
+`+runtimeFilter+` ORDER BY CASE a.status WHEN 'running' THEN 0 WHEN 'repairing' THEN 1 ELSE 2 END,
 		         a.due_at ASC, a.id ASC LIMIT 1`, now).Scan(&id, &priorStatus, &priorPhase)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {

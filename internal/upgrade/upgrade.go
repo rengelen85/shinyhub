@@ -54,6 +54,16 @@ type SignalState struct {
 	mu       sync.Mutex
 	inFlight chan struct{}
 	handoff  bool
+	waitHook func() func(bool)
+}
+
+// SetReloadWaitHook defers new background work during an acknowledged wait.
+// Completion receives true only after a successful handoff, when the retiring
+// process must keep its background admissions closed.
+func (s *SignalState) SetReloadWaitHook(hook func() func(bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.waitHook = hook
 }
 
 // TransitionError identifies a temporary admission failure. Waiting reloads
@@ -72,8 +82,15 @@ func (s *SignalState) Reload(ctx context.Context, upg Upgrader, wait time.Durati
 	}
 	done := make(chan struct{})
 	s.inFlight = done
+	hook := s.waitHook
 	s.mu.Unlock()
 	succeeded := false
+	if wait > 0 && hook != nil {
+		finish := hook()
+		if finish != nil {
+			defer func() { finish(succeeded) }()
+		}
+	}
 	defer func() {
 		s.mu.Lock()
 		s.handoff = s.handoff || succeeded

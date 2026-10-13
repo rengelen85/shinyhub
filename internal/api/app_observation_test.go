@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/rvben/shinyhub/internal/appstatus"
+	"github.com/rvben/shinyhub/internal/config"
 	"github.com/rvben/shinyhub/internal/db"
+	"github.com/rvben/shinyhub/internal/proxy"
 )
 
 // The elastic branch of decorateAppObservation: an elastic pool has no durable
@@ -100,5 +102,32 @@ func TestDecorateAppObservation_MultiplexIgnoresPool(t *testing.T) {
 	s.decorateAppObservation(app, []*db.Replica{{Index: 0, Status: db.ReplicaStatusRunning}}, elasticPool{})
 	if app.Status != appstatus.Running || app.ReplicasRunning != 1 {
 		t.Fatalf("multiplex with one running replica: status=%q replicas_running=%d", app.Status, app.ReplicasRunning)
+	}
+}
+
+func TestMultiplexObservationWithRetainedGroupedDrainer(t *testing.T) {
+	p := proxy.New()
+	defer p.Deregister("app")
+	p.SetPoolMode("app", config.IsolationGrouped, 4, 2)
+	if err := p.RegisterElasticWorker("app", 0, "http://127.0.0.1:1234", nil, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.StageGenerationWithPolicy("app", 20, 1, proxy.GenerationPolicy{Mode: config.IsolationMultiplex}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RegisterGenerationReplica("app", 20, 0, "http://127.0.0.1:1235", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ActivateGeneration("app", 20); err != nil {
+		t.Fatal(err)
+	}
+	if snap, ok := p.ElasticWorkersSnapshot("app"); !ok || len(snap.Workers) != 1 {
+		t.Fatal("test needs retained grouped worker")
+	}
+	srv := &Server{proxy: p}
+	app := &db.App{Slug: "app", Status: "running"}
+	srv.decorateAppObservation(app, []*db.Replica{{Index: 0, Status: db.ReplicaStatusRunning}}, srv.elasticObservation("app"))
+	if app.Status != "running" || app.ReplicasRunning != 1 {
+		t.Fatalf("status=%s replicas=%d", app.Status, app.ReplicasRunning)
 	}
 }

@@ -3656,3 +3656,63 @@ func TestListAppsPagination(t *testing.T) {
 		})
 	}
 }
+
+func TestAppReadSurfacesNameDisabledProducerQuarantine(t *testing.T) {
+	srv, store := newTestServer(t)
+	hash, _ := testHashPassword("pass")
+	err := store.CreateUser(db.CreateUserParams{Username: "operator", PasswordHash: hash, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := store.GetUserByUsername("operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := user.ID
+	if _, err := store.CreateApp(db.CreateAppParams{Slug: "quarantined", Name: "Quarantined", OwnerID: id}); err != nil {
+		t.Fatal(err)
+	}
+	app, err := store.GetAppBySlug("quarantined")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, Status: db.ReplicaStatusRunning, DesiredState: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	scheduleID, err := store.CreateSchedule(db.CreateScheduleParams{AppID: app.ID, Name: "retired-producer", CronExpr: "0 * * * *", CommandJSON: `["true"]`, Enabled: false, TimeoutSeconds: 60, OverlapPolicy: "skip", MissedPolicy: "skip", DeployTrigger: "never", OnSuccess: "none"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`INSERT INTO schedule_data_uncertainty (schedule_id,data_write_sequence,schedule_run_id,status) VALUES (?,1,42,'failed')`, scheduleID); err != nil {
+		t.Fatal(err)
+	}
+	token, _ := auth.IssueJWT(id, "operator", "admin", "test-secret")
+	for _, path := range []string{"/api/apps", "/api/apps/quarantined"} {
+		rec := httptest.NewRecorder()
+		srv.Router().ServeHTTP(rec, authedRequest(t, "GET", path, nil, token))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		view, _ := payload["app"].(map[string]any)
+		if view == nil {
+			view = payload["items"].([]any)[0].(map[string]any)
+		}
+		if view["status"] != "running" || view["compatibility_quarantined"] != true || view["producer_repair_required"] != true {
+			t.Fatalf("view=%v", view)
+		}
+		names := view["producer_repair_schedules"].([]any)
+		if len(names) != 1 || names[0] != "retired-producer" {
+			t.Fatalf("names=%v", names)
+		}
+		if schedules, ok := payload["deploy_trigger_schedules"].([]any); ok && len(schedules) != 1 {
+			t.Fatalf("disabled repair producer hidden: %v", schedules)
+		}
+	}
+}

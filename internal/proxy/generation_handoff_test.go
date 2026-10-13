@@ -179,7 +179,7 @@ func TestGenerationHandoffKeepsOpenWebSocketWhileNewWorkUsesActive(t *testing.T)
 			defer middleConn.Close()
 			thirdPolicy := proxy.GenerationPolicy{Mode: config.IsolationMultiplex}
 			if thirdGrouped {
-				thirdPolicy = proxy.GenerationPolicy{Mode: config.IsolationGrouped, GroupedSize: 8, MaxWorkers: 2}
+				thirdPolicy = proxy.GenerationPolicy{Mode: config.IsolationGrouped, GroupedSize: 32, MaxWorkers: 2}
 			}
 			thirdSlot, err := p.StageGenerationWithPolicy("dashboard", 303, 1, thirdPolicy, 2)
 			if err != nil {
@@ -315,6 +315,21 @@ func TestGenerationHandoffKeepsOpenWebSocketWhileNewWorkUsesActive(t *testing.T)
 			}
 			generationRequestCookies(t, p, oldCookies, "v3")
 			generationRequestCookies(t, p, middleCookies, "v3")
+
+			// Shut retired upstreams down before reconnecting with stale browser cookies.
+			// Any route leak now fails the actual TCP dial rather than serving old code.
+			v1.Close()
+			v2.Close()
+			for _, cookies := range [][]*http.Cookie{oldCookies, middleCookies} {
+				for attempt := 0; attempt < 3; attempt++ {
+					conn, reader := openWS(cookies)
+					_, _ = io.WriteString(conn, "after-retirement\n")
+					if got, err := reader.ReadString('\n'); err != nil || got != "v3:after-retirement\n" {
+						t.Fatalf("retired reconnect=%q err=%v", got, err)
+					}
+					_ = conn.Close()
+				}
+			}
 
 		})
 	}

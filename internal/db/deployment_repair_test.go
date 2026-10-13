@@ -87,3 +87,42 @@ func TestDeploymentRepairBatchExcludesPhysicalWriters(t *testing.T) {
 		t.Fatalf("empty batch=%v err=%v", empty, err)
 	}
 }
+
+func TestProducerCompatibilityBatchNamesIndependentBlockers(t *testing.T) {
+	store := newScheduleStore(t)
+	appID := newScheduleAppFixture(t, store, "compatibility")
+	dep := promoteConvergenceDeployment(t, store, appID, "good", "sha256:good")
+	scheduleID := createConvergenceSchedule(t, store, appID, `["producer"]`, schedulespec.DeployTriggerBundleChange)
+	runID := insertProducerRun(t, store, scheduleID, dep, `["producer"]`)
+	for _, failed := range []bool{false, true} {
+		if failed {
+			finishProducerRun(t, store, runID, "failed")
+		}
+		states, err := store.ProducerCompatibilityForApps([]int64{appID, 999999})
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := states[appID]
+		if failed && (len(state.RepairProducers) != 1 || len(state.RunningProducers) != 0) {
+			t.Fatalf("failed state=%+v", state)
+		}
+		if !failed && (len(state.RunningProducers) != 1 || len(state.RepairProducers) != 0) {
+			t.Fatalf("running state=%+v", state)
+		}
+		schedule, err := store.GetSchedule(scheduleID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := state.RunningProducers
+		if failed {
+			names = state.RepairProducers
+		}
+		if names[0] != schedule.Name {
+			t.Fatalf("names=%v", names)
+		}
+		other := states[999999]
+		if len(other.RepairProducers)+len(other.RunningProducers) != 0 {
+			t.Fatal("state leaked across apps")
+		}
+	}
+}

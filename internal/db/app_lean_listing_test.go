@@ -1,6 +1,7 @@
 package db_test
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/rvben/shinyhub/internal/db"
@@ -107,7 +108,7 @@ func TestListAppsLean_MatchesListApps(t *testing.T) {
 	for i := range full {
 		want := nonDeploymentFieldsOf(full[i])
 		got := *lean[i]
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("row %d: ListAppsLean = %+v, want %+v (from ListApps, deployment fields zeroed)", i, got, want)
 		}
 	}
@@ -128,7 +129,7 @@ func TestListAppsLean_MatchesListApps(t *testing.T) {
 	for i := range fullVisible {
 		want := nonDeploymentFieldsOf(fullVisible[i])
 		got := *leanVisible[i]
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("visible row %d: ListAppsVisibleToUserLean = %+v, want %+v", i, got, want)
 		}
 	}

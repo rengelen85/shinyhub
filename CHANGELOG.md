@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **diagnostics**: mark compatibility-quarantined apps in listings, name producers requiring repair in app details, and warn about quarantine in deployment plans. Preserving reload blockers identify the app, WebSocket connection, deployment, and replica.
+
+### Fixed
+
+- **reload**: pause new scheduled activation claims during a session-preserving reload wait, while allowing existing rolls and their repair retries to finish. Resume queued work after a failed reload or in the successor after handoff.
+- **apps**: report the active multiplex generation correctly after a grouped-to-multiplex handoff with grouped workers still draining.
+- **deploy**: name retained producer schedules that force a stop-first deployment, identify declarations omitted from the manifest, and provide the explicit removal command.
+- **proxy**: require a failed upstream WebSocket upgrade before warning that no WebSocket has connected, avoiding false errors from HTTP-only handoff probes.
+
 ## [0.20.5](https://github.com/rvben/shinyhub/compare/v0.20.4...v0.20.5) - 2026-10-12
 
 ### Added

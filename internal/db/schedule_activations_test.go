@@ -769,3 +769,31 @@ func insertActivationRun(t *testing.T, store *db.Store, scheduleID int64, starte
 }
 
 func intPtr(v int) *int { return &v }
+
+func TestRepairOnlyActivationClaimLeavesUntouchedQueuePending(t *testing.T) {
+	store := newScheduleStore(t)
+	appID := newScheduleAppFixture(t, store, "reload-repair")
+	scheduleID, err := store.CreateSchedule(db.CreateScheduleParams{AppID: appID, Name: "refresh", CronExpr: "0 * * * *", CommandJSON: `["true"]`, Enabled: true, TimeoutSeconds: 60, OverlapPolicy: "skip", MissedPolicy: "skip", OnSuccess: "roll"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	runID := insertActivationRun(t, store, scheduleID, now, "roll", 0)
+	a, err := store.CompleteScheduleRunAndEnqueueActivation(db.CompleteScheduleRunParams{RunID: runID, Status: "succeeded", ExitCode: intPtr(0), FinishedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextScheduleActivationRepair(now); err != db.ErrNotFound {
+		t.Fatalf("untouched claim err=%v", err)
+	}
+	if _, err := store.ClaimNextScheduleActivation(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeferScheduleActivation(a.ID, "repairing", "transient failure", now, now); err != nil {
+		t.Fatal(err)
+	}
+	repair, err := store.ClaimNextScheduleActivationRepair(now)
+	if err != nil || repair.ID != a.ID || repair.Phase != "recovering" {
+		t.Fatalf("repair=%+v err=%v", repair, err)
+	}
+}

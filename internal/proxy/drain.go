@@ -292,6 +292,41 @@ func (p *Proxy) RelaySnapshot() ([]upgrade.RelayBackend, bool) {
 	return out, true
 }
 
+// RelayConnectionBlockers identifies upgraded connections whose immutable
+// backend identity is no longer the stable active replica.
+func (p *Proxy) RelayConnectionBlockers() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var blockers []string
+	for _, conn := range p.conns.snapshot() {
+		key := conn.backend
+		pool := p.pools[key.Slug]
+		stable := false
+		if key.Slug != "" && key.TargetURL != "" && key.DeploymentID > 0 && key.Index >= 0 && pool != nil && key.Index < len(pool.replicas) {
+			rep := pool.replicas[key.Index]
+			stable = rep != nil && !rep.draining.Load() && rep.deploymentID == key.DeploymentID && rep.targetURL == key.TargetURL
+		}
+		if stable {
+			continue
+		}
+		slug := key.Slug
+		if slug == "" {
+			slug = conn.principal.Slug
+		}
+		connectionID := "unknown"
+		if conn.session != nil {
+			conn.session.mu.Lock()
+			if conn.session.connectionID != "" {
+				connectionID = conn.session.connectionID
+			}
+			conn.session.mu.Unlock()
+		}
+		blockers = append(blockers, fmt.Sprintf("%s: upgraded connection %s does not match a stable active replica (deployment %d, replica %d)", slug, connectionID, key.DeploymentID, key.Index))
+	}
+	sort.Strings(blockers)
+	return blockers
+}
+
 // SealRelay atomically prevents any later hijack from enlarging the lease.
 // HTTP must already be quiescent: an unexpected late hijack is closed instead
 // of admitting unprotected work. Subsequent snapshots use immutable conn keys.

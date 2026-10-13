@@ -348,3 +348,25 @@ func (s *Server) removePrestartPlaceholders(plan *prestartSchedulePlan) {
 		_, _ = s.store.DeleteSchedulePlaceholderIfUnused(id)
 	}
 }
+
+// downtimeReason names the retained producers so an omitted manifest declaration
+// cannot silently force every subsequent code-only deploy into stop-first mode.
+func (plan *prestartSchedulePlan) downtimeReason(manifest *deploy.Manifest, slug string) string {
+	reason := "this deployment changes shared producer state and requires an explicit stop-first deploy"
+	declared := map[string]bool{}
+	if manifest != nil {
+		for _, spec := range manifest.Schedules {
+			declared[spec.Name] = true
+		}
+	}
+	for _, producer := range plan.producers {
+		reason += fmt.Sprintf("; schedule %q", producer.Name)
+		if manifest != nil && !declared[producer.Name] {
+			reason += fmt.Sprintf(" is not in the manifest and is retained; remove it with shinyhub schedule rm %s %s if no longer needed", slug, producer.Name)
+		}
+	}
+	if plan.deploymentRepairRequired {
+		reason += "; an unresolved deployment producer barrier also requires repair"
+	}
+	return reason
+}

@@ -127,6 +127,21 @@ writer whose `deploy_trigger` is `never`) or a deployment that supplies and
 successfully runs a replacement producer policy. Merely deploying unrelated
 code or rolling back does not erase an uncertain physical write.
 
+Quarantine also applies while a designated producer is still writing, and after
+an interrupted or failed deployment crossed its producer barrier. A later
+successful corrective deploy repairs the deployment barrier; schedule write
+uncertainty is tracked independently for each producer. One successful deploy
+therefore does not promise to clear every cause. Existing sessions can keep
+serving while new consumer starts are blocked. `apps list` marks the app as
+quarantined while preserving its serving status. `apps show` names producers
+requiring repair, including disabled schedules, and running data producers;
+`plan` warns about quarantine and names the required producer reruns.
+
+Manifest schedule reconciliation retains schedules omitted from `shinyhub.toml`.
+If a retained producer forces a stop-first deploy, the refusal names it, says it
+is absent from the manifest, and provides `shinyhub schedule rm APP SCHEDULE`.
+Remove it explicitly when it is no longer intended to run.
+
 For legacy-upgrade uncertainty, the original schedule may have
 `deploy_trigger = "never"` and `on_success = "none"`. Run it explicitly with
 `shinyhub schedule run APP SCHEDULE --follow`: while

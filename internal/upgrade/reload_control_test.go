@@ -267,3 +267,51 @@ func TestReloadControlRecoversStaleSocketWithoutReplacingLiveSocketOrFiles(t *te
 		t.Fatalf("existing file changed: %q %v", data, err)
 	}
 }
+
+func TestReloadWaitHookLifecycle(t *testing.T) {
+	for _, scenario := range []string{"success", "failure", "timeout", "cancel", "immediate"} {
+		t.Run(scenario, func(t *testing.T) {
+			active, finished, success := false, false, false
+			state := &SignalState{}
+			state.SetReloadWaitHook(func() func(bool) {
+				active = true
+				return func(ok bool) { active = false; finished = true; success = ok }
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			wait := time.Millisecond
+			if scenario == "immediate" {
+				wait = 0
+			}
+			u := &reloadTestUpgrader{fakeUpgrader: newFakeUpgrader(), run: func() error {
+				if scenario != "immediate" && !active {
+					t.Error("activation pause absent during upgrade attempt")
+				}
+				switch scenario {
+				case "success", "immediate":
+					return nil
+				case "cancel":
+					cancel()
+					return &TransitionError{Reason: "drain"}
+				case "timeout":
+					return &TransitionError{Reason: "drain"}
+				default:
+					return errors.New("refused")
+				}
+			}}
+			err := state.Reload(ctx, u, wait, quietLogger())
+			if scenario == "immediate" {
+				if finished || active {
+					t.Fatal("immediate reload used wait hook")
+				}
+				return
+			}
+			if !finished || active || success != (scenario == "success") {
+				t.Fatalf("finished=%t active=%t success=%t", finished, active, success)
+			}
+			if (err == nil) != (scenario == "success") {
+				t.Fatal(err)
+			}
+		})
+	}
+}
