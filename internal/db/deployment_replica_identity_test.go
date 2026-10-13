@@ -7,7 +7,7 @@ import (
 )
 
 func TestDeploymentReplicaMeasurementsBelongToRuntimeIncarnation(t *testing.T) {
-	for _, change := range []string{"unchanged", "pid", "worker", "endpoint", "start-identity"} {
+	for _, change := range []string{"unchanged", "pid", "port", "worker", "endpoint", "start-identity"} {
 		t.Run(change, func(t *testing.T) {
 			store := newScheduleStore(t)
 			appID := newScheduleAppFixture(t, store, "ledger-incarnation")
@@ -16,7 +16,8 @@ func TestDeploymentReplicaMeasurementsBelongToRuntimeIncarnation(t *testing.T) {
 				t.Fatal(err)
 			}
 			oldPID, newPID := 101, 202
-			p := db.UpsertDeploymentReplicaParams{AppID: appID, DeploymentID: dep.ID, Index: 0, PID: &oldPID, Status: "running", Provider: "native", WorkerID: "worker-a", EndpointURL: "http://worker-a", DataGeneration: 7, StartupPeakRSSBytes: 512 << 20, ProcessStartIdentity: 1000}
+			oldPort, newPort := 20001, 20002
+			p := db.UpsertDeploymentReplicaParams{AppID: appID, DeploymentID: dep.ID, Index: 0, PID: &oldPID, Port: &oldPort, Status: "running", Provider: "native", WorkerID: "worker-a", EndpointURL: "http://worker-a", DataGeneration: 7, StartupPeakRSSBytes: 512 << 20, ProcessStartIdentity: 1000}
 			if err = store.UpsertDeploymentReplica(p); err != nil {
 				t.Fatal(err)
 			}
@@ -24,6 +25,8 @@ func TestDeploymentReplicaMeasurementsBelongToRuntimeIncarnation(t *testing.T) {
 			switch change {
 			case "pid":
 				p.PID = &newPID
+			case "port":
+				p.Port = &newPort
 			case "worker":
 				p.WorkerID = "worker-b"
 			case "endpoint":

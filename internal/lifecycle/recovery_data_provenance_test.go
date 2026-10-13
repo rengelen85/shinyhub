@@ -283,6 +283,15 @@ func TestRecoveryRejectsLegacyProvenanceWhenPIDChangesOnSameWorker(t *testing.T)
 }
 
 func TestRecoveryPreservesLegacyProvenanceForSameNativeProcess(t *testing.T) {
+	checkNativeRecoveryProvenance(t, false)
+}
+
+func TestRecoveryRejectsLegacyProvenanceWhenNativeListenerChanges(t *testing.T) {
+	checkNativeRecoveryProvenance(t, true)
+}
+
+func checkNativeRecoveryProvenance(t *testing.T, changedPort bool) {
+	t.Helper()
 	store := dbtest.New(t)
 	app := mustCreateApp(t, store, "legacy-native-process")
 	dep, err := store.BeginDeployment(app.ID, "v1", t.TempDir())
@@ -294,11 +303,16 @@ func TestRecoveryPreservesLegacyProvenanceForSameNativeProcess(t *testing.T) {
 	}
 	pid, _ := startNativeProcess(t, dep.BundleDir)
 	port := liveListener(t)
-	endpoint := fmt.Sprintf("http://127.0.0.1:%d", port)
+	// Legacy rows identify native listeners by port alone.
+	endpoint := ""
 	if err = store.UpsertReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, PID: &pid, Port: &port, Status: "running", Provider: "native", EndpointURL: endpoint, DeploymentID: &dep.ID, DataGeneration: 7, DataProducerFingerprint: "known-boot", StartupPeakRSSBytes: 512 << 20}); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.UpsertDeploymentReplica(db.UpsertDeploymentReplicaParams{AppID: app.ID, DeploymentID: dep.ID, Index: 0, PID: &pid, Port: &port, Status: "running", Provider: "native", EndpointURL: endpoint}); err != nil {
+	recoveredPort := port
+	if changedPort {
+		recoveredPort = liveListener(t)
+	}
+	if err = store.UpsertDeploymentReplica(db.UpsertDeploymentReplicaParams{AppID: app.ID, DeploymentID: dep.ID, Index: 0, PID: &pid, Port: &recoveredPort, Status: "running", Provider: "native", EndpointURL: endpoint}); err != nil {
 		t.Fatal(err)
 	}
 	if err = store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "running"}); err != nil {
@@ -319,8 +333,12 @@ func TestRecoveryPreservesLegacyProvenanceForSameNativeProcess(t *testing.T) {
 	if err != nil || len(replicas) != 1 {
 		t.Fatalf("replicas=%v err=%v", replicas, err)
 	}
-	if replicas[0].Status != "running" || replicas[0].DataGeneration != 7 || replicas[0].DataProducerFingerprint != "known-boot" || replicas[0].StartupPeakRSSBytes != 512<<20 {
-		t.Fatalf("same live native process lost known boot metadata: %+v", replicas[0])
+	wantGeneration, wantPeak, wantFingerprint := int64(7), int64(512<<20), "known-boot"
+	if changedPort {
+		wantGeneration, wantPeak, wantFingerprint = 0, 0, ""
+	}
+	if replicas[0].Status != "running" || replicas[0].DataGeneration != wantGeneration || replicas[0].DataProducerFingerprint != wantFingerprint || replicas[0].StartupPeakRSSBytes != wantPeak {
+		t.Fatalf("changed port=%v: want generation=%d peak=%d fingerprint=%q, got %+v", changedPort, wantGeneration, wantPeak, wantFingerprint, replicas[0])
 	}
 }
 

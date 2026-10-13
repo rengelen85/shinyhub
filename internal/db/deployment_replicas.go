@@ -47,6 +47,7 @@ func (s *Store) UpsertDeploymentReplica(p UpsertDeploymentReplicaParams) error {
 	// Measurements describe a process incarnation, not a reusable deployment
 	// slot. Omitted measurements may be retained only while identity matches.
 	const sameRuntimeSQL = `COALESCE(deployment_replicas.pid, 0) = COALESCE(excluded.pid, 0)
+ AND COALESCE(deployment_replicas.port, 0) = COALESCE(excluded.port, 0)
  AND deployment_replicas.provider = excluded.provider AND deployment_replicas.tier = excluded.tier
  AND deployment_replicas.worker_id = excluded.worker_id AND deployment_replicas.endpoint_url = excluded.endpoint_url
  AND (excluded.process_start_identity = 0 OR deployment_replicas.process_start_identity = 0

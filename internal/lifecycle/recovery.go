@@ -769,6 +769,11 @@ func sameRecoveredConsumer(existing *db.Replica, recovered *db.DeploymentReplica
 	if existing == nil || existing.DeploymentID == nil || *existing.DeploymentID != recovered.DeploymentID || existing.Provider != recovered.Provider || existing.Tier != recovered.Tier {
 		return false
 	}
+	if existing.Port != nil || recovered.Port != nil {
+		if existing.Port == nil || recovered.Port == nil || *existing.Port != *recovered.Port {
+			return false
+		}
+	}
 	if existing.PID != nil && recovered.PID != nil && *existing.PID > 0 && *recovered.PID > 0 {
 		return *existing.PID == *recovered.PID && existing.WorkerID == recovered.WorkerID && existing.EndpointURL == recovered.EndpointURL
 	}
