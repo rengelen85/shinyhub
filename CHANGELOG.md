@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.20.6](https://github.com/rvben/shinyhub/compare/v0.20.5...v0.20.6) - 2026-10-13
+
 ### Added
 
 - **diagnostics**: mark compatibility-quarantined apps in listings, name producers requiring repair in app details, and warn about quarantine in deployment plans. Preserving reload blockers identify the app, WebSocket connection, deployment, and replica.
