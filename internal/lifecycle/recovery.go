@@ -676,16 +676,51 @@ func reconcileDeploymentGenerationProjection(store *db.Store, app *db.App) bool 
 		slog.Error("generation recovery: load active deployment", "slug", app.Slug, "deployment_id", activeID, "err", err)
 		return false
 	}
+	projected, err := store.ListReplicas(app.ID)
+	if err != nil {
+		slog.Error("generation recovery: load projected provenance", "slug", app.Slug, "err", err)
+		return false
+	}
+	byIndex := make(map[int]*db.Replica, len(projected))
+	for _, r := range projected {
+		byIndex[r.Index] = r
+	}
+	publication, err := store.GetAppDataPublication(app.ID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		slog.Error("generation recovery: load data publication", "slug", app.Slug, "err", err)
+		return false
+	}
 
 	for _, replica := range activeRows {
 		pid, port, deploymentID := replica.PID, replica.Port, replica.DeploymentID
-		if err := store.UpsertReplica(db.UpsertReplicaParams{
+		generation := replica.DataGeneration
+		existing := byIndex[replica.Index]
+		// Adoption does not reload data. The ledger records the generation
+		// loaded at boot; retain existing source/activation attribution when
+		// it already describes that generation.
+		if existing != nil && generation > 0 && existing.DataGeneration == generation {
+			generation = 0 // A status-only upsert preserves the existing provenance.
+		}
+		params := db.UpsertReplicaParams{
 			AppID: app.ID, Index: replica.Index, PID: pid, Port: port,
 			Status: db.ReplicaStatusRunning, Provider: replica.Provider, Tier: replica.Tier,
 			EndpointURL: replica.EndpointURL, WorkerID: replica.WorkerID,
 			AppVersion: activeDeployment.Version, DesiredState: "running",
-			DeploymentID: &deploymentID, ConsumerBooted: true,
-		}); err != nil {
+			DeploymentID: &deploymentID, DataGeneration: generation,
+			ReplaceDataProvenance: replica.DataGeneration == 0 && !sameRecoveredConsumer(existing, replica),
+			ReplaceStartupPeakRSS: !sameRecoveredConsumer(existing, replica),
+			StartupPeakRSSBytes:   replica.StartupPeakRSSBytes,
+		}
+		// The current publication supplies source attribution only when its
+		// token matches the consumer's boot snapshot. A newer publication is
+		// never evidence that an adopted process loaded the newer data.
+		if generation > 0 && publication != nil && publication.Generation == generation {
+			params.DataProducerDeploymentID = publication.ProducerDeploymentID
+			params.DataProducerAppVersion = publication.ProducerAppVersion
+			params.DataProducerContentDigest = publication.ProducerContentDigest
+			params.DataProducerFingerprint = publication.ProducerFingerprint
+		}
+		if err := store.UpsertReplica(params); err != nil {
 			slog.Error("generation recovery: publish active replica projection", "slug", app.Slug, "index", replica.Index, "err", err)
 			return false
 		}
@@ -695,6 +730,21 @@ func reconcileDeploymentGenerationProjection(store *db.Store, app *db.App) bool 
 		return false
 	}
 	return true
+}
+
+// Only an exact durable runtime identity can carry canonical attribution that
+// predates the generation ledger. Matching a reusable slot is insufficient.
+func sameRecoveredConsumer(existing *db.Replica, recovered *db.DeploymentReplica) bool {
+	if existing == nil || existing.DeploymentID == nil || *existing.DeploymentID != recovered.DeploymentID || existing.Provider != recovered.Provider || existing.Tier != recovered.Tier {
+		return false
+	}
+	if existing.PID != nil && recovered.PID != nil && *existing.PID > 0 && *recovered.PID > 0 {
+		return *existing.PID == *recovered.PID && existing.WorkerID == recovered.WorkerID && existing.EndpointURL == recovered.EndpointURL
+	}
+	// Local Docker's worker ID is an immutable container ID. Other runtimes
+	// may use a shared node/tier alias or reusable native unit name, which is
+	// not enough evidence of process continuity without a matching live PID.
+	return recovered.Provider == "docker" && existing.WorkerID != "" && existing.WorkerID == recovered.WorkerID && existing.EndpointURL == recovered.EndpointURL
 }
 
 // CleanupObsoleteDeploymentGenerations runs after authoritative projection

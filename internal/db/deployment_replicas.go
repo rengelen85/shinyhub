@@ -44,6 +44,13 @@ type UpsertDeploymentReplicaParams struct {
 }
 
 func (s *Store) UpsertDeploymentReplica(p UpsertDeploymentReplicaParams) error {
+	// Measurements describe a process incarnation, not a reusable deployment
+	// slot. Omitted measurements may be retained only while identity matches.
+	const sameRuntimeSQL = `COALESCE(deployment_replicas.pid, 0) = COALESCE(excluded.pid, 0)
+ AND deployment_replicas.provider = excluded.provider AND deployment_replicas.tier = excluded.tier
+ AND deployment_replicas.worker_id = excluded.worker_id AND deployment_replicas.endpoint_url = excluded.endpoint_url
+ AND (excluded.process_start_identity = 0 OR deployment_replicas.process_start_identity = 0
+      OR deployment_replicas.process_start_identity = excluded.process_start_identity)`
 	if p.AppID <= 0 || p.DeploymentID <= 0 || p.Index < 0 {
 		return fmt.Errorf("upsert deployment replica: invalid identity")
 	}
@@ -66,9 +73,12 @@ func (s *Store) UpsertDeploymentReplica(p UpsertDeploymentReplicaParams) error {
 			tier = excluded.tier,
 			endpoint_url = excluded.endpoint_url,
 			worker_id = excluded.worker_id,
- process_start_identity = CASE WHEN excluded.process_start_identity > 0 THEN excluded.process_start_identity ELSE deployment_replicas.process_start_identity END,
- data_generation = CASE WHEN excluded.data_generation > 0 THEN excluded.data_generation ELSE deployment_replicas.data_generation END,
- startup_peak_rss_bytes = CASE WHEN excluded.startup_peak_rss_bytes > 0 THEN excluded.startup_peak_rss_bytes ELSE deployment_replicas.startup_peak_rss_bytes END,
+ process_start_identity = CASE WHEN excluded.process_start_identity > 0 THEN excluded.process_start_identity
+   WHEN `+sameRuntimeSQL+` THEN deployment_replicas.process_start_identity ELSE 0 END,
+ data_generation = CASE WHEN excluded.data_generation > 0 THEN excluded.data_generation
+   WHEN `+sameRuntimeSQL+` THEN deployment_replicas.data_generation ELSE 0 END,
+ startup_peak_rss_bytes = CASE WHEN excluded.startup_peak_rss_bytes > 0 THEN excluded.startup_peak_rss_bytes
+   WHEN `+sameRuntimeSQL+` THEN deployment_replicas.startup_peak_rss_bytes ELSE 0 END,
 			updated_at = CURRENT_TIMESTAMP`,
 		p.AppID, p.DeploymentID, p.Index, p.PID, p.Port, p.Status,
 		p.Provider, p.Tier, p.EndpointURL, p.WorkerID, p.DataGeneration, p.StartupPeakRSSBytes, p.ProcessStartIdentity)

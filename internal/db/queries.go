@@ -4718,12 +4718,27 @@ type UpsertReplicaParams struct {
 	DataProducerAppVersion    string
 	DataProducerContentDigest string
 	DataProducerFingerprint   string
+	// ReplaceDataProvenance replaces the complete attribution even when the
+	// generation is unknown (zero). Recovery uses this when projecting another
+	// consumer incarnation; ordinary status updates preserve existing data.
+	ReplaceDataProvenance bool
+	// ReplaceStartupPeakRSS clears a previous incarnation's measurement when
+	// projecting a recovered consumer whose startup peak is unknown (zero).
+	ReplaceStartupPeakRSS bool
 }
 
 // UpsertReplica inserts a new replica or updates an existing one identified by
 // (app_id, idx). All fields are replaced on conflict. DesiredState defaults to
 // "running" when the caller leaves it empty.
 func (s *Store) UpsertReplica(p UpsertReplicaParams) error {
+	replaceDataSQL := "excluded.data_generation > 0"
+	if p.ReplaceDataProvenance {
+		replaceDataSQL = "1 = 1"
+	}
+	replaceStartupPeakSQL := "excluded.startup_peak_rss_bytes > 0"
+	if p.ReplaceStartupPeakRSS {
+		replaceStartupPeakSQL = "1 = 1"
+	}
 	// Every real consumer boot loads whatever publication is currently on disk.
 	// Resolve its durable generation/source here so deploy retries, stopped-app
 	// starts, watchdog healing, and autoscale all stamp the same authoritative
@@ -4790,19 +4805,19 @@ func (s *Store) UpsertReplica(p UpsertReplicaParams) error {
 			exit_observed_at = CASE WHEN excluded.status = 'crashed' THEN excluded.exit_observed_at ELSE replicas.exit_observed_at END,
 			exit_oom_killed = CASE WHEN excluded.status = 'crashed' THEN excluded.exit_oom_killed ELSE replicas.exit_oom_killed END,
 			exit_run_id = CASE WHEN excluded.status = 'crashed' THEN excluded.exit_run_id ELSE replicas.exit_run_id END,
-			startup_peak_rss_bytes = CASE WHEN excluded.startup_peak_rss_bytes > 0
+			startup_peak_rss_bytes = CASE WHEN `+replaceStartupPeakSQL+`
 				THEN excluded.startup_peak_rss_bytes ELSE replicas.startup_peak_rss_bytes END,
-			data_generation = CASE WHEN excluded.data_generation > 0
+			data_generation = CASE WHEN `+replaceDataSQL+`
 				THEN excluded.data_generation ELSE replicas.data_generation END,
-			activation_id = CASE WHEN excluded.data_generation > 0
+			activation_id = CASE WHEN `+replaceDataSQL+`
 				THEN NULL ELSE replicas.activation_id END,
-			data_producer_deployment_id = CASE WHEN excluded.data_generation > 0
+			data_producer_deployment_id = CASE WHEN `+replaceDataSQL+`
 				THEN excluded.data_producer_deployment_id ELSE replicas.data_producer_deployment_id END,
-			data_producer_app_version = CASE WHEN excluded.data_generation > 0
+			data_producer_app_version = CASE WHEN `+replaceDataSQL+`
 				THEN excluded.data_producer_app_version ELSE replicas.data_producer_app_version END,
-			data_producer_content_digest = CASE WHEN excluded.data_generation > 0
+			data_producer_content_digest = CASE WHEN `+replaceDataSQL+`
 				THEN excluded.data_producer_content_digest ELSE replicas.data_producer_content_digest END,
-			data_producer_fingerprint = CASE WHEN excluded.data_generation > 0
+			data_producer_fingerprint = CASE WHEN `+replaceDataSQL+`
 				THEN excluded.data_producer_fingerprint ELSE replicas.data_producer_fingerprint END,
 			updated_at    = excluded.updated_at`,
 		p.AppID, p.Index, p.PID, p.Port, p.Status, p.Provider, p.Tier,
