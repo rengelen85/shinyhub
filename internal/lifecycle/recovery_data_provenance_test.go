@@ -323,3 +323,204 @@ func TestRecoveryPreservesLegacyProvenanceForSameNativeProcess(t *testing.T) {
 		t.Fatalf("same live native process lost known boot metadata: %+v", replicas[0])
 	}
 }
+
+func TestRecoveryRepairsMissingMatchingPublicationAttribution(t *testing.T) {
+	store := dbtest.New(t)
+	app := mustCreateApp(t, store, "missing-publication-attribution")
+	dep, err := store.BeginDeployment(app.ID, "v1", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PromoteDeployment(dep.ID); err != nil {
+		t.Fatal(err)
+	}
+	loaded := publishRecoveryData(t, store, app.ID, dep, `["loaded"]`)
+	if err = store.UpsertReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, Status: "running", Provider: "native", DeploymentID: &dep.ID, DataGeneration: loaded.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.UpsertDeploymentReplica(db.UpsertDeploymentReplicaParams{AppID: app.ID, DeploymentID: dep.ID, Index: 0, Status: "running", Provider: "native", DataGeneration: loaded.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := lifecycle.PrepareRecovery(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle.RecoverProcesses(store, process.NewManager(t.TempDir(), process.NewNativeRuntime()), proxy.New(), 0, false, "multiplex", nil, inputs)
+	replicas, err := store.ListReplicas(app.ID)
+	if err != nil || len(replicas) != 1 {
+		t.Fatalf("replicas=%v err=%v", replicas, err)
+	}
+	got := replicas[0]
+	if got.DataGeneration != loaded.Generation || got.DataProducerDeploymentID == nil || *got.DataProducerDeploymentID != *loaded.ProducerDeploymentID || got.DataProducerAppVersion != loaded.ProducerAppVersion || got.DataProducerContentDigest != loaded.ProducerContentDigest || got.DataProducerFingerprint != loaded.ProducerFingerprint {
+		t.Fatalf("matching durable publication attribution lost during recovery: %+v", got)
+	}
+}
+
+func TestRecoveryDoesNotTransferActivationOwnershipToCandidate(t *testing.T) {
+	store := dbtest.New(t)
+	app := mustCreateApp(t, store, "candidate-activation-owner")
+	old, err := store.BeginDeployment(app.ID, "old", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PromoteDeployment(old.ID); err != nil {
+		t.Fatal(err)
+	}
+	scheduleID, err := store.CreateSchedule(db.CreateScheduleParams{AppID: app.ID, Name: "refresh", CronExpr: "0 5 * * *", CommandJSON: `["produce"]`, Enabled: true, OnSuccess: "roll", RollFallback: "defer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := store.InsertScheduleRun(db.InsertScheduleRunParams{ScheduleID: scheduleID, Status: "running", StartedAt: time.Now().UTC(), Trigger: "manual", OnSuccess: "roll", RollFallback: "defer", DeploymentID: &old.ID, AppVersion: old.Version, PublishesData: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	activation, err := store.CompleteScheduleRunAndEnqueueActivation(db.CompleteScheduleRunParams{RunID: runID, Status: "succeeded", ExitCode: &zero, FinishedAt: time.Now().UTC()})
+	if err != nil || activation == nil {
+		t.Fatalf("activation=%v err=%v", activation, err)
+	}
+	if err = store.UpsertActivationReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, Status: "running", Provider: "native", DeploymentID: &old.ID}, activation.TargetGeneration, activation.ID); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := store.BeginDeployment(app.ID, "candidate", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.UpsertDeploymentReplica(db.UpsertDeploymentReplicaParams{AppID: app.ID, DeploymentID: candidate.ID, Index: 0, Status: "running", Provider: "native", DataGeneration: activation.TargetGeneration}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PromoteDeployment(candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := lifecycle.PrepareRecovery(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle.RecoverProcesses(store, process.NewManager(t.TempDir(), process.NewNativeRuntime()), proxy.New(), 0, false, "multiplex", nil, inputs)
+	replicas, err := store.ListReplicas(app.ID)
+	if err != nil || len(replicas) != 1 {
+		t.Fatalf("replicas=%v err=%v", replicas, err)
+	}
+	if replicas[0].ActivationID != nil || replicas[0].DataGeneration != activation.TargetGeneration {
+		t.Fatalf("candidate inherited another consumer's activation ownership: %+v", replicas[0])
+	}
+}
+
+func TestRecoveryCarriesHistoricalActivationSourceWithoutOwnership(t *testing.T) {
+	store := dbtest.New(t)
+	app := mustCreateApp(t, store, "candidate-historical-source")
+	old, err := store.BeginDeployment(app.ID, "old", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PromoteDeployment(old.ID); err != nil {
+		t.Fatal(err)
+	}
+	scheduleID, err := store.CreateSchedule(db.CreateScheduleParams{AppID: app.ID, Name: "refresh", CronExpr: "0 5 * * *", CommandJSON: `["produce"]`, Enabled: true, OnSuccess: "roll", RollFallback: "defer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := store.InsertScheduleRun(db.InsertScheduleRunParams{ScheduleID: scheduleID, Status: "running", StartedAt: time.Now().UTC(), Trigger: "manual", OnSuccess: "roll", RollFallback: "defer", DeploymentID: &old.ID, AppVersion: old.Version, ContentDigest: "sha256:loaded", ProducerFingerprint: "loaded-producer", PublishesData: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	activation, err := store.CompleteScheduleRunAndEnqueueActivation(db.CompleteScheduleRunParams{RunID: runID, Status: "succeeded", ExitCode: &zero, FinishedAt: time.Now().UTC()})
+	if err != nil || activation == nil {
+		t.Fatalf("activation=%v err=%v", activation, err)
+	}
+	if err = store.UpsertActivationReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, Status: "running", Provider: "native", DeploymentID: &old.ID}, activation.TargetGeneration, activation.ID); err != nil {
+		t.Fatal(err)
+	}
+	publishRecoveryData(t, store, app.ID, old, `["newer-publication"]`)
+	candidate, err := store.BeginDeployment(app.ID, "candidate", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.UpsertDeploymentReplica(db.UpsertDeploymentReplicaParams{AppID: app.ID, DeploymentID: candidate.ID, Index: 0, Status: "running", Provider: "native", DataGeneration: activation.TargetGeneration}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PromoteDeployment(candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := lifecycle.PrepareRecovery(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle.RecoverProcesses(store, process.NewManager(t.TempDir(), process.NewNativeRuntime()), proxy.New(), 0, false, "multiplex", nil, inputs)
+	replicas, err := store.ListReplicas(app.ID)
+	if err != nil || len(replicas) != 1 {
+		t.Fatalf("replicas=%v err=%v", replicas, err)
+	}
+	if replicas[0].ActivationID != nil || replicas[0].DataGeneration != activation.TargetGeneration || replicas[0].DataProducerFingerprint != "loaded-producer" || replicas[0].DataProducerContentDigest != "sha256:loaded" || replicas[0].DataProducerDeploymentID == nil || *replicas[0].DataProducerDeploymentID != old.ID || replicas[0].DataProducerAppVersion != old.Version {
+		t.Fatalf("candidate inherited another consumer's activation ownership: %+v", replicas[0])
+	}
+}
+
+func TestRecoveryPreservesActivationOwnershipForSurvivingConsumer(t *testing.T) {
+	store := dbtest.New(t)
+	app := mustCreateApp(t, store, "surviving-activation-owner")
+	old, err := store.BeginDeployment(app.ID, "old", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PromoteDeployment(old.ID); err != nil {
+		t.Fatal(err)
+	}
+	scheduleID, err := store.CreateSchedule(db.CreateScheduleParams{AppID: app.ID, Name: "refresh", CronExpr: "0 5 * * *", CommandJSON: `["produce"]`, Enabled: true, OnSuccess: "roll", RollFallback: "defer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := store.InsertScheduleRun(db.InsertScheduleRunParams{ScheduleID: scheduleID, Status: "running", StartedAt: time.Now().UTC(), Trigger: "manual", OnSuccess: "roll", RollFallback: "defer", DeploymentID: &old.ID, AppVersion: old.Version, PublishesData: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	activation, err := store.CompleteScheduleRunAndEnqueueActivation(db.CompleteScheduleRunParams{RunID: runID, Status: "succeeded", ExitCode: &zero, FinishedAt: time.Now().UTC()})
+	if err != nil || activation == nil {
+		t.Fatalf("activation=%v err=%v", activation, err)
+	}
+	pid, _ := startNativeProcess(t, old.BundleDir)
+	port := liveListener(t)
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d", port)
+	if err = store.UpsertActivationReplica(db.UpsertReplicaParams{AppID: app.ID, Index: 0, PID: &pid, Port: &port, EndpointURL: endpoint, Status: "running", Provider: "native", DeploymentID: &old.ID}, activation.TargetGeneration, activation.ID); err != nil {
+		t.Fatal(err)
+	}
+	candidate := old
+	if err = store.UpsertDeploymentReplica(db.UpsertDeploymentReplicaParams{AppID: app.ID, DeploymentID: candidate.ID, Index: 0, PID: &pid, Port: &port, EndpointURL: endpoint, Status: "running", Provider: "native", DataGeneration: activation.TargetGeneration}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PromoteDeployment(candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.UpdateAppStatus(db.UpdateAppStatusParams{Slug: app.Slug, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := lifecycle.PrepareRecovery(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr := process.NewManager(t.TempDir(), process.NewNativeRuntime())
+	t.Cleanup(func() {
+		if err := mgr.Stop(app.Slug); err != nil {
+			t.Errorf("stop recovered process: %v", err)
+		}
+	})
+	lifecycle.RecoverProcesses(store, mgr, proxy.New(), 0, false, "multiplex", nil, inputs)
+	replicas, err := store.ListReplicas(app.ID)
+	if err != nil || len(replicas) != 1 {
+		t.Fatalf("replicas=%v err=%v", replicas, err)
+	}
+	if replicas[0].ActivationID == nil || *replicas[0].ActivationID != activation.ID || replicas[0].DataGeneration != activation.TargetGeneration || replicas[0].Status != "running" {
+		t.Fatalf("surviving consumer lost its activation ownership: %+v", replicas[0])
+	}
+}

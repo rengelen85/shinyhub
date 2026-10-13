@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **recovery**: repair missing producer attribution from the matching publication, keep activation ownership with the original consumer, and preserve historical producer details when recovering a replacement consumer that loaded the same data.
 - **routing**: retain existing healthy consumers while scheduled producers run, and remove superseded endpoints when replacement readiness or worker transport fails without discarding concurrent replacement routes.
 - **recovery**: preserve a surviving consumer's original data generation and producer attribution instead of treating adoption as a fresh boot. Rebuild missing projections from recorded boot generations, retain candidate startup memory measurements, and clear metadata inherited from a different runtime incarnation.
 - **recovery**: exclude compatibility-quarantined consumers from startup and clustered routing, recheck quarantine after readiness probes, and clean up failed or operator-stopped apps without a producer recovery marker. Invalidate draining consumers while retaining runtime identity until shutdown is confirmed.

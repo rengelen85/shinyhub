@@ -695,10 +695,19 @@ func reconcileDeploymentGenerationProjection(store *db.Store, app *db.App) bool 
 		pid, port, deploymentID := replica.PID, replica.Port, replica.DeploymentID
 		generation := replica.DataGeneration
 		existing := byIndex[replica.Index]
+		matchingPublication := publication != nil && publication.Generation == generation
+		// A generation-only legacy row can be repaired from the exact
+		// publication. Keep activation ownership intact when it is recorded.
+		repairAttribution := matchingPublication && existing != nil && existing.ActivationID == nil &&
+			(derefInt64(existing.DataProducerDeploymentID) != derefInt64(publication.ProducerDeploymentID) ||
+				existing.DataProducerAppVersion != publication.ProducerAppVersion ||
+				existing.DataProducerContentDigest != publication.ProducerContentDigest ||
+				existing.DataProducerFingerprint != publication.ProducerFingerprint)
 		// Adoption does not reload data. The ledger records the generation
 		// loaded at boot; retain existing source/activation attribution when
 		// it already describes that generation.
-		if existing != nil && generation > 0 && existing.DataGeneration == generation {
+		if existing != nil && generation > 0 && existing.DataGeneration == generation && !repairAttribution &&
+			(existing.ActivationID == nil || sameRecoveredConsumer(existing, replica)) {
 			generation = 0 // A status-only upsert preserves the existing provenance.
 		}
 		params := db.UpsertReplicaParams{
@@ -710,6 +719,28 @@ func reconcileDeploymentGenerationProjection(store *db.Store, app *db.App) bool 
 			ReplaceDataProvenance: replica.DataGeneration == 0 && !sameRecoveredConsumer(existing, replica),
 			ReplaceStartupPeakRSS: !sameRecoveredConsumer(existing, replica),
 			StartupPeakRSSBytes:   replica.StartupPeakRSSBytes,
+		}
+		// Producer attribution belongs to the data generation; activation
+		// ownership belongs to the consumer incarnation. Carry historical
+		// source details across a cutover without transferring that ownership.
+		if generation > 0 && existing != nil && existing.DataGeneration == generation {
+			params.DataProducerDeploymentID = existing.DataProducerDeploymentID
+			params.DataProducerAppVersion = existing.DataProducerAppVersion
+			params.DataProducerContentDigest = existing.DataProducerContentDigest
+			params.DataProducerFingerprint = existing.DataProducerFingerprint
+			if existing.ActivationID != nil {
+				activation, err := store.GetScheduleActivation(*existing.ActivationID)
+				if err != nil && !errors.Is(err, db.ErrNotFound) {
+					slog.Error("generation recovery: load historical data attribution", "slug", app.Slug, "err", err)
+					return false
+				}
+				if activation != nil && activation.AppID != nil && *activation.AppID == app.ID && activation.TargetGeneration == generation {
+					params.DataProducerDeploymentID = activation.SourceDeploymentID
+					params.DataProducerAppVersion = activation.SourceAppVersion
+					params.DataProducerContentDigest = activation.SourceContentDigest
+					params.DataProducerFingerprint = activation.SourceProducerFingerprint
+				}
+			}
 		}
 		// The current publication supplies source attribution only when its
 		// token matches the consumer's boot snapshot. A newer publication is
