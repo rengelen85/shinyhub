@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.20.7](https://github.com/rvben/shinyhub/compare/v0.20.6...v0.20.7) - 2026-10-13
+
 ### Fixed
 
 - **schedules**: restore the app's lifecycle state after all failed producers are repaired, and replace quarantined consumers across multiplex, grouped, and per-session worker isolation. Operator stops and deletion take precedence. Recovery intent survives hub restarts; failures recorded by older versions still need one manual `shinyhub apps start` after repair.
