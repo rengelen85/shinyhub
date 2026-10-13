@@ -167,20 +167,32 @@ func List(dataDir string, maxEntries int) ([]FileInfo, error) {
 // removed is the one that can be read back, so a caller gets ErrFileNotFound
 // for a missing path, ErrNotAFile for a directory or other non-regular entry,
 // and ErrInvalidPath (via SanitizeRelPath and SafeJoin) for traversal attempts,
-// reserved prefixes and symlinked components. Nothing here follows a symlink:
-// SafeJoin rejects one anywhere in the path, and the reopened handle is
-// re-stated so a regular file cannot be swapped for a device or a FIFO between
-// the check and the open.
+// reserved prefixes and pre-existing symlinked components. The open is rooted
+// in dataDir so a concurrent symlink swap cannot redirect a download outside
+// that directory. The opened descriptor is checked to serve only regular files.
 func Open(dataDir, rel string) (*os.File, os.FileInfo, error) {
 	clean, err := SanitizeRelPath(rel)
 	if err != nil {
 		return nil, nil, err
 	}
-	target, err := SafeJoin(dataDir, clean)
+	root, err := os.OpenRoot(dataDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, ErrFileNotFound
+		}
 		return nil, nil, err
 	}
-	f, err := os.Open(target)
+	defer root.Close()
+
+	// Preserve rejection of pre-existing symlinks, including links to files
+	// inside the data directory. This check alone is not a containment guard:
+	// an app can replace a checked segment before the subsequent open.
+	if _, err := SafeJoin(dataDir, clean); err != nil {
+		return nil, nil, err
+	}
+	// Open relative to the held directory descriptor. Root.Open prevents both
+	// symlink and directory-rename races from escaping the app-data directory.
+	f, err := root.Open(clean)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil, ErrFileNotFound
