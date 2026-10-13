@@ -1272,9 +1272,14 @@ func (s *Store) AppElasticOrphanRisk(appID int64) (bool, error) {
 // statuses also keeps the deploying page on clustered standbys, which never
 // hold the lock; their stopped/crashed windows degrade to the previous pages.
 func (a *App) MissStatus(deployInFlight bool) (status, reason string) {
+	// Starting a corrective deployment does not repair incompatible data.
+	// Preserve this fence until successful producer/deployment completion.
+	if a.Status == "failed" {
+		return a.Status, a.LastError
+	}
 	if a.LastDeploymentStatus == DeploymentPending {
 		switch a.Status {
-		case "stopped", "crashed", "failed":
+		case "stopped", "crashed":
 			if deployInFlight {
 				return "deploying", ""
 			}

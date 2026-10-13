@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **proxy**: reject new traffic to failed apps even while their backends survive cleanup, override stale readiness success, and retain the failure fence until a corrective deployment actually succeeds.
 - **recovery**: restore previously serving apps with missing replica rows instead of leaving them stopped, preserve app state on replica lookup errors, and retain replacement routes when a retired generation reused the same endpoint.
 - **recovery**: repair missing producer attribution from the matching publication, keep activation ownership with the original consumer, and preserve historical producer details when recovering a replacement consumer that loaded the same data.
 - **recovery**: include native listener ports when matching runtime incarnations, preventing a different listener from inheriting stale data provenance and startup measurements.

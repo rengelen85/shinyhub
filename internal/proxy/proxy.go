@@ -1454,9 +1454,11 @@ func renderUnknownAppPage(home string) string {
 }
 
 // SetAppStatusLookup registers a callback that reports an app's lifecycle status
-// and (for a crashed app) its failure reason. It lets a no-backend miss for a
-// crashed/stopped app render a clear status page instead of the loading spinner.
-// Called once at startup; leaving it unset preserves the loading-page behaviour.
+// and (for a crashed app) its failure reason. Failed status fences new traffic
+// and readiness even while a backend survives; misses for crashed/stopped apps
+// render a clear status page. The callback runs outside the route lock and must
+// retain failed status during corrective deployments. Leaving it unset preserves
+// the loading-page behaviour.
 func (p *Proxy) SetAppStatusLookup(fn func(slug string) (status, reason string)) {
 	p.mu.Lock()
 	p.appStatusFn = fn
@@ -3367,6 +3369,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// are about to forward to.
 	renderWaited := false
 routeLookup:
+	// A failed producer invalidates consumers before asynchronous cleanup
+	// removes their routes. A surviving endpoint is not permission to serve
+	// incompatible data, including while its confirmed stop is being retried.
+	if fn := p.getAppStatusLookup(); fn != nil {
+		if status, _ := fn(slug); status == "failed" {
+			p.serveMissPage(rec, r, slug, nil)
+			return
+		}
+	}
 	p.mu.RLock()
 	pool := p.pools[slug]
 	trigger := p.wakeTrigger
@@ -3854,6 +3865,13 @@ func (p *Proxy) serveReadyProbe(w http.ResponseWriter, r *http.Request, slug str
 		ready = (*fn)(slug)
 	} else {
 		ready = p.IsWSReady(slug)
+	}
+	if ready {
+		if fn := p.getAppStatusLookup(); fn != nil {
+			if status, _ := fn(slug); status == "failed" {
+				ready = false
+			}
+		}
 	}
 	// The unknown-vs-cold-start distinction only matters when we're about to
 	// answer "not ready": a ready slug is known by definition (a replica has

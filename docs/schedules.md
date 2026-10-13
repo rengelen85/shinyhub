@@ -138,8 +138,12 @@ Quarantine also applies while a designated producer is still writing, and after
 an interrupted or failed deployment crossed its producer barrier. A later
 successful corrective deploy repairs the deployment barrier; schedule write
 uncertainty is tracked independently for each producer. One successful deploy
-therefore does not promise to clear every cause. Existing sessions can keep
-serving while new consumer starts are blocked. `apps list` marks the app as
+therefore does not promise to clear every cause. During a healthy producer run,
+existing sessions can keep serving while new consumer starts are blocked. If a
+failed write moves the app to `failed`, new HTTP requests and WebSocket upgrades
+receive 503 and `.shinyhub/ready` reports false, even if a consumer survives
+cleanup. Starting a corrective deployment retains this fence until repair
+succeeds. `apps list` marks the app as
 quarantined while preserving its serving status. `apps show` names producers
 requiring repair, including disabled schedules, and running data producers;
 `plan` warns about quarantine and names the required producer reruns.
