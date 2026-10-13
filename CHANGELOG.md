@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **recovery**: target the recorded Docker container during consumer cleanup, and preserve replacement replica identities written while an older consumer is stopping.
+
 - **recovery**: adopt healthy remote replicas owned by unfinished schedule rolls, ignore terminated inventory tasks when locating a live replacement, and retain ownership when multiple live tasks claim the same slot instead of adopting or stopping an arbitrary task.
 
 - **recovery**: retain remote consumers' deployment ownership, including ECS tasks awaiting an IP, and avoid treating worker registry read errors as confirmed loss that permits duplicate placement.

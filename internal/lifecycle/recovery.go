@@ -1964,6 +1964,11 @@ func stopQuarantinedReplica(store *db.Store, mgr *process.Manager, app *db.App, 
 				return false
 			}
 			for _, container := range containers {
+				// Labels identify a slot, but a restart may reuse them for another
+				// incarnation. Stop only the durable container identity when known.
+				if r.WorkerID != "" && container.ID != r.WorkerID {
+					continue
+				}
 				if container.Labels[process.LabelSlug] != app.Slug {
 					continue
 				}
@@ -2005,7 +2010,10 @@ func stopQuarantinedReplica(store *db.Store, mgr *process.Manager, app *db.App, 
 			return false
 		}
 	}
-	if err := store.ClearReplicaRuntimeIdentity(app.ID, r.Index); err != nil && !errors.Is(err, db.ErrNotFound) {
+	if _, err := store.ClearReplicaRuntimeIdentityIfCurrent(app.ID, r.Index, db.ReplicaRuntimeIdentity{
+		PID: derefInt(r.PID), Port: derefInt(r.Port), EndpointURL: r.EndpointURL,
+		WorkerID: r.WorkerID, DeploymentID: derefInt64(r.DeploymentID),
+	}); err != nil {
 		slog.Warn("producer quarantine: clear stopped consumer identity", "slug", app.Slug, "index", r.Index, "err", err)
 		return false
 	}

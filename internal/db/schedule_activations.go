@@ -928,6 +928,26 @@ func (s *Store) ClearReplicaRuntimeIdentity(appID int64, index int) error {
 	return nil
 }
 
+// ClearReplicaRuntimeIdentityIfCurrent records a confirmed stop only while the
+// slot still belongs to the runtime that was stopped. A replacement may reuse
+// the slot while external shutdown is in progress; its identity must survive.
+// A false result means the row has moved on or has been removed.
+func (s *Store) ClearReplicaRuntimeIdentityIfCurrent(appID int64, index int, expect ReplicaRuntimeIdentity) (bool, error) {
+	res, err := s.db.Exec(`UPDATE replicas SET pid = NULL, port = NULL, status = 'stopped',
+		endpoint_url = '', worker_id = '', updated_at = `+s.d.nowEpoch()+`
+		WHERE app_id = ? AND idx = ? AND COALESCE(pid, 0) = ?
+		AND COALESCE(port, 0) = ? AND endpoint_url = ? AND worker_id = ?
+		AND COALESCE(deployment_id, 0) = ?`, appID, index, expect.PID, expect.Port, expect.EndpointURL, expect.WorkerID, expect.DeploymentID)
+	if err != nil {
+		return false, fmt.Errorf("clear current replica runtime identity: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("clear current replica runtime identity: %w", err)
+	}
+	return n > 0, nil
+}
+
 // InvalidateReplicaSnapshot makes an old suspended process image impossible to
 // resume while preserving its existing intent ("warm" for a shrunken slot,
 // "stopped" for a fully hibernated app). The next wake therefore cold-boots.
