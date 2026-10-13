@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var errScheduleActivationInFlight = errors.New("scheduled data activation owns serving runtime state")
@@ -49,6 +50,21 @@ func (s *Server) guardCompatibilityQuarantine(appID int64, operation string) err
 		return fmt.Errorf("%s: check compatibility quarantine: %w", operation, err)
 	}
 	if quarantined {
+		producers, err := s.store.ProducerCompatibilityForApps([]int64{appID})
+		if err != nil {
+			return fmt.Errorf("%s: inspect producer repair state: %w", operation, err)
+		}
+		app, err := s.store.GetAppByID(appID)
+		if err != nil {
+			return err
+		}
+		var commands []string
+		for _, name := range producers[appID].RepairProducers {
+			commands = append(commands, fmt.Sprintf("shinyhub schedule run %s %s --follow", app.Slug, name))
+		}
+		if len(commands) > 0 {
+			return fmt.Errorf("%s: %w; repair producers with %s before starting consumers", operation, errCompatibilityQuarantined, strings.Join(commands, "; "))
+		}
 		return fmt.Errorf("%s: %w; rerun every failed data producer successfully, or deploy a replacement producer policy that repairs the data, before starting consumers", operation, errCompatibilityQuarantined)
 	}
 	return nil

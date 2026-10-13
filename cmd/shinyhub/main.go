@@ -3263,6 +3263,11 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		}
 		if cfg.Server.ReloadSessions == "preserve" {
 			var blockers []string
+			jobBlockers, err := jobsMgr.ReloadBlockers()
+			if err != nil {
+				return err
+			}
+			blockers = append(blockers, jobBlockers...)
 			temporary := true
 			if live >= cfg.Server.ReloadRelayLimit {
 				blockers = append(blockers, "reload relay limit reached; wait for retained sessions to finish")
@@ -3308,9 +3313,14 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		return upgrade.CheckRelaySuccessor(probeCtx)
 	}
 	upg.(*upgrade.RepeatableUpgrader).SetUpgradeGuard(func() (func(), error) {
+		resumeJobs := func() {}
+		if cfg.Server.ReloadSessions == "preserve" {
+			resumeJobs = jobsMgr.PauseAdmissions()
+		}
 		// Observe known blockers without fencing the fleet on every wait tick.
 		// Recheck after pausing to close the admission race before probing.
 		if err := checkRelayUpgrade(false); err != nil {
+			resumeJobs()
 			return nil, err
 		}
 		if cfg.Server.ReloadSessions != "preserve" {
@@ -3321,27 +3331,35 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		}
 		release, ok := srv.TryPauseAppOperations()
 		if !ok {
+			resumeJobs()
 			return nil, &upgrade.TransitionError{Reason: "session-preserving reload waits for admitted app operations"}
 		}
 		if err := checkRelayUpgrade(true); err != nil {
 			release()
+			resumeJobs()
 			return nil, err
 		}
-		return release, nil
+		return func() { release(); resumeJobs() }, nil
 	})
 	if cfg.Server.ReloadSessions == "preserve" {
 		upgradeSignals.SetReloadWaitHook(func() func(bool) {
 			resume := activationCoordinator.Pause()
+			resumeJobs := jobsMgr.PauseAdmissions()
 			return func(succeeded bool) {
 				if !succeeded {
 					resume()
+					resumeJobs()
 				}
 			}
 		})
 	}
 	var reloadStartupReady atomic.Bool
 	reloadReady := reloadReadyPredicate(isClustered(cfg), prx, reloadStartupReady.Load, elector.IsOwner, ownerAndReady, srv.AppOperationsPaused)
-	stopReloadControl, err := upgrade.StartReloadControl(ctx, cfg.Server.PIDFile, cfg.Server.UpgradeTimeout, upg, upgradeSignals, reloadReady, logger)
+	var servingChecks []upgrade.ReloadServingCheck
+	if cfg.Server.ReloadSessions == "preserve" && !isClustered(cfg) {
+		servingChecks = append(servingChecks, reloadServingCheck(store, mgr, prx))
+	}
+	stopReloadControl, err := upgrade.StartReloadControl(ctx, cfg.Server.PIDFile, cfg.Server.UpgradeTimeout, upg, upgradeSignals, reloadReady, logger, servingChecks...)
 	if err != nil {
 		// An optional acknowledgement endpoint must not turn a compatible cold
 		// start into an outage. Signals still work; the command fails clearly.

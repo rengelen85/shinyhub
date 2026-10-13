@@ -91,6 +91,72 @@ func TestAcknowledgedReloadRefusalAndSuccess(t *testing.T) {
 	}
 }
 
+func TestAcknowledgedReloadCarriesServingAppsAndRefusesFalseSuccess(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sh-reload-apps-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	pidFile := filepath.Join(dir, "pid")
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprint(os.Getpid())), 0600); err != nil {
+		t.Fatal(err)
+	}
+	apps := []ReloadApp{{ID: 42, Slug: "rolled-app", MinimumReady: 1}}
+	upg := &reloadTestUpgrader{fakeUpgrader: newFakeUpgrader(), run: func() error {
+		return os.WriteFile(pidFile, []byte(fmt.Sprint(os.Getpid()+1)), 0600)
+	}}
+	stop, err := StartReloadControl(context.Background(), pidFile, time.Second, upg, &SignalState{}, func() bool { return true }, quietLogger(), ReloadServingCheck{Snapshot: func() ([]ReloadApp, error) { return apps, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	successor, err := net.Listen("unix", reloadSocket(pidFile, os.Getpid()+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer successor.Close()
+	var validProbes atomic.Int32
+	go func() {
+		for {
+			conn, err := successor.Accept()
+			if err != nil {
+				return
+			}
+			var request reloadRequest
+			_ = json.NewDecoder(conn).Decode(&request)
+			if len(request.Apps) == 1 && request.Apps[0] == apps[0] {
+				validProbes.Add(1)
+			}
+			_ = json.NewEncoder(conn).Encode(ReloadResult{PID: os.Getpid() + 1, Ready: false, NotReadyReason: "rolled-app: 0 ready replicas after reload, need 1"})
+			conn.Close()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
+	result, err := RequestReload(ctx, pidFile, 0, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "rolled-app") || result.Ready || validProbes.Load() == 0 {
+		t.Fatalf("false success: result=%+v err=%v probes=%d", result, err, validProbes.Load())
+	}
+}
+
+func TestReloadControlChecksServingAppsAfterControlPlaneReady(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sh-reload-check-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	pidFile := filepath.Join(dir, "pid")
+	stop, err := StartReloadControl(context.Background(), pidFile, time.Second, newFakeUpgrader(), &SignalState{}, func() bool { return true }, quietLogger(), ReloadServingCheck{Check: func(apps []ReloadApp) string { return apps[0].Slug + ": no ready replica" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	result, err := exchangeReload(context.Background(), reloadSocket(pidFile, os.Getpid()), reloadRequest{Version: 1, Check: true, Apps: []ReloadApp{{ID: 42, Slug: "rolled-app", MinimumReady: 1}}})
+	if err != nil || result.Ready || !strings.Contains(result.NotReadyReason, "rolled-app") {
+		t.Fatalf("serving readiness = %+v, %v", result, err)
+	}
+}
+
 func TestReloadWaitRetriesOnlyTransitionsAndReportsTimeout(t *testing.T) {
 	var calls atomic.Int32
 	u := &reloadTestUpgrader{fakeUpgrader: newFakeUpgrader(), run: func() error {

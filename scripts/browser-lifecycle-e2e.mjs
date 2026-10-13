@@ -16,7 +16,9 @@ import { checkBrowserScaling } from './browser-scaling-checks.mjs';
 import { checkBrowserSettings } from './browser-settings-checks.mjs';
 import { checkSessionRelays } from './browser-session-relay-checks.mjs';
 import { checkBookmarkContinuity } from './browser-bookmark-continuity-checks.mjs';
-const relayMode = process.env.SHINYHUB_E2E_SESSION_RELAYS === '1';
+import { checkReloadProducers } from './browser-reload-producer-checks.mjs';
+const producerReloadMode = process.env.SHINYHUB_E2E_RELOAD_PRODUCERS === '1';
+const relayMode = producerReloadMode || process.env.SHINYHUB_E2E_SESSION_RELAYS === '1';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(new URL('../loadtest/render/driver/package.json', import.meta.url));
@@ -136,7 +138,7 @@ try {
   await new Promise(resolve => reservation.close(resolve));
   const host = `http://127.0.0.1:${port}`;
   await writeFile(passwordFile, password, { mode: 0o600 });
-  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: ${relayMode ? 16 : 4}\n  drain_timeout: 5s\n${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
+  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: ${relayMode ? 16 : 4}\n  drain_timeout: ${producerReloadMode ? '20s' : '5s'}\n${producerReloadMode ? '  reload_drain_timeout: 2s\n  upgrade_timeout: 5s\n' : ''}${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
   await command([binary, 'init', '--config', config, '--admin-user', username, '--admin-password-file', passwordFile], 'init', { cwd: state });
   const log = createWriteStream(join(work, 'server.log'), { mode: 0o600 });
   server = spawn(binary, ['serve', '--config', config, '--no-browser'], { cwd: state, env, detached: true });
@@ -234,7 +236,13 @@ try {
     await page.getByRole('button', { name: 'Recalculate' }).click();
     await output(page, 'v1', 2, 500, original);
   });
-  if (relayMode) {
+  if (producerReloadMode) {
+    await checkReloadProducers({ context, page, appURL, state, work, binary, config, python,
+      command, api, request, check, poll, output, sockets, report });
+    assert.deepEqual(report.browserErrors, [], 'no browser script errors');
+    report.status = 'passed';
+    console.log('BROWSER RELOAD PRODUCER E2E PASS');
+  } else if (relayMode) {
     await checkSessionRelays({ context, page, original, appURL, host, state, app, work,
       binary, config, command, api, request, deploy, check, poll, output, assertDisconnected, sockets, viewerID: viewerRecord.id, viewer });
     await checkBookmarkContinuity({ root, state, binary, clientConfig, host, token, env, command, context, check, poll, report });

@@ -18,6 +18,7 @@ import (
 	"github.com/rvben/shinyhub/internal/auth"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/deploy"
+	"github.com/rvben/shinyhub/internal/jobs"
 	"github.com/rvben/shinyhub/internal/lifecycle/scheduler"
 	"github.com/rvben/shinyhub/internal/process"
 	"github.com/rvben/shinyhub/internal/safego"
@@ -943,6 +944,11 @@ func (s *Server) handleRunSchedule(w http.ResponseWriter, r *http.Request) {
 	// the run finishing but does surface admission failures to the caller.
 	runID, err := s.jobs.Run(id, scheduler.TriggerManual, uid)
 	if err != nil {
+		if errors.Is(err, jobs.ErrManagerStopped) {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusServiceUnavailable, "schedule admissions are temporarily unavailable; retry after reload or ownership handoff completes")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to start run: "+err.Error())
 		return
 	}

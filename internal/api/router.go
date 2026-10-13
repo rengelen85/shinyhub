@@ -630,8 +630,12 @@ func (s *Server) SetJobs(j *jobs.Manager, sc *scheduler.Scheduler) {
 	s.scheduler = sc
 	if j != nil {
 		j.SetUnsafePublicationHandler(func(appID int64, slug, status string) {
+			slog.Warn("producer write did not complete; stopping consumers and quarantining app",
+				"app_id", appID, "slug", slug, "run_status", status)
 			if s.manager != nil {
-				_ = s.manager.Stop(slug)
+				if err := s.manager.Stop(slug); err != nil {
+					slog.Error("stop consumers after uncertain producer write", "slug", slug, "err", err)
+				}
 			}
 			if s.proxy != nil {
 				s.proxy.Deregister(slug)

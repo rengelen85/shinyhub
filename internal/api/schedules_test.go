@@ -1534,6 +1534,37 @@ func newScheduleE2EServerWithJobs(t *testing.T) (*api.Server, *db.Store, string)
 	return srv, store, token
 }
 
+func TestScheduleRunDuringReloadPauseReturnsRetryableUnavailable(t *testing.T) {
+	srv, store, token, jm := buildScheduleE2EServer(t)
+	srv.SetJobs(jm, nil)
+	_, err := store.CreateApp(db.CreateAppParams{Slug: "reload-paused", Name: "Reload paused", OwnerID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := store.GetAppBySlug("reload-paused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := store.CreateSchedule(db.CreateScheduleParams{
+		AppID: app.ID, Name: "refresh", CronExpr: "0 2 * * *", CommandJSON: `["true"]`,
+		TimeoutSeconds: 30, OverlapPolicy: "skip", MissedPolicy: "skip", DeployTrigger: "never", OnSuccess: "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resume := jm.PauseAdmissions()
+	defer resume()
+	req := authedRequest(t, "POST", fmt.Sprintf("/api/apps/reload-paused/schedules/%d/run", id), nil, token)
+	rec := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
+		t.Fatalf("paused schedule should be retryable: status=%d headers=%v body=%s", rec.Code, rec.Header(), rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "retry after reload") {
+		t.Fatalf("missing pause explanation: %s", rec.Body.String())
+	}
+}
+
 func TestScheduleConvergenceRetry_RunsOnlyFailedCurrentObligation(t *testing.T) {
 	srv, store, token := newScheduleE2EServerWithJobs(t)
 	if _, err := store.CreateApp(db.CreateAppParams{Slug: "retry-app", Name: "retry-app", OwnerID: 1, Access: "private"}); err != nil {

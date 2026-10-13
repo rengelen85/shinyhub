@@ -21,13 +21,29 @@ type reloadRequest struct {
 	Version int           `json:"version"`
 	Wait    time.Duration `json:"wait"`
 	Check   bool          `json:"check,omitempty"`
+	Apps    []ReloadApp   `json:"apps,omitempty"`
+}
+
+// ReloadApp records a serving obligation from the retiring process. The
+// successor must satisfy it before an acknowledged reload reports success.
+type ReloadApp struct {
+	ID           int64  `json:"id"`
+	Slug         string `json:"slug"`
+	MinimumReady int    `json:"minimum_ready"`
+}
+
+type ReloadServingCheck struct {
+	Snapshot func() ([]ReloadApp, error)
+	Check    func([]ReloadApp) string
 }
 
 type ReloadResult struct {
-	PreviousPID int    `json:"previous_pid"`
-	PID         int    `json:"pid"`
-	Error       string `json:"error,omitempty"`
-	Ready       bool   `json:"ready,omitempty"`
+	PreviousPID    int         `json:"previous_pid"`
+	PID            int         `json:"pid"`
+	Error          string      `json:"error,omitempty"`
+	Ready          bool        `json:"ready,omitempty"`
+	Apps           []ReloadApp `json:"apps,omitempty"`
+	NotReadyReason string      `json:"not_ready_reason,omitempty"`
 }
 
 func reloadSocket(pidFile string, pid int) string {
@@ -50,7 +66,7 @@ func readPID(pidFile string) (int, error) {
 // StartReloadControl exposes an acknowledged reload only to users with access
 // to the server's private runtime directory. Each process has its own socket,
 // so a retiring process cannot unlink its successor's control endpoint.
-func StartReloadControl(ctx context.Context, pidFile string, upgradeTimeout time.Duration, upg Upgrader, state *SignalState, ready func() bool, log *slog.Logger) (func(), error) {
+func StartReloadControl(ctx context.Context, pidFile string, upgradeTimeout time.Duration, upg Upgrader, state *SignalState, ready func() bool, log *slog.Logger, serving ...ReloadServingCheck) (func(), error) {
 	if pidFile == "" {
 		return func() {}, nil
 	}
@@ -110,14 +126,32 @@ func StartReloadControl(ctx context.Context, pidFile string, upgradeTimeout time
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 				var request reloadRequest
 				result := ReloadResult{PreviousPID: os.Getpid()}
-				if err := json.NewDecoder(io.LimitReader(conn, 1024)).Decode(&request); err != nil {
+				if err := json.NewDecoder(io.LimitReader(conn, 64*1024)).Decode(&request); err != nil {
 					result.Error = "invalid reload request"
 				} else if request.Version != 1 || request.Wait < 0 || request.Wait > 24*time.Hour {
 					result.Error = "unsupported reload request or wait outside 0..24h"
 				} else if request.Check {
 					result.PID = os.Getpid()
 					result.Ready = ready()
+					if result.Ready && len(request.Apps) > 0 {
+						if len(serving) == 0 || serving[0].Check == nil {
+							result.Error = "successor cannot verify serving app readiness"
+							result.Ready = false
+						} else {
+							result.NotReadyReason = serving[0].Check(request.Apps)
+							result.Ready = result.NotReadyReason == ""
+						}
+					}
 				} else {
+					if len(serving) > 0 && serving[0].Snapshot != nil {
+						apps, snapshotErr := serving[0].Snapshot()
+						if snapshotErr != nil {
+							result.Error = "capture serving apps before reload: " + snapshotErr.Error()
+							_ = json.NewEncoder(conn).Encode(result)
+							return
+						}
+						result.Apps = apps
+					}
 					_ = conn.SetDeadline(time.Now().Add(request.Wait + upgradeTimeout + 10*time.Second))
 					// Cancel a waiting request when its caller disconnects. The
 					// accepted handoff itself retains the upgrader's own timeout.
@@ -188,10 +222,11 @@ func RequestReload(ctx context.Context, pidFile string, wait, upgradeTimeout tim
 	// mutations. Time spent waiting for transitions must not consume this budget.
 	ctx, readinessCancel := context.WithTimeout(ctx, upgradeTimeout+time.Minute)
 	defer readinessCancel()
+	notReadyReason := "control-plane recovery in progress"
 	for {
-		probe, err := exchangeReload(ctx, reloadSocket(pidFile, result.PID), reloadRequest{Version: 1, Check: true})
+		probe, err := exchangeReload(ctx, reloadSocket(pidFile, result.PID), reloadRequest{Version: 1, Check: true, Apps: result.Apps})
 		if err != nil {
-			return result, fmt.Errorf("handoff accepted, but successor readiness could not be verified; check the live PID before retrying: %w", err)
+			return result, fmt.Errorf("handoff accepted, but successor readiness could not be verified (%s); check the live PID before retrying: %w", notReadyReason, err)
 		}
 		if probe.Error != "" {
 			return result, errors.New(probe.Error)
@@ -210,11 +245,14 @@ func RequestReload(ctx context.Context, pidFile string, wait, upgradeTimeout tim
 			result.Ready = true
 			return result, nil
 		}
+		if probe.NotReadyReason != "" {
+			notReadyReason = probe.NotReadyReason
+		}
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return result, fmt.Errorf("successor %d did not become ready: %w", result.PID, ctx.Err())
+			return result, fmt.Errorf("successor %d did not become ready (%s): %w", result.PID, notReadyReason, ctx.Err())
 		case <-timer.C:
 		}
 	}
@@ -235,6 +273,6 @@ func exchangeReload(ctx context.Context, path string, request reloadRequest) (Re
 		return ReloadResult{}, err
 	}
 	var result ReloadResult
-	err = json.NewDecoder(io.LimitReader(conn, 16*1024)).Decode(&result)
+	err = json.NewDecoder(io.LimitReader(conn, 64*1024)).Decode(&result)
 	return result, err
 }

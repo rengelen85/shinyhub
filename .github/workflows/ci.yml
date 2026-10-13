@@ -259,6 +259,9 @@ jobs:
       - name: Repeated reload and bookmark continuity E2E
         run: make test-browser-session-relays-e2e
 
+      - name: Scheduled producer and reload handoff E2E
+        run: make test-browser-reload-producers-e2e
+
       - name: App-detail logs browser E2E
         run: make test-browser-logs-e2e
 

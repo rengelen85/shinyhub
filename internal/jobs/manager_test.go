@@ -428,6 +428,10 @@ func TestManager_CandidateProducerRunsSynchronouslyAgainstPendingBundle(t *testi
 	pending := &db.Deployment{ID: 9, AppID: app.ID, Version: "v2", BundleDir: t.TempDir(), ContentDigest: "sha256:v2", Status: db.DeploymentPending}
 	m := newTestManager(t, rt, st)
 	release := m.AcquireProducerGates([]int64{schedule.ID})
+	// A reload pause must allow producers belonging to an admitted deploy to
+	// complete; the fleet operation fence excludes handoff until it returns.
+	resume := m.PauseAdmissions()
+	defer resume()
 	runID, err := m.RunCandidateProducerLocked(schedule, app, pending)
 	release()
 	if err != nil {
@@ -1327,6 +1331,100 @@ func TestManager_Stop_InFlightRunMarkedInterrupted(t *testing.T) {
 	}
 	if run.ExitCode != nil {
 		t.Fatalf("interrupted run exit_code must be nil, got %d", *run.ExitCode)
+	}
+}
+
+func TestManager_ReloadPauseRejectsAdmissionAlreadyInsertingRun(t *testing.T) {
+	rt := &fakeRuntime{}
+	st := newFakeStore(makeSchedule("concurrent", 30), makeApp())
+	st.inserted = make(chan struct{}, 1)
+	release := make(chan struct{})
+	st.releaseInsert = release
+	m := newTestManager(t, rt, st)
+	t.Cleanup(func() { m.Stop(context.Background()) })
+	result := make(chan error, 1)
+	go func() { _, err := m.Run(1, "schedule", nil); result <- err }()
+	select {
+	case <-st.inserted:
+	case <-time.After(time.Second):
+		t.Fatal("run did not reach insertion")
+	}
+	resume := m.PauseAdmissions()
+	defer resume()
+	if blockers, err := m.ReloadBlockers(); err != nil || len(blockers) == 0 {
+		t.Fatalf("handoff ignored pending insertion: %v, %v", blockers, err)
+	}
+	close(release)
+	select {
+	case err := <-result:
+		if !errors.Is(err, jobs.ErrManagerStopped) {
+			t.Fatalf("admission crossed reload fence: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admission did not return")
+	}
+	if blockers, err := m.ReloadBlockers(); err != nil || len(blockers) != 0 {
+		t.Fatalf("rejected run remained active: %v, %v", blockers, err)
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.calls != 0 {
+		t.Fatalf("rejected run started a producer: %d calls", rt.calls)
+	}
+}
+
+func TestManager_ReloadPauseFinishesProducerWithoutInterrupting(t *testing.T) {
+	rt := &fakeRuntime{block: make(chan struct{}), entered: make(chan struct{}, 1)}
+	sched := makeSchedule("concurrent", 30)
+	sched.DeployTrigger, sched.OnSuccess = "first_deploy", "roll"
+	st := newFakeStore(sched, makeApp())
+	m := newTestManager(t, rt, st)
+	t.Cleanup(func() { m.Stop(context.Background()) })
+	runID, err := m.Run(1, "schedule", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-rt.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("producer did not start")
+	}
+	resume := m.PauseAdmissions()
+	resumeNested := m.PauseAdmissions()
+	if blockers, err := m.ReloadBlockers(); err != nil || len(blockers) != 1 || !strings.Contains(blockers[0], "test-schedule") {
+		t.Fatalf("blockers = %v, %v", blockers, err)
+	}
+	if _, err := m.Run(1, "schedule", nil); !errors.Is(err, jobs.ErrManagerStopped) {
+		t.Fatalf("paused admission: %v", err)
+	}
+	resumeNested()
+	resumeNested()
+	if _, err := m.Run(1, "schedule", nil); !errors.Is(err, jobs.ErrManagerStopped) {
+		t.Fatalf("nested pause released outer pause: %v", err)
+	}
+	close(rt.block)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		blockers, err := m.ReloadBlockers()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(blockers) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("producer never finalized")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	run, err := st.GetScheduleRun(runID)
+	if err != nil || run.Status != "succeeded" {
+		t.Fatalf("run = %+v, %v", run, err)
+	}
+	resume()
+	resume()
+	if _, err := m.Run(1, "schedule", nil); err != nil {
+		t.Fatalf("failed reload resume: %v", err)
 	}
 }
 

@@ -93,7 +93,7 @@ jobs:
 
       - name: Real Shiny browser lifecycle release gate
         timeout-minutes: 12
-        run: make test-browser-lifecycle-e2e test-browser-session-relays-e2e
+        run: make test-browser-lifecycle-e2e test-browser-session-relays-e2e test-browser-reload-producers-e2e
 
       - name: Log in to GHCR
         uses: docker/login-action@v4

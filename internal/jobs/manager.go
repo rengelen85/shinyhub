@@ -113,11 +113,13 @@ type Manager struct {
 	// than starting a process.
 	globalSem chan struct{}
 
-	mu       sync.Mutex
-	stopped  bool                    // set by Stop; rejects new admissions
-	draining bool                    // owner handoff: rejects admissions until active runs finalize
-	locks    map[int64]*schedLock    // per-schedule lock for "skip"/"queue" policies
-	queues   map[int64]chan struct{} // per-schedule capacity-2 semaphore for "queue" policy (1 active + 1 queued)
+	mu                sync.Mutex
+	stopped           bool                    // set by Stop; rejects new admissions
+	draining          bool                    // owner handoff: rejects admissions until active runs finalize
+	admissionPauses   int                     // reload waits reject new work without canceling admitted runs
+	pendingAdmissions int                     // callers inserting or finalizing rows before active registration
+	locks             map[int64]*schedLock    // per-schedule lock for "skip"/"queue" policies
+	queues            map[int64]chan struct{} // per-schedule capacity-2 semaphore for "queue" policy (1 active + 1 queued)
 	// admissionLocks order the handoff into producerGates. They let an async
 	// required writer reserve its place before returning to the dispatcher, so a
 	// later deployment barrier cannot overtake it while preserving async APIs.
@@ -400,10 +402,10 @@ func (m *Manager) ForgetApp(appID int64) {
 // handoff/app deletion. WaitGroup.Add and active registration happen while the
 // same mutex guards draining, so InterruptAndDrain can never observe zero and
 // return before a pre-admitted goroutine registers itself.
-func (m *Manager) commitAdmission(runID, appID int64, cancel context.CancelFunc) error {
+func (m *Manager) commitAdmission(runID, appID int64, cancel context.CancelFunc, admittedAppOperation bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.stopped || m.draining || m.blockedApps[appID] {
+	if m.stopped || m.draining || (m.admissionPauses > 0 && !admittedAppOperation) || m.blockedApps[appID] {
 		return ErrManagerStopped
 	}
 	m.active[runID] = cancel
@@ -544,6 +546,72 @@ func (m *Manager) ResumeAdmissions() {
 	}
 }
 
+// PauseAdmissions closes the same gate as commitAdmission without canceling
+// admitted writers. A reload must wait for their durable completion before
+// retirement, because canceling an in-place producer makes its data uncertain.
+func (m *Manager) PauseAdmissions() func() {
+	m.mu.Lock()
+	m.admissionPauses++
+	m.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			m.admissionPauses--
+			m.mu.Unlock()
+		})
+	}
+}
+
+func (m *Manager) beginAdmission(admittedAppOperation bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped || m.draining || (m.admissionPauses > 0 && !admittedAppOperation) {
+		return ErrManagerStopped
+	}
+	m.pendingAdmissions++
+	return nil
+}
+
+func (m *Manager) endAdmission() {
+	m.mu.Lock()
+	m.pendingAdmissions--
+	m.mu.Unlock()
+}
+
+// ReloadBlockers includes admitted work waiting for execution or publication
+// fences, and stays nonempty through terminal persistence and failure cleanup.
+func (m *Manager) ReloadBlockers() ([]string, error) {
+	m.mu.Lock()
+	ids := make([]int64, 0, len(m.active))
+	for id := range m.active {
+		ids = append(ids, id)
+	}
+	pending := m.pendingAdmissions
+	m.mu.Unlock()
+	slices.Sort(ids)
+	var blockers []string
+	if pending > 0 {
+		blockers = append(blockers, fmt.Sprintf("%d schedule admissions still finalizing", pending))
+	}
+	for _, id := range ids {
+		run, err := m.store.GetScheduleRun(id)
+		if err != nil {
+			return nil, err
+		}
+		schedule, err := m.store.GetSchedule(run.ScheduleID)
+		if err != nil {
+			return nil, err
+		}
+		app, err := m.store.GetAppByID(schedule.AppID)
+		if err != nil {
+			return nil, err
+		}
+		blockers = append(blockers, fmt.Sprintf("%s: schedule %q run %d in progress", app.Slug, schedule.Name, id))
+	}
+	return blockers, nil
+}
+
 // Stop signals all in-flight runs to cancel and waits for their goroutines
 // to finalize (update the schedule_runs row) or for ctx to expire. After
 // Stop returns, Run rejects new admissions with ErrManagerStopped. ctx
@@ -592,14 +660,14 @@ func (m *Manager) Run(scheduleID int64, trigger string, userID *int64) (int64, e
 }
 
 func (m *Manager) runAdmitted(ctx context.Context, scheduleID int64, trigger string, userID *int64, refresh *refreshAdmission) (int64, error) {
+	if err := m.beginAdmission(false); err != nil {
+		return 0, err
+	}
+	defer m.endAdmission()
 	m.mu.Lock()
-	stopped := m.stopped || m.draining
 	admission := m.admissionLockFor(scheduleID)
 	gate := m.producerGateFor(scheduleID)
 	m.mu.Unlock()
-	if stopped {
-		return 0, ErrManagerStopped
-	}
 
 	// Enter the read fence before loading any mutable declaration or deployment
 	// state. Otherwise a caller can snapshot command A, wait behind a deployment
@@ -695,14 +763,14 @@ func (m *Manager) RunForDeployment(scheduleID int64, trigger string, userID *int
 	if deployment == nil {
 		return 0, errors.New("schedule run deployment is required")
 	}
+	if err := m.beginAdmission(false); err != nil {
+		return 0, err
+	}
+	defer m.endAdmission()
 	m.mu.Lock()
-	stopped := m.stopped || m.draining
 	admission := m.admissionLockFor(scheduleID)
 	gate := m.producerGateFor(scheduleID)
 	m.mu.Unlock()
-	if stopped {
-		return 0, ErrManagerStopped
-	}
 	admission.Lock()
 	defer admission.Unlock()
 	gate.RLock()
@@ -742,12 +810,10 @@ func (m *Manager) RunDeployObligation(obligation *db.ScheduleDeployObligation) (
 	if obligation == nil {
 		return 0, errors.New("deploy obligation is required")
 	}
-	m.mu.Lock()
-	stopped := m.stopped || m.draining
-	m.mu.Unlock()
-	if stopped {
-		return 0, ErrManagerStopped
+	if err := m.beginAdmission(false); err != nil {
+		return 0, err
 	}
+	defer m.endAdmission()
 	sched, err := m.store.GetSchedule(obligation.ScheduleID)
 	if err != nil {
 		return 0, fmt.Errorf("get schedule %d: %w", obligation.ScheduleID, err)
@@ -810,7 +876,7 @@ func (m *Manager) runRequired(sched *db.Schedule, app *db.App, deployment *db.De
 		return 0, err
 	}
 	ctx, cancel := m.buildRunContext()
-	if err := m.commitAdmission(runID, app.ID, cancel); err != nil {
+	if err := m.commitAdmission(runID, app.ID, cancel, false); err != nil {
 		cancel()
 		admission.Unlock()
 		m.finishRun(sched, runID, "interrupted", nil, "deploy", nil, false)
@@ -885,7 +951,7 @@ func (m *Manager) runWithOwnedSlot(sched *db.Schedule, app *db.App, deployment *
 	}
 
 	ctx, cancel := m.buildRunContext()
-	if err := m.commitAdmission(runID, app.ID, cancel); err != nil {
+	if err := m.commitAdmission(runID, app.ID, cancel, false); err != nil {
 		cancel()
 		slot.unlock()
 		gate.RUnlock()
@@ -938,7 +1004,7 @@ func (m *Manager) runWithQueue(sched *db.Schedule, app *db.App, deployment *db.D
 			return 0, err
 		}
 		ctx, cancel := m.buildRunContext()
-		if err := m.commitAdmission(runID, app.ID, cancel); err != nil {
+		if err := m.commitAdmission(runID, app.ID, cancel, false); err != nil {
 			cancel()
 			slot.unlock()
 			gate.RUnlock()
@@ -972,7 +1038,7 @@ func (m *Manager) runWithQueue(sched *db.Schedule, app *db.App, deployment *db.D
 	}
 
 	ctx, cancel := m.buildRunContext()
-	if err := m.commitAdmission(runID, app.ID, cancel); err != nil {
+	if err := m.commitAdmission(runID, app.ID, cancel, false); err != nil {
 		cancel()
 		<-sem
 		gate.RUnlock()
@@ -1016,7 +1082,7 @@ func (m *Manager) runConcurrent(sched *db.Schedule, app *db.App, deployment *db.
 	}
 
 	ctx, cancel := m.buildRunContext()
-	if err := m.commitAdmission(runID, app.ID, cancel); err != nil {
+	if err := m.commitAdmission(runID, app.ID, cancel, false); err != nil {
 		cancel()
 		gate.RUnlock()
 		m.finishRun(sched, runID, "interrupted", nil, trigger, userID, false)
@@ -1339,12 +1405,13 @@ func (m *Manager) RunCandidateProducerLocked(sched *db.Schedule, app *db.App, de
 	if sched.AppID != app.ID || deployment.AppID != app.ID {
 		return 0, errors.New("candidate producer app identity mismatch")
 	}
-	m.mu.Lock()
-	unavailable := m.stopped || m.draining
-	m.mu.Unlock()
-	if unavailable {
-		return 0, ErrManagerStopped
+	// This synchronous producer belongs to an already-admitted app operation.
+	// The reload's fleet fence waits for that operation, so allow it to finish
+	// even while independent schedule admissions are paused.
+	if err := m.beginAdmission(true); err != nil {
+		return 0, err
 	}
+	defer m.endAdmission()
 	snapshot := *sched
 	// Serving activation is unnecessary and unsafe before the candidate app is
 	// live. The normal policy remains on the persisted declaration for later
@@ -1355,7 +1422,7 @@ func (m *Manager) RunCandidateProducerLocked(sched *db.Schedule, app *db.App, de
 		return 0, err
 	}
 	ctx, cancel := m.buildRunContext()
-	if err := m.commitAdmission(runID, app.ID, cancel); err != nil {
+	if err := m.commitAdmission(runID, app.ID, cancel, true); err != nil {
 		cancel()
 		m.finishRun(&snapshot, runID, "interrupted", nil, "deploy", nil, false)
 		return runID, err

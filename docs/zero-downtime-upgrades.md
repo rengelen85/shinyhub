@@ -91,8 +91,13 @@ systemctl reload shinyhub
 The reference systemd unit uses `shinyhub reload --wait 10m`. The command
 returns success only after the successor acknowledges readiness and its PID
 matches `server.pid_file`. Standalone successors must regain mutation ownership;
-clustered successors may be healthy standbys after their first pool sync. A refusal or failed handoff returns nonzero, so
-`systemctl reload` reports failure while the current process continues serving.
+session-preserving standalone reloads also verify that previously serving apps
+have reachable, adopted replicas meeting their warm floor (at least one replica).
+An unavailable app is named in the readiness failure rather than reporting success.
+Clustered successors may be healthy standbys after their first pool sync. A refusal
+or failed readiness check returns nonzero, so `systemctl reload` reports failure.
+A refusal before handoff leaves the current process serving; after an accepted
+handoff, inspect the successor and the named app before retrying.
 The unit allows fourteen minutes for the default ten-minute transition wait,
 startup acknowledgement, and a separate readiness budget. If you increase
 `--wait` or `server.upgrade_timeout`, set `TimeoutStartSec` to at least
@@ -104,15 +109,32 @@ For a local invocation without systemd:
 shinyhub reload --config /etc/shinyhub/shinyhub.yaml --wait 10m
 ```
 
-During a waiting session-preserving reload, new scheduled activation claims are
-paused so queued hourly rolls do not extend the wait. An already-admitted roll
+During a waiting session-preserving reload, new schedule runs and scheduled
+activation claims are paused so newly due producers and queued hourly rolls do
+not extend the wait. Already-admitted schedule runs finish their execution and
+durable result handling before handoff; blockers name the app, schedule, and run.
+This prevents retirement from interrupting an in-place producer and quarantining
+its serving app. An already-admitted roll
 finishes normally, and retries for work that already owns runtime state remain
-admitted. A canceled or failed reload resumes the activation queue;
-the successor resumes durable queued work after a successful handoff. Producer
-schedules can still run and enqueue work during the wait. Draining replicas
+admitted, including synchronous producers needed by an admitted deployment.
+A canceled or failed reload resumes schedule admissions and the activation queue;
+the successor resumes durable queued work after a successful handoff. Schedules
+missed during the pause follow their configured missed-run policy. Draining replicas
 remain a reload blocker; preserving their sessions across reload is not yet
 supported. Connection-identity blockers name the app, connection ID, deployment,
 and replica so they can be matched to WebSocket logs.
+
+These admission protections run in the retiring server. When upgrading from
+0.20.6, arrange the first reload after active producers and rolls have finished;
+replacing the binary cannot change the already-running process's retirement logic.
+
+`make test-browser-reload-producers-e2e` exercises this boundary with real native
+processes, a cron producer overlapping a scheduled roll, and a Shiny browser
+session. It verifies exact replica adoption, uninterrupted page probes, and
+session continuity beyond the reload drain deadline. A second case deliberately
+fails a producer and verifies that an accepted handoff with no ready app replica
+returns nonzero with the app named. New manual schedule requests during the
+reload pause return 503 with `Retry-After: 1` and can be retried afterward.
 
 Without `--wait`, temporary blockers fail immediately. With it, the command
 waits up to that duration for app operations, candidates, draining generations,
