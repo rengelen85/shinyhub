@@ -8,12 +8,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -86,6 +88,7 @@ func TestRepeatableProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sessions sync.WaitGroup
+	ready := make(chan struct{})
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/upgrade":
@@ -115,6 +118,24 @@ func TestRepeatableProcessHelper(t *testing.T) {
 				}
 			}
 		default:
+			select {
+			case <-ready:
+			default:
+				http.Error(w, "process is not ready", http.StatusServiceUnavailable)
+				return
+			}
+			// A successor can accept from the inherited listener before the
+			// parent has stopped accepting. Publish its PID only after the real
+			// retirement acknowledgement, so later test requests target a
+			// single serving generation rather than racing the draining parent.
+			if repeat != nil {
+				select {
+				case <-repeat.parentDone:
+				default:
+					http.Error(w, "parent is retiring", http.StatusServiceUnavailable)
+					return
+				}
+			}
 			fmt.Fprint(w, os.Getpid())
 		}
 	})
@@ -126,6 +147,7 @@ func TestRepeatableProcessHelper(t *testing.T) {
 	if err := u.Ready(); err != nil {
 		t.Fatal(err)
 	}
+	close(ready)
 	<-u.Exit()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -193,17 +215,81 @@ func startUpgradeHarness(t *testing.T, legacy string, failChild bool) (string, *
 }
 func readHarnessPID(t *testing.T, client *http.Client, url string) int {
 	t.Helper()
-	resp, err := client.Get(url)
-	if err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		resp, err := client.Get(url)
+		if err == nil {
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if resp.StatusCode == http.StatusOK {
+				pid, err := strconv.Atoi(string(body))
+				if err != nil {
+					t.Fatalf("PID request: %d %q %v", resp.StatusCode, body, err)
+				}
+				return pid
+			}
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("PID request: %d %q", resp.StatusCode, body)
+			}
+		} else if !errors.Is(err, io.EOF) {
+			t.Fatal(err)
+		}
+		// During handoff, Shutdown can close a StateNew connection accepted
+		// by the retiring server before it reads this request. Retry the read-only
+		// probe's EOF or explicit readiness status; upgrade requests and held
+		// tunnels stay strict.
+		if !time.Now().Before(deadline) {
+			t.Fatal("PID probe did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	pid, err := strconv.Atoi(string(body))
-	if err != nil || resp.StatusCode != 200 {
-		t.Fatalf("PID request: %d %q %v", resp.StatusCode, body, err)
+}
+
+func waitHarnessSuccessor(t *testing.T, client *http.Client, url string, parentPID int) int {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		pid := readHarnessPID(t, client, url)
+		if pid != parentPID {
+			return pid
+		}
+		// Upgrade acknowledges successor readiness before the parent finishes
+		// Shutdown. A final parent response does not mean takeover failed.
+		if !time.Now().Before(deadline) {
+			t.Fatal("successor did not take over")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return pid
+}
+
+func TestReadHarnessPIDRetriesRetiringConnection(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			conn.Close()
+			return
+		case 2:
+			http.Error(w, "parent is retiring", http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprint(w, "42")
+	}))
+	defer srv.Close()
+	if pid := readHarnessPID(t, srv.Client(), srv.URL); pid != 42 {
+		t.Fatalf("PID = %d, want successor PID 42", pid)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("requests = %d, want closed connection, retiring parent, then ready successor", got)
+	}
 }
 func holdHarnessTunnel(t *testing.T, url string, pid int) (net.Conn, *bufio.Reader) {
 	t.Helper()
@@ -264,9 +350,7 @@ func TestRepeatableUpgradesPreserveEarlierTunnels(t *testing.T) {
 			if !succeeded {
 				t.Fatal("successor remained fenced by retained tunnel")
 			}
-			if readHarnessPID(t, client, url) == pid {
-				t.Fatal("successor did not take over")
-			}
+			waitHarnessSuccessor(t, client, url, pid)
 		}
 		for i := range connections {
 			checkHarnessTunnel(t, connections[i], readers[i], pids[i])
@@ -285,9 +369,7 @@ func TestRepeatableFirstUpgradeFromTableflip(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("legacy handoff: %s", body)
 	}
-	if readHarnessPID(t, client, url) == pid {
-		t.Fatal("legacy parent still serving")
-	}
+	waitHarnessSuccessor(t, client, url, pid)
 }
 func TestRepeatableLegacyChildWaitsForParentExit(t *testing.T) {
 	url, client, _ := startUpgradeHarness(t, "child", false)
