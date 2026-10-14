@@ -50,6 +50,7 @@ docker create --name "$network-driver" --label "shinyhub.load_run=$network" --ne
   -e LOAD_CORES="${LOAD_CORES:-}" \
   -e LOAD_REPLICAS="${LOAD_REPLICAS:-1}" -e LOAD_DIRECT="${LOAD_DIRECT:-0}" \
   -e LOAD_WORKER_PROFILE="${LOAD_WORKER_PROFILE:-0}" \
+  -e LOAD_OWNER_UID="$(id -u)" -e LOAD_OWNER_GID="$(id -g)" \
   -e LOAD_CPU_REQUEST="${LOAD_CPU_REQUEST:-}" -e LOAD_CPU_RESERVE="${LOAD_CPU_RESERVE:-}" \
   shinyhub-update-load-driver:local node /work/loadtest/update-capacity/run.mjs >/dev/null
 docker cp "$scratch/shinyhub" "$network-driver:/binary"

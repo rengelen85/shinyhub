@@ -539,5 +539,10 @@ try {
       p95: usage.length ? usage[Math.floor(usage.length * 0.95)] : null };
   }
   await writeFile(join(work, 'result.json'), JSON.stringify(report, null, 2));
+  if (process.env.LOAD_OWNER_UID !== undefined) {
+    const uid = Number(process.env.LOAD_OWNER_UID), gid = Number(process.env.LOAD_OWNER_GID);
+    assert.ok(Number.isSafeInteger(uid) && uid >= 0 && Number.isSafeInteger(gid) && gid >= 0, 'evidence owner');
+    await command(['chown', '-R', `${uid}:${gid}`, work]);
+  }
   console.log(`Evidence: ${work}/result.json`);
 }
