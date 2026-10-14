@@ -158,13 +158,42 @@ pool. Admission checks available memory and CPU before preparation and again
 under the host-wide launch reservation immediately before starting workers.
 A scheduled roll budgets one surge worker instead of a complete second pool.
 
-CPU headroom is sampled over 200 ms. Each new worker reserves at least one core
-(or its configured CPU ceiling if higher), plus a 10% node margin shared by the
-candidate pool. A binding detected cgroup CPU quota also accounts for CPU time
-consumed inside that cgroup. Missing or invalid readings refuse parallel starts.
-These conservative budgets reduce contention; they do not guarantee response
-times or bound a multithreaded app's startup consumption. A one-core node cannot
-admit a parallel worker with the safety margin, even when otherwise idle.
+CPU admission first accounts for every local live worker, including starting,
+serving, draining, suspended, and unconfirmed processes. Each owns the configured
+CPU request even when idle. A separate 200 ms pressure check catches contention
+from current traffic and other programs; that sample does not reserve CPU.
+
+Configure the accounting policy under `server.update_capacity`:
+
+```yaml
+server:
+  update_capacity:
+    worker_cpu_request_cores: 1   # per worker; fractional requests are allowed
+    reserved_cpu_cores: 0.1       # absolute control-plane/background-work reserve
+    max_surge_replicas: 1         # per app, including retained old generations
+```
+
+Unset CPU requests default to one core per worker; the unset CPU reserve remains
+10% of effective node capacity. These are conservative defaults, not measured
+startup requirements. Requests differ from `cpu_quota_percent`, which controls
+runtime enforcement; choose requests appropriate to your workers' workload.
+Requests are accounting budgets, not OS reservations against unrelated processes.
+
+The default surge ceiling is `0` (no additional replica-count ceiling; resource
+admission still applies). Scheduled rolls use one surge worker. Code handoffs
+require a complete healthy candidate pool: a positive ceiling smaller than that
+pool refuses the update without partially replacing it. Normal parallel updates
+have zero planned unavailable workers. `--allow-downtime` authorizes stop-first
+replacement explicitly. A one-core node can admit fractional requests when the
+serving and replacement requests, reserve, memory and pressure checks all fit.
+
+Linux detection resolves process membership and controller mounts, including
+nested systemd services, cgroup namespaces and v1/v2 controllers. Every visible
+ancestor CPU limit and its usage are checked, even with a capacity override.
+Memory headroom is the minimum of host availability and each finite ancestor's
+remaining budget, including sibling workers. Missing or invalid accounting under
+a finite limit refuses parallel starts. Hidden ancestors outside a container's
+cgroup namespace cannot be measured; provision its visible allocation accordingly.
 
 A refused upload returns HTTP 409 with `update_state: "blocked_capacity"`, the
 resource, available and required budgets when known, and `automatic_retry: false`.

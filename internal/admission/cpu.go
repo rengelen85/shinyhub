@@ -13,17 +13,16 @@ import (
 // effective node budget is reduced by host pressure; a binding cgroup quota
 // additionally budgets the actual CPU time consumed within that cgroup.
 // Measurements that cannot prove headroom return an error, never idle capacity.
-func AvailableCPUCores(ctx context.Context, cores float64, source string) (float64, error) {
+func AvailableCPUCores(ctx context.Context, cores float64, _ string) (float64, error) {
 	if cores <= 0 || math.IsNaN(cores) || math.IsInf(cores, 0) {
 		return 0, fmt.Errorf("invalid CPU capacity")
 	}
-	var before float64
-	var err error
-	if source == "cgroup-quota" {
-		before, err = readCPUUsage()
-		if err != nil {
-			return 0, err
-		}
+	before, err := readCPUConstraints()
+	if err != nil {
+		return 0, err
+	}
+	for _, c := range before {
+		cores = math.Min(cores, c.cores)
 	}
 	started := time.Now()
 	pcts, err := gopscpu.PercentWithContext(ctx, 200*time.Millisecond, false)
@@ -34,16 +33,35 @@ func AvailableCPUCores(ctx context.Context, cores float64, source string) (float
 		return 0, fmt.Errorf("host CPU reading is unavailable or invalid")
 	}
 	available := cores * (1 - pcts[0]/100)
-	if source == "cgroup-quota" {
-		after, err := readCPUUsage()
-		if err != nil {
-			return 0, err
+	after, err := readCPUConstraints()
+	if err != nil {
+		return 0, err
+	}
+	elapsed := time.Since(started).Seconds()
+	if len(after) != len(before) || elapsed <= 0 {
+		return 0, fmt.Errorf("cgroup CPU constraints changed")
+	}
+	for path, first := range before {
+		last, ok := after[path]
+		if !ok || last.cores != first.cores || last.usage < first.usage {
+			return 0, fmt.Errorf("cgroup CPU constraints changed or counter reset")
 		}
-		elapsed := time.Since(started).Seconds()
-		if after < before || elapsed <= 0 {
-			return 0, fmt.Errorf("cgroup CPU counter reset")
-		}
-		available = math.Min(available, math.Max(0, cores-(after-before)/elapsed))
+		available = math.Min(available, math.Max(0, first.cores-(last.usage-first.usage)/elapsed))
 	}
 	return available, nil
+}
+
+type cpuConstraint struct{ cores, usage float64 }
+
+// EffectiveCPUCores clamps an accounting override to actual kernel quotas.
+// An override can reduce an allocation; it cannot enlarge a service's quota.
+func EffectiveCPUCores(cores float64) (float64, error) {
+	constraints, err := readCPUConstraints()
+	if err != nil {
+		return 0, err
+	}
+	for _, c := range constraints {
+		cores = math.Min(cores, c.cores)
+	}
+	return cores, nil
 }

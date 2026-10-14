@@ -12,22 +12,21 @@ import (
 	"github.com/rvben/shinyhub/internal/activation"
 	"github.com/rvben/shinyhub/internal/admission"
 	"github.com/rvben/shinyhub/internal/db"
-	"github.com/rvben/shinyhub/internal/deploy"
+	"github.com/rvben/shinyhub/internal/process"
 )
 
-// checkUpdateCPU reserves startup CPU for parallel workers while retaining a
-// ten-percent node margin for existing sessions and the control plane. It is
-// checked under the same launch reservation as memory admission.
+// checkUpdateCPU accounts for live worker requests before checking measured
+// pressure. Callers hold the launch gate through the candidate readiness boundary.
 func (s *Server) checkUpdateCPU(app *db.App, replicas int) error {
 	cores, source := admission.Detect(s.cfg.HostCapacityCores())
 	if s.hostCapacity != nil {
 		cores, source = s.hostCapacity.Cores, s.hostCapacity.CoresSource
 	}
 	var available float64
-	var err error
-	if s.availableCPUCores != nil {
+	cores, err := admission.EffectiveCPUCores(cores)
+	if err == nil && s.availableCPUCores != nil {
 		available, err = s.availableCPUCores()
-	} else {
+	} else if err == nil {
 		ctx := s.generationCtx
 		if ctx == nil {
 			ctx = context.Background()
@@ -37,16 +36,64 @@ func (s *Server) checkUpdateCPU(app *db.App, replicas int) error {
 	if cores <= 0 || math.IsNaN(cores) || math.IsInf(cores, 0) || err != nil || available < 0 || math.IsNaN(available) || math.IsInf(available, 0) {
 		return &activation.CapacityError{Resource: "cpu", Units: "cores", Reason: "CPU headroom could not be measured; current sessions are preserved", RetryAfter: time.Minute}
 	}
-	_, defaultCPU := s.cfg.Runtime.DefaultResourcesForApp(app)
-	quota := deploy.ResolveCPUQuotaPercent(app.CPUQuotaPercent, defaultCPU)
-	// An unenforced or fractional quota does not prove a cold import uses less
-	// than one core. Higher configured ceilings require the larger budget.
-	perWorker := math.Max(1, float64(quota)/100)
+	perWorker := s.cfg.Server.UpdateCapacity.CPURequest()
 	needed := perWorker * float64(max(1, replicas))
-	floor := cores * 0.1
+	floor := s.cfg.Server.UpdateCapacity.CPUReserve(cores)
+	if perWorker <= 0 || math.IsNaN(needed) || math.IsInf(needed, 0) || floor < 0 || math.IsNaN(floor) || math.IsInf(floor, 0) {
+		return &activation.CapacityError{Resource: "cpu", Units: "cores", Reason: "CPU budget cannot be represented; check server.update_capacity worker requests and reserve; current sessions are preserved", RetryAfter: time.Minute}
+	}
+	// Idle workers still own their startup budgets. Count every generation,
+	// including staged, draining and suspended processes, rather than only
+	// the selected serving pool. The launch gate makes this check atomic with
+	// ShinyHub's starts; it does not reserve resources against other programs.
+	liveWorkers := 0
+	if s.manager != nil {
+		for _, worker := range s.manager.All() {
+			if worker.Status == process.StatusStopped || worker.Status == process.StatusCrashed {
+				continue
+			}
+			if worker.Provider == "fargate" || (s.nodeForTier != nil && s.nodeForTier(worker.Tier) != "") {
+				continue
+			}
+			liveWorkers++
+		}
+	}
+	reserved := float64(liveWorkers) * perWorker
+	if reserved+needed+floor > cores {
+		remaining, required := math.Max(0, cores-reserved-floor), needed
+		return &activation.CapacityError{Resource: "cpu", Units: "cores", Available: &remaining, Required: &required, Reason: fmt.Sprintf("CPU budget: %.2f cores allocated to live workers; %.2f requested for candidates plus %.2f reserved on a %.2f-core node; current sessions are preserved", reserved, needed, floor, cores), RetryAfter: time.Minute}
+	}
 	if available < needed+floor {
 		required := needed + floor
 		return &activation.CapacityError{Resource: "cpu", Units: "cores", Available: &available, Required: &required, Reason: fmt.Sprintf("CPU: %.2f cores available; need %.2f for %d startup workers plus %.2f cores of node headroom; current sessions are preserved", available, needed, max(1, replicas), floor), RetryAfter: time.Minute}
+	}
+	return nil
+}
+
+func (s *Server) checkUpdateSurge(app *db.App, candidates int) error {
+	ceiling := s.cfg.Server.UpdateCapacity.MaxSurgeReplicas
+	if ceiling == 0 || s.manager == nil {
+		return nil
+	}
+	live := func(w *process.ProcessInfo) bool {
+		return w != nil && w.Status != process.StatusStopped && w.Status != process.StatusCrashed
+	}
+	active, total := 0, 0
+	for _, w := range s.manager.AllForSlug(app.Slug) {
+		if live(w) {
+			active++
+		}
+	}
+	for _, w := range s.manager.All() {
+		if w.Slug == app.Slug && live(w) {
+			total++
+		}
+	}
+	extra := total - active + max(1, candidates)
+	if extra > ceiling {
+		available, required := float64(max(0, ceiling-(total-active))), float64(max(1, candidates))
+		return &activation.CapacityError{Resource: "surge", Units: "replicas", Available: &available, Required: &required,
+			Reason: fmt.Sprintf("server.update_capacity.max_surge_replicas=%d cannot fit %d candidates and %d existing non-active workers; current sessions are preserved", ceiling, max(1, candidates), total-active), RetryAfter: time.Minute}
 	}
 	return nil
 }
@@ -56,6 +103,9 @@ func capacityFailureReason(block *activation.CapacityError) string {
 }
 
 func capacityConflictMessage(block *activation.CapacityError) string {
+	if block.Resource == "surge" {
+		return "working version preserved: " + block.Reason + "; retry after previous generations retire or increase server.update_capacity.max_surge_replicas; use --allow-downtime for an explicit stop-first deployment"
+	}
 	return "working version preserved: " + block.Reason + "; retry after freeing capacity, add capacity, or use --allow-downtime for an explicit stop-first deployment"
 }
 
@@ -86,7 +136,11 @@ func (s *Server) blockedUpdateStatus(slug string) map[string]any {
 	if !ok {
 		return nil
 	}
+	nextAction := "free or add capacity and retry the deployment; use --allow-downtime only for an intentional stop-first update"
+	if resource == "surge" {
+		nextAction = "retry after previous generations retire or increase server.update_capacity.max_surge_replicas; use --allow-downtime only for an intentional stop-first update"
+	}
 	return map[string]any{"state": "blocked_capacity", "resource": resource, "reason": reason,
 		"deployment_id": latest.ID, "requested_at": latest.CreatedAt, "automatic_retry": false,
-		"next_action": "free or add capacity and retry the deployment; use --allow-downtime only for an intentional stop-first update"}
+		"next_action": nextAction}
 }

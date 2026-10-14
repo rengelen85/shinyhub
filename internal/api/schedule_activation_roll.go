@@ -9,11 +9,11 @@ import (
 	"time"
 
 	"github.com/rvben/shinyhub/internal/activation"
+	"github.com/rvben/shinyhub/internal/admission"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/deploy"
 	"github.com/rvben/shinyhub/internal/process"
 	"github.com/rvben/shinyhub/internal/schedulespec"
-	gopsmem "github.com/shirou/gopsutil/v4/mem"
 )
 
 // Roll implements activation.Runner. It serializes with every other app
@@ -593,16 +593,18 @@ func tierForActivationIndex(p deploy.Params, index int) string {
 }
 
 func (s *Server) activationCapacityCheck(app *db.App, sampleIndex int) error {
+	if err := s.checkUpdateSurge(app, 1); err != nil {
+		return err
+	}
 	estimate := s.activationSurgeMemoryEstimate(app, sampleIndex)
 	neededMB := estimate.MemoryMB
 	if neededMB <= 0 {
 		return &activation.CapacityError{Resource: "memory", Units: "MiB", Reason: "surge memory is unknown; configure memory_limit_mb or enable runtime metrics", RetryAfter: time.Minute}
 	}
-	vm, err := gopsmem.VirtualMemory()
-	if err != nil || vm == nil {
+	availableMB, err := s.availableMemoryMB()
+	if err != nil {
 		return &activation.CapacityError{Resource: "memory", Units: "MiB", Reason: "host available memory could not be measured", RetryAfter: time.Minute}
 	}
-	availableMB := int(vm.Available / (1024 * 1024))
 	requiredMB := s.cfg.MinAvailableMemoryMB() + neededMB
 	if availableMB < requiredMB {
 		available, required := float64(availableMB), float64(requiredMB)
@@ -619,6 +621,9 @@ func (s *Server) activationCapacityCheck(app *db.App, sampleIndex int) error {
 // needs every target replica healthy before publication, so budgeting a single
 // surge replica would still leave the host vulnerable to an OOM mid-start.
 func (s *Server) generationHandoffCapacityCheck(app *db.App) error {
+	if err := s.checkUpdateSurge(app, app.Replicas); err != nil {
+		return err
+	}
 	estimate := s.activationSurgeMemoryEstimate(app, 0)
 	if estimate.MemoryMB <= 0 {
 		return &activation.CapacityError{Resource: "memory", Units: "MiB", Reason: "parallel-generation memory is unknown; configure memory_limit_mb or enable runtime metrics", RetryAfter: time.Minute}
@@ -645,14 +650,7 @@ func (s *Server) generationHandoffCapacityCheck(app *db.App) error {
 }
 
 func hostAvailableMemoryMB() (int, error) {
-	vm, err := gopsmem.VirtualMemory()
-	if err != nil {
-		return 0, err
-	}
-	if vm == nil {
-		return 0, errors.New("host memory sample is nil")
-	}
-	return int(vm.Available / (1024 * 1024)), nil
+	return admission.AvailableMemoryMB()
 }
 
 func (s *Server) rollFeasibilityAdvisory(app *db.App, onSuccess, fallback string) *string {
@@ -665,20 +663,23 @@ func (s *Server) rollFeasibilityAdvisory(app *db.App, onSuccess, fallback string
 		msg := "Surge-roll feasibility could not be checked because replica memory is unknown; configure memory_limit_mb or keep runtime metrics available."
 		return &msg
 	}
-	vm, err := gopsmem.VirtualMemory()
-	if err != nil || vm == nil {
+	availableMB, err := s.availableMemoryMB()
+	if err != nil {
 		msg := "Surge-roll feasibility could not be checked because host available memory could not be measured."
 		return &msg
 	}
-	availableMB := int(vm.Available / (1024 * 1024))
 	msg := formatRollFeasibilityAdvisory(neededMB, availableMB, s.cfg.MinAvailableMemoryMB(), fallback)
 	if msg == "" {
-		if cpuErr := s.checkUpdateCPU(app, 1); cpuErr != nil {
-			msg = "Surge roll is currently infeasible: " + cpuErr.Error() + "."
+		capacityErr := s.checkUpdateSurge(app, 1)
+		if capacityErr == nil {
+			capacityErr = s.checkUpdateCPU(app, 1)
+		}
+		if capacityErr != nil {
+			msg = "Surge roll is currently infeasible: " + capacityErr.Error() + "."
 			if fallback == "restart" {
 				msg += " The configured restart fallback stops the old pool first and accepts an availability gap."
 			} else {
-				msg += " Activation will defer until CPU capacity becomes available."
+				msg += " Activation will defer until capacity becomes available."
 			}
 			return &msg
 		}

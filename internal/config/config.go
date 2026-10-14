@@ -586,6 +586,8 @@ type ServerConfig struct {
 	// would exceed available memory. 0 disables the guard.
 	HostBudgetMB int `yaml:"host_budget_mb"`
 
+	UpdateCapacity UpdateCapacityConfig `yaml:"update_capacity"`
+
 	// MinAvailableMemoryMB is the runtime companion to HostBudgetMB's static
 	// worst-case check: while the host's available memory (MemAvailable) is
 	// below this floor, NO new elastic worker (grouped/per_session isolation)
@@ -1765,6 +1767,9 @@ func loadRaw(path string) (*Config, error) {
 	// fixed port; a negative or out-of-range value is always a misconfiguration.
 	if cfg.Server.Port < 0 || cfg.Server.Port > 65535 {
 		return nil, fmt.Errorf("server.port must be between 0 and 65535, got %d", cfg.Server.Port)
+	}
+	if err := cfg.Server.UpdateCapacity.Validate(); err != nil {
+		return nil, err
 	}
 	if err := validateAppOrigin(&cfg.Server); err != nil {
 		return nil, err

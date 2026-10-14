@@ -304,6 +304,10 @@ test-browser-update-capacity-e2e:
 	cd loadtest/render/driver && npx --no-install playwright install chromium
 	SHINYHUB_E2E_UPDATE_CAPACITY=1 PYTHON_VERSION='$(PYTHON_VERSION)' node scripts/browser-lifecycle-e2e.mjs
 
+.PHONY: test-cgroup-admission-e2e
+test-cgroup-admission-e2e:
+	bash scripts/test-cgroup-admission.sh
+
 # test-cli-compatibility-e2e downloads the checksum-pinned previous release and
 # proves both supported upgrade directions with real servers: current CLI ->
 # released server (connect, doctor, deploy, credential recovery) and released

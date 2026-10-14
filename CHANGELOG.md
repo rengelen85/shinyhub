@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **capacity**: resolve nested and namespaced cgroup limits, account for shared ancestor CPU and memory usage, and honor v1 controllers on hybrid hosts. Parallel updates now account for live worker CPU requests independently of utilization, with configurable CPU requests, reserves and surge ceilings that include draining generations.
+
 - **deployment**: refuse parallel starts when CPU headroom is exhausted or unknown, budget the complete candidate pool, and preserve serving workers when capacity disappears during preparation. Capacity-blocked uploads now expose actionable API and dashboard status; scheduled rolls defer and retry using their existing durable backoff.
 
 - **schedules**: preserve active jobs during history pruning so their outcomes and producer repair requirements remain recoverable; active jobs no longer consume the completed-history retention allowance.

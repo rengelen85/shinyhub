@@ -601,8 +601,10 @@ server:
 ```
 
 `host_capacity_cores` also sets the effective CPU budget for parallel worker
-admission during live updates and scheduled rolls. An override replaces detection;
-keep it within the actual allocation. See [update capacity](deployment-plan.md#capacity-during-live-updates).
+admission during live updates and scheduled rolls. Kernel CPU quotas still cap
+update admission when an override is set.
+Worker requests, the CPU reserve and a per-app surge ceiling are configurable
+under `server.update_capacity`. See [update capacity](deployment-plan.md#capacity-during-live-updates).
 
 Env vars: `SHINYHUB_HOST_CAPACITY_CORES`, `SHINYHUB_HOST_CAPACITY_MEMORY_MB`.
 

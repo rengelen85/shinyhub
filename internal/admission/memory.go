@@ -1,6 +1,9 @@
 package admission
 
-import gopsmem "github.com/shirou/gopsutil/v4/mem"
+import (
+	"fmt"
+	gopsmem "github.com/shirou/gopsutil/v4/mem"
+)
 
 // DetectMemory resolves the memory capacity of the box ShinyHub runs on, in
 // MiB, along with the source of that number and whether any source answered.
@@ -61,4 +64,23 @@ func bytesToMB(b uint64) int {
 		return 1
 	}
 	return mb
+}
+
+// AvailableMemoryMB reports allocatable headroom within every visible ancestor
+// limit. Reclaimable host memory does not enlarge a container/service budget.
+// Missing usage under a finite limit fails closed, rather than reporting host
+// headroom as though that limit did not exist.
+func AvailableMemoryMB() (int, error) {
+	vm, err := gopsmem.VirtualMemory()
+	if err != nil {
+		return 0, err
+	}
+	if vm == nil {
+		return 0, fmt.Errorf("host memory sample is nil")
+	}
+	available, err := cgroupAvailableMemory(vm.Available)
+	if err != nil {
+		return 0, err
+	}
+	return int(available / (1024 * 1024)), nil
 }

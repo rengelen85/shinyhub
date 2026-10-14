@@ -289,10 +289,10 @@ Important behavior:
   startups do not replace the stored peak, and status-only lifecycle changes do
   not erase it. The replica API/metrics field is `startup_peak_rss_bytes`, and
   capacity errors and feasibility advisories identify the estimate source.
-- CPU admission reserves at least one core per new worker (more for a higher
-  configured CPU ceiling), plus 10% of node capacity for existing work. CPU
-  saturation and unknown measurements defer the roll just like a memory
-  shortage. See [capacity during live updates](deployment-plan.md#capacity-during-live-updates).
+- CPU admission accounts for configured worker requests across all local live
+  generations, keeps the configured CPU reserve, then checks current pressure.
+  The per-app surge ceiling includes retained old generations. CPU saturation
+  and unknown measurements defer the roll just like a memory shortage. See [capacity during live updates](deployment-plan.md#capacity-during-live-updates).
 - Capacity deferrals back off at 1, 2, 4, 8, then 15-minute intervals. The
   persisted `capacity_deferrals` count is separate from rollout `attempts`.
   With `max_defer_age` set, the deadline starts at the first capacity defer,
