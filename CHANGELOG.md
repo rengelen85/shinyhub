@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.20.9](https://github.com/rvben/shinyhub/compare/v0.20.8...v0.20.9) - 2026-10-14
+
 ### Upgrade notice
 
 The reference systemd unit now uses `serve --supervise` (Linux 5.3+) and omits
@@ -13,19 +15,6 @@ The reference systemd unit now uses `serve --supervise` (Linux 5.3+) and omits
 Adopting this unit requires one announced restart. Broker-native replicas need
 one rollout to switch from controller pipes to journal output before restart
 survival is available. Shared-user native replicas still stop with the service.
-
-### Fixed
-
-- **reload**: preserve every replica ready before the handoff, including capacity above the configured warm floor, and warn when an app starts below its floor. The separate successor readiness budget remains documented as `server.upgrade_timeout + 1m`.
-
-### Added
-
-- **reload**: re-read private `server.env_file` settings before handoff, removing deleted overrides; add `server.max_retired_lifetime` (24h default) with reconnect close code 1012, `shinyhub status`, retired-generation metrics, and exit logs. New shared-user native replicas use independent output helpers so retired controllers can exit.
-- **native isolation**: broker-native replicas use systemd journal output independent of the controller and expose bounded authenticated journal pages in the log viewer. With `shutdown_apps: adopt`, separate worker units and their output survive controller restarts. Launch data travels over the authenticated bootstrap socket, keeping secrets out of unit properties.
-
-## [0.20.9](https://github.com/rvben/shinyhub/compare/v0.20.8...v0.20.9) - 2026-10-14
-
-### Upgrade notice
 
 The default live-update CPU accounting request changes from 1 to 0.1 core per
 worker. This restores deploys and scheduled rolls for small idle fleets, while
@@ -36,7 +25,7 @@ request. These requests are accounting budgets, separate from runtime CPU quotas
 
 ### Fixed
 
-- **reload**: cap successor replica requirements at the predecessor's actually ready replicas so hosts serving below their configured warm floor can reload. Report readiness timeouts and app blockers to the successor's server log, and clarify the separate `server.upgrade_timeout + 1m` readiness budget in CLI help and documentation.
+- **reload**: preserve every replica ready before the handoff, including capacity above the configured warm floor, and warn when an app starts below its floor. The separate successor readiness budget remains documented as `server.upgrade_timeout + 1m`. Report readiness timeouts and app blockers to the successor server log.
 
 - **runtime**: support long Linux control-socket paths without moving sockets out of their private directories; reject runtime control directories owned by another user.
 - **schedules**: cap grouped-roll surge admission at the configured worker limit, including when warm spares exceed that limit.
@@ -47,6 +36,9 @@ request. These requests are accounting budgets, separate from runtime CPU quotas
 - **loadtest**: capture worker profiles during pressure ([ca9740c](https://github.com/rvben/shinyhub/commit/ca9740cc5528e79e3161bd8fbe6218e13ab5eb21))
 
 ### Added
+
+- **reload**: re-read private `server.env_file` settings before handoff, removing deleted overrides; add `server.max_retired_lifetime` (24h default) with reconnect close code 1012, `shinyhub status`, retired-generation metrics, and exit logs. New shared-user native replicas use independent output helpers so retired controllers can exit.
+- **native isolation**: broker-native replicas use systemd journal output independent of the controller and expose bounded authenticated journal pages in the log viewer. With `shutdown_apps: adopt`, separate worker units and their output survive controller restarts. Launch data travels over the authenticated bootstrap socket, keeping secrets out of unit properties.
 
 - **testing**: add an isolated Linux Python/R lifecycle matrix with real sessions, browser calculations, kernel resource-limit checks, and scoped cleanup. Its README states the supported reload and deployment boundaries.
 - **announcements**: root on Linux or macOS can mint an audited, non-renewable announcement-only credential with `shinyhub local-token --scope announcements --ttl 10m`. Credentials expire within fifteen minutes, require a private runtime socket and kernel peer-UID verification, and use the existing announcement CLI and API with a 24-hour notice window and revision protection. Stale runtime sockets recover after crashes, and temporary accept failures retry with bounded backoff.
