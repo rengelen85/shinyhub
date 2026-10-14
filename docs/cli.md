@@ -70,6 +70,7 @@ Run and administer the server:
 |---|---|
 | `init` | Set up ShinyHub for its first run |
 | `serve` | Run the ShinyHub server |
+| `local-token` | Mint a short-lived announcement capability as root on the server host; see [release notices](announcements.md#host-local-release-automation) |
 | `reload` | Reload the local server and acknowledge successor readiness; `--wait` allows temporary transitions to finish; see [zero-downtime upgrades](zero-downtime-upgrades.md) |
 | `validate-config` | Validate server configuration before restarting; see [configuration preflight](configuration.md#validate-before-restarting) |
 | `worker` | Run ShinyHub as a remote worker that joins a control plane |

@@ -73,7 +73,10 @@ func (s *Server) HandleActiveAnnouncements(w http.ResponseWriter, r *http.Reques
 func canManageAnnouncements(u *auth.ContextUser) bool {
 	return u != nil && u.Role == "admin" && !u.AppScopeRestricted && len(u.AppScope) == 0 && u.SupportSession == nil
 }
-func requireAnnouncementAdmin(w http.ResponseWriter, r *http.Request) (*auth.ContextUser, bool) {
+func requireAnnouncementManager(w http.ResponseWriter, r *http.Request) (*auth.ContextUser, bool) {
+	if u := auth.UserFromContext(r.Context()); u != nil && u.LocalAnnouncements {
+		return u, true
+	}
 	u, ok := requireAdmin(w, r)
 	if !ok {
 		return nil, false
@@ -94,7 +97,7 @@ func managed(a db.Announcement) managedAnnouncement {
 	return managedAnnouncement{a, a.Status(time.Now().UTC())}
 }
 func (s *Server) handleListAnnouncements(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireAnnouncementAdmin(w, r); !ok {
+	if _, ok := requireAnnouncementManager(w, r); !ok {
 		return
 	}
 	limit, offset := parsePagination(r)
@@ -118,7 +121,7 @@ func (s *Server) handleListAnnouncements(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, 200, map[string]any{"announcements": out, "has_more": more})
 }
 func (s *Server) handleGetAnnouncement(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireAnnouncementAdmin(w, r); !ok {
+	if _, ok := requireAnnouncementManager(w, r); !ok {
 		return
 	}
 	a, err := s.store.GetAnnouncement(chi.URLParam(r, "id"))
@@ -143,7 +146,7 @@ type announcementRequest struct {
 }
 
 func (s *Server) handleSaveAnnouncement(w http.ResponseWriter, r *http.Request) {
-	u, ok := requireAnnouncementAdmin(w, r)
+	u, ok := requireAnnouncementManager(w, r)
 	if !ok {
 		return
 	}
@@ -232,12 +235,26 @@ func (s *Server) handleSaveAnnouncement(w http.ResponseWriter, r *http.Request) 
 			a.PublishedAt = &now
 		}
 	}
+	if u.LocalAnnouncements && a.Publication == "published" {
+		if a.EndsAt == nil {
+			writeError(w, 400, "host-local announcement publication requires ends_at")
+			return
+		}
+		if a.EndsAt.After(now.Add(auth.LocalNoticeMaxWindow)) {
+			writeError(w, 400, "host-local announcements must end within 24 hours of publication or update")
+			return
+		}
+	}
 	if err := a.Validate(); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
-	a.UpdatedBy = &u.ID
-	audit := db.AuditEventParams{UserID: &u.ID, IPAddress: s.ClientIP(r)}
+	var actor *int64
+	if !u.LocalAnnouncements {
+		actor = &u.ID
+	}
+	a.UpdatedBy = actor
+	audit := db.AuditEventParams{UserID: actor, IPAddress: s.ClientIP(r)}
 	if c := auth.CredentialInfoFromContext(r.Context()); c != nil {
 		if c.ID != 0 {
 			audit.CredentialID = &c.ID

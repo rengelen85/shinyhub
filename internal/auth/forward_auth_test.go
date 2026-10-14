@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rvben/shinyhub/internal/favicon"
 )
@@ -1114,5 +1115,32 @@ func TestForwardAuth_NameHeader_OffWhenUnconfiguredOrEmpty(t *testing.T) {
 	mw2.ServeHTTP(httptest.NewRecorder(), r2)
 	if len(store2.setNameCalls) != 0 {
 		t.Fatalf("missing name value must not write, got %+v", store2.setNameCalls)
+	}
+}
+
+func TestForwardAuthLocalCapabilityHasNoProxyIdentity(t *testing.T) {
+	store := newFakeStore()
+	cfg := ForwardAuthConfig{Enabled: true, UserHeader: "X-Forwarded-User", SharedSecret: "proxy-secret", SecretHeader: "X-Proxy-Secret", DefaultRole: "admin"}
+	token, _, _, err := IssueLocalToken(localTestSecret, LocalTokenScope, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := ForwardAuthMiddleware(store, cfg, []*net.IPNet{mustCIDR(t, "127.0.0.0/8")})(BearerMiddleware(localTestSecret, nil, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := UserFromContext(r.Context())
+		if !u.LocalAnnouncements || u.Role != "" {
+			t.Fatal("capability inherited proxy role")
+		}
+		if r.Header.Get(cfg.UserHeader) != "" {
+			t.Fatal("proxy identity header retained")
+		}
+	})))
+	req := httptest.NewRequest("GET", "/api/announcements", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set(cfg.UserHeader, "proxy-admin")
+	req.Header.Set("Authorization", "Token "+token)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != 200 || len(store.created) != 0 {
+		t.Fatalf("status %d, provisioned %v: %s", w.Code, store.created, w.Body)
 	}
 }

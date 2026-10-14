@@ -26,7 +26,7 @@ Announcement content is public, including before sign-in. Do not include private
 
 When multiple notices are active, Critical comes first, then Warning, then Information; newer publication breaks ties. **View all announcements** expands the other active notices.
 
-Successful mutations and their audit records commit together. Only platform-wide administrators may manage notices. App-scoped administrator credentials cannot do so. An unrestricted administrator service credential can use the API for automation.
+Successful mutations and their audit records commit together. Platform-wide administrators and root-issued host-local announcement capabilities may manage notices. App-scoped administrator credentials cannot do so. An unrestricted administrator service credential can use the API for automation. Operator and deployment credentials do not gain announcement permissions.
 
 For persistent instance identity, use [branding.environment](branding.md#environment-identity).
 Its strip has a separate slot and is never hidden by announcement ordering.
@@ -43,7 +43,7 @@ Notices communicate maintenance; they do not stop apps, drain sessions, guarante
 
 ## Release pipeline CLI
 
-Use `shinyhub announcements` with platform-wide administrator credentials. The example below requires Bash and `jq`. The CLI uses the existing `SHINYHUB_HOST` and `SHINYHUB_TOKEN` environment variables or saved client credentials. App-scoped credentials cannot manage announcements.
+Use `shinyhub announcements` with platform-wide administrator credentials, or a [host-local announcement capability](#host-local-release-automation). The example below requires Bash and `jq`. The CLI uses the existing `SHINYHUB_HOST` and `SHINYHUB_TOKEN` environment variables or saved client credentials. App-scoped credentials cannot manage announcements.
 
 ```bash
 set -euo pipefail
@@ -75,6 +75,96 @@ The 45-second delay is a best-effort propagation window, not a readership guaran
 
 Do not withdraw unconditionally in an exit trap: a failed release may leave users experiencing disruption. Retain its notice until expiry, or use the administration UI/API to describe the remaining impact. TTL expiry withdraws stale messaging; it does not indicate recovery. The outer release pipeline owns the full window, including host/auth restarts and smoke tests; `fleet apply` does not publish or clear notices.
 
+## Host-local release automation
+
+On Linux and macOS, root on the server host can request a short-lived credential
+without a stored administrator token:
+
+```bash
+# Run on the ShinyHub host as root. Use the configuration of the running server.
+shinyhub local-token --config /etc/shinyhub/shinyhub.yaml \
+  --scope announcements --ttl 10m
+```
+
+The command prints only the token to stdout and never saves it to client
+credentials. It requires a running server with `server.pid_file` configured and
+a private `0700` `.reload` directory beside that file. The issuance socket is
+`0600`; the server additionally checks the connected peer's kernel-reported UID
+and accepts only UID 0. Socket access as the ShinyHub service user does not grant
+issuance. No HTTP endpoint can mint these credentials. Unsupported operating
+systems refuse the command.
+
+`--scope announcements` is required and is the only supported scope. `--ttl`
+defaults to ten minutes and must be between one second and fifteen minutes.
+Expiry uses the server clock. Tokens survive a normal server restart with the
+same authentication secret and expire independently of the notice. They cannot
+renew themselves, authenticate browser sessions, manage users or apps, create
+other credentials, or call other authenticated API endpoints. They use the
+normal `Authorization: Token <token>` scheme; the existing CLI selects it
+automatically. They grant platform-wide announcement management, including
+editing or withdrawing other notices, so keep them within the release process.
+
+The server records issuance before returning the credential and refuses to
+issue one if that durable audit write fails. Announcement mutations retain the
+normal transactional audit and revision checks. Both records identify
+`local-token(uid=0, scope=announcements, id=...)`, with a unique token ID and no
+invented human account. UID 0 identifies host automation; retain SSH/SSM and
+pipeline logs to establish who invoked it. The credential itself is never
+included in audit records. There is no command to revoke one local token before
+expiry; an authentication-secret rotation invalidates all tokens signed with that
+secret.
+
+Use a fresh credential for withdrawal, so a release lasting longer than ten
+minutes can still clear its own notice. This Bash example requires `jq`; set
+`SHINYHUB_HOST` explicitly to this instance's normal API URL. Use the CLI's
+existing TLS configuration when that URL uses HTTPS.
+
+```bash
+set -euo pipefail
+# Keep shell tracing disabled so command output and credentials stay out of logs.
+set +x
+export SHINYHUB_HOST="https://shinyhub.example.com"
+server_config=/etc/shinyhub/shinyhub.yaml
+
+# A separate assignment preserves failure status from local-token.
+notice_token=$(shinyhub local-token --config "$server_config" \
+  --scope announcements --ttl 10m)
+notice=$(SHINYHUB_TOKEN="$notice_token" shinyhub announcements publish \
+  --severity warning --ttl 90m \
+  --title "Release in progress" \
+  --message "Dashboards may briefly disconnect; reload the page if one stops responding." \
+  --output json)
+unset notice_token
+notice_id=$(jq -er '.id' <<<"$notice")
+notice_revision=$(jq -er '.announcement.revision' <<<"$notice")
+
+# Retain this ID and revision if withdrawal runs in a separate job.
+sleep 45
+# Run the host upgrade, app rollout, and smoke tests here.
+# Continue only after all release steps succeed and ShinyHub is serving again.
+
+notice_token=$(shinyhub local-token --config "$server_config" \
+  --scope announcements --ttl 10m)
+SHINYHUB_TOKEN="$notice_token" shinyhub announcements disable "$notice_id" \
+  --expected-revision "$notice_revision"
+unset notice_token
+```
+
+An API publication using a host-local token must have `ends_at` no more than
+24 hours after the server's current time, even when bypassing the CLI. This also
+applies to edits of published notices and bounds scheduling to that window.
+Administrators retain their existing ability to publish longer or ongoing notices. The notice
+TTL remains the fallback if the release fails or cannot withdraw it. Keep a
+failed release's notice until expiry or explicitly update its impact; do not
+withdraw in an unconditional exit trap. Never blindly retry an outcome-unknown
+publication: inspect announcement history first.
+
+These credentials are for root-controlled host automation and break-glass
+operations. Ordinary remote CI and workstation deployments should continue
+using their configured deployment identities. Minting is host-local; the issued
+credential is a bearer credential usable on the normal API until it expires,
+so do not distribute it or retain it as a pipeline secret.
+
 ## API
 
 Public active feeds:
@@ -86,7 +176,7 @@ GET /app/{slug}/.shinyhub/announcements.json
 
 Both return `announcements`, `server_time`, and `next_transition`. The app-origin feed is read-only and has the same public content regardless of the slug. All feeds use `Cache-Control: no-store`.
 
-Management endpoints require platform-wide administrator credentials:
+Management endpoints require platform-wide administrator credentials or a host-local announcement capability:
 
 ```text
 GET   /api/announcements?limit=50&offset=0

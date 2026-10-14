@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rvben/shinyhub/internal/runtimesocket"
 	"io"
 	"log/slog"
 	"net"
@@ -13,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -70,42 +70,8 @@ func StartReloadControl(ctx context.Context, pidFile string, upgradeTimeout time
 	if pidFile == "" {
 		return func() {}, nil
 	}
-	dir := filepath.Dir(reloadSocket(pidFile, os.Getpid()))
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, err
-	}
-	info, err := os.Lstat(dir)
+	listener, err := runtimesocket.Listen(reloadSocket(pidFile, os.Getpid()))
 	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return nil, errors.New("reload control directory must be private (mode 0700)")
-	}
-	path := reloadSocket(pidFile, os.Getpid())
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSocket == 0 {
-			return nil, errors.New("reload control path already exists and is not a socket")
-		}
-		conn, err := net.DialTimeout("unix", path, time.Second)
-		if err == nil {
-			conn.Close()
-			return nil, errors.New("reload control socket is already active")
-		}
-		if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("check existing reload socket: %w", err)
-		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("remove stale reload socket: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		return nil, fmt.Errorf("listen for reloads: %w", err)
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		listener.Close()
 		return nil, err
 	}
 	controlCtx, cancel := context.WithCancel(ctx)
@@ -115,7 +81,7 @@ func StartReloadControl(ctx context.Context, pidFile string, upgradeTimeout time
 	go func() {
 		defer close(acceptDone)
 		for {
-			conn, err := listener.Accept()
+			conn, err := runtimesocket.Accept(listener, log)
 			if err != nil {
 				return
 			}

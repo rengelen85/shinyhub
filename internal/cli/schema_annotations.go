@@ -54,7 +54,7 @@ var mut = boolp(true) // mutating
 // below the root, e.g. "apps list", "schedule add", "serve".
 var schemaAnnotations = map[string]cmdAnnotation{
 	"announcements": {Mutating: ro},
-	"announcements publish": {Mutating: mut, ArgEnums: map[string][]string{"--severity": {"information", "warning", "critical"}}, Notes: "Requires exactly one of positive --ttl or future --ends-at. Platform-wide administrator credentials required. Writes are not automatically retried; ambiguous write outcomes return internal/exit 1 with an inspection hint.", OutputFields: []fieldSpec{
+	"announcements publish": {Mutating: mut, ArgEnums: map[string][]string{"--severity": {"information", "warning", "critical"}}, Notes: "Requires exactly one of positive --ttl or future --ends-at. Platform-wide administrator credentials or a root-issued host-local announcement token required. Writes are not automatically retried; ambiguous write outcomes return internal/exit 1 with an inspection hint.", OutputFields: []fieldSpec{
 		{Name: "status", Type: "string"}, {Name: "id", Type: "string"}, {Name: "announcement", Type: "object"},
 	}},
 	"announcements get":  {Mutating: ro, OutputFields: announcementOutputFields},
@@ -115,7 +115,8 @@ var schemaAnnotations = map[string]cmdAnnotation{
 		{Name: "created_config", Type: "boolean"},
 		{Name: "created_admin", Type: "boolean"},
 	}},
-	"serve": {Mutating: mut, Streaming: true},
+	"serve":       {Mutating: mut, Streaming: true},
+	"local-token": {Mutating: mut, ArgTypes: map[string]string{"--config": "path"}, ArgEnums: map[string][]string{"--scope": {"announcements"}}, Notes: "Root-only host-local credential issuance. Requires a live private Unix socket and server.pid_file. Prints only a secret token, regardless of output format; never saves client credentials. TTL is 1s..15m (default 10m). Issuance is audited and non-idempotent; the token authorizes only announcement management and cannot renew itself."},
 	"reload": {Mutating: mut, ArgTypes: map[string]string{"--config": "path"}, OutputFields: []fieldSpec{
 		{Name: "status", Type: "string", Desc: "reloaded"},
 		{Name: "previous_pid", Type: "integer"},

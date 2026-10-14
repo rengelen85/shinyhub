@@ -59,6 +59,7 @@ import (
 	"github.com/rvben/shinyhub/internal/leader"
 	"github.com/rvben/shinyhub/internal/lifecycle"
 	"github.com/rvben/shinyhub/internal/lifecycle/scheduler"
+	"github.com/rvben/shinyhub/internal/localtoken"
 	"github.com/rvben/shinyhub/internal/logging"
 	"github.com/rvben/shinyhub/internal/metrics"
 	"github.com/rvben/shinyhub/internal/oauth"
@@ -460,7 +461,7 @@ var buildRootOnce sync.Once
 // tests to call; registration happens exactly once per process.
 func buildRoot() *cobra.Command {
 	buildRootOnce.Do(func() {
-		rootCmd.AddCommand(newRelayProtocolCmd(), newInitCmd(), serveCmd, reloadCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd, newHealthcheckCmd(), newWorkerCmd(), newSandboxCmd())
+		rootCmd.AddCommand(newLocalTokenCmd(), newRelayProtocolCmd(), newInitCmd(), serveCmd, reloadCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd, newHealthcheckCmd(), newWorkerCmd(), newSandboxCmd())
 		cli.AddCommandsTo(rootCmd)
 	})
 	return rootCmd
@@ -3367,6 +3368,23 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		stopReloadControl = func() {}
 	}
 	defer stopReloadControl()
+	stopLocalTokens, err := localtoken.Start(ctx, cfg.Server.PIDFile, func(ctx context.Context, scope string, ttl time.Duration) (string, error) {
+		token, id, expires, err := auth.IssueLocalToken(cfg.Auth.Secret, scope, ttl)
+		if err != nil {
+			return "", err
+		}
+		if err := store.RecordLocalToken(ctx, id, expires); err != nil {
+			return "", err
+		}
+		return token, nil
+	})
+	if err != nil {
+		logger.Error("host-local token issuance unavailable", "err", err)
+		stopLocalTokens = func() {}
+	} else {
+		defer stopLocalTokens()
+	}
+
 	if err := upg.Ready(); err != nil {
 		_ = httpSrv.Close()
 		if metricsSrv != nil {
@@ -3408,6 +3426,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	// Mark unready for both the signal and clean self-stop paths.
 	prx.SetDraining(true)
 	handedOff := upgradeSignals.SuccessfulHandoff()
+	stopLocalTokens()
 	stopReloadControl()
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)

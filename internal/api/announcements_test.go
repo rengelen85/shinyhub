@@ -20,7 +20,7 @@ func announcementRequest(t *testing.T, s *api.Server, method, path, token string
 	r := httptest.NewRequest(method, path, bytes.NewReader(data))
 	if token != "" {
 		scheme := "Bearer "
-		if strings.HasPrefix(token, "shk_") {
+		if strings.HasPrefix(token, "shk_") || strings.HasPrefix(token, auth.LocalTokenPrefix) {
 			scheme = "Token "
 		}
 		r.Header.Set("Authorization", scheme+token)

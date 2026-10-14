@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,6 +38,9 @@ type SupportSessionContext struct {
 }
 
 type ContextUser struct {
+	// LocalAnnouncements marks a dedicated host capability with no user role.
+	LocalAnnouncements bool
+
 	ID       int64
 	Username string
 	Role     string
@@ -264,6 +268,12 @@ func (e *WrongSchemeError) Error() string {
 // the header is only ever set when the request already carried an Authorization
 // header of its own.
 func writeUnauthorized(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrLocalTokenScope) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	var wrong *WrongSchemeError
 	if errors.As(err, &wrong) {
 		w.Header().Set("WWW-Authenticate", fmt.Sprintf(
@@ -339,6 +349,9 @@ func authenticateHeader(header, secret string, keyLookup APIKeyLookup, userLooku
 		tokenInfo := tokenFromClaims(claims)
 		return &authResult{User: user, Token: tokenInfo, Credential: credentialFromToken("session_token", tokenInfo)}, nil
 	case "token":
+		if strings.HasPrefix(token, LocalTokenPrefix) {
+			return authenticateLocalToken(token, secret, revoked)
+		}
 		if keyLookup == nil {
 			return nil, fmt.Errorf("api key lookup unavailable")
 		}
@@ -459,6 +472,9 @@ func authenticateRequest(r *http.Request, secret string, keyLookup APIKeyLookup,
 	if err != nil || res == nil {
 		return nil, err
 	}
+	if res.User != nil && res.User.LocalAnnouncements && !localAnnouncementRequest(r) {
+		return nil, ErrLocalTokenScope
+	}
 	return res, nil
 }
 
@@ -473,9 +489,13 @@ func authenticateRequest(r *http.Request, secret string, keyLookup APIKeyLookup,
 func BearerMiddleware(secret string, keyLookup APIKeyLookup, userLookup UserLookup, revoked RevocationChecker) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// An upstream middleware (e.g. forward-auth) may have already authenticated
-			// this request and attached the user. Honor it and pass through.
-			if UserFromContext(r.Context()) != nil {
+			// Honor an upstream identity unless an explicit host capability was
+			// supplied; capabilities must not inherit a broader user role.
+			if u := UserFromContext(r.Context()); u != nil && !IsLocalTokenHeader(r.Header.Get("Authorization")) {
+				if u.LocalAnnouncements && !localAnnouncementRequest(r) {
+					writeUnauthorized(w, ErrLocalTokenScope)
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
 			}

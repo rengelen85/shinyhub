@@ -4195,8 +4195,10 @@ type AuditEvent struct {
 // LogAuditEvent inserts an audit event. A write failure is logged and surfaced
 // via the audit-error hook but does not fail the caller — audit recording must
 // never break normal operation.
-func (s *Store) LogAuditEvent(p AuditEventParams) {
-	_, err := s.db.Exec(`
+func (s *Store) LogAuditEvent(p AuditEventParams) { _ = s.recordAuditEvent(context.Background(), p) }
+
+func (s *Store) recordAuditEvent(ctx context.Context, p AuditEventParams) error {
+	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO audit_events (user_id, action, resource_type, resource_id, detail, ip_address, run_id,
 		 credential_id, credential_type, credential_name)
 		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)`,
@@ -4229,6 +4231,7 @@ func (s *Store) LogAuditEvent(p AuditEventParams) {
 			s.auditErrHook()
 		}
 	}
+	return err
 }
 
 // AuditEventFilter narrows the audit stream for contextual UI destinations.

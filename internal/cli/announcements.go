@@ -15,7 +15,7 @@ import (
 )
 
 func newAnnouncementsCmd() *cobra.Command {
-	cmd := &cobra.Command{Use: "announcements", Short: "Manage public platform notices (platform administrator)"}
+	cmd := &cobra.Command{Use: "announcements", Short: "Manage public platform notices (administrator or host-local announcement token)"}
 	cmd.AddCommand(newAnnouncementsPublishCmd(), newAnnouncementsGetCmd(), newAnnouncementsListCmd(), newAnnouncementsDisableCmd())
 	return cmd
 }

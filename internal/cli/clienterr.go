@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/rvben/shinyhub/internal/auth"
 	"net/http"
 	"strings"
 )
@@ -53,6 +54,9 @@ func loginFailedError(resp *http.Response) error {
 func httpError(token, op string, resp *http.Response, body []byte) error {
 	if err := parseDiskQuotaError(op, resp.StatusCode, body); err != nil {
 		return err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && strings.HasPrefix(token, auth.LocalTokenPrefix) {
+		return &httpStatusError{Status: resp.StatusCode, msg: "host-local announcement credential was rejected - mint a fresh token on the server host with `shinyhub local-token --scope announcements`"}
 	}
 	if resp.StatusCode == http.StatusUnauthorized && looksLikeJWT(token) {
 		return &httpStatusError{

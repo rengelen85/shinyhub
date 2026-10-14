@@ -36,6 +36,11 @@ func (b *boundDB) Exec(query string, args ...any) (sql.Result, error) {
 	b.observe(rebound)
 	return b.real.Exec(rebound, args...)
 }
+func (b *boundDB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	rebound := b.d.rebind(query)
+	b.observe(rebound)
+	return b.real.ExecContext(ctx, rebound, args...)
+}
 func (b *boundDB) Query(query string, args ...any) (*sql.Rows, error) {
 	rebound := b.d.rebind(query)
 	b.observe(rebound)

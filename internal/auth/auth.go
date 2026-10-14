@@ -227,13 +227,13 @@ func ValidateJWT(tokenStr, secret string, revoked RevocationChecker) (*Claims, e
 	return validateJWT(tokenStr, secret, revoked, "")
 }
 
-func validateJWT(tokenStr, secret string, revoked RevocationChecker, purpose string) (*Claims, error) {
+func validateJWT(tokenStr, secret string, revoked RevocationChecker, purpose string, options ...jwt.ParserOption) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return []byte(secret), nil
-	})
+	}, options...)
 	if err != nil {
 		return nil, err
 	}

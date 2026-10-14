@@ -142,6 +142,12 @@ func ForwardAuthMiddleware(store ForwardAuthUserStore, cfg ForwardAuthConfig, tr
 			delForwardAuthHeader(r, cfg.NameHeader)
 			delForwardAuthHeader(r, cfg.EmailHeader)
 
+			// A host capability must never inherit a proxy user's broader role.
+			// Strip ingress headers above, then let explicit token auth decide.
+			if IsLocalTokenHeader(r.Header.Get("Authorization")) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			onAppHost := forwardAppHost(r, cfg, trustedProxies)
 			launch := onAppHost && r.URL.Query().Get("__shinyhub_launch") != ""
 			resume := r.URL.Path == ForwardAuthResumePath && r.Method == http.MethodPost

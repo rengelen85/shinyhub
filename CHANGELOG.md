@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **announcements**: root on Linux or macOS can mint an audited, non-renewable announcement-only credential with `shinyhub local-token --scope announcements --ttl 10m`. Credentials expire within fifteen minutes, require a private runtime socket and kernel peer-UID verification, and use the existing announcement CLI and API with a 24-hour notice window and revision protection. Stale runtime sockets recover after crashes, and temporary accept failures retry with bounded backoff.
+
 ## [0.20.8](https://github.com/rvben/shinyhub/compare/v0.20.6...v0.20.8) - 2026-10-14
 
 ### Fixed
