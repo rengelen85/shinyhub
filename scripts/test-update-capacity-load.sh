@@ -21,7 +21,11 @@ case "$architecture" in
   *) echo "Unsupported Docker architecture: $architecture" >&2; exit 1 ;;
 esac
 cd "$root"
-GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o "$scratch/shinyhub" ./cmd/shinyhub
+if [ -n "${LOAD_BINARY_OVERRIDE:-}" ]; then
+  cp "$LOAD_BINARY_OVERRIDE" "$scratch/shinyhub"
+else
+  GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o "$scratch/shinyhub" ./cmd/shinyhub
+fi
 docker build -t shinyhub-update-load:local loadtest/update-capacity
 docker build -f loadtest/update-capacity/Dockerfile.driver -t shinyhub-update-load-driver:local loadtest/update-capacity
 mkdir -p loadtest/results
@@ -41,7 +45,7 @@ docker create --name "$network-driver" --label "shinyhub.load_run=$network" --ne
   --mount "type=bind,src=$root,dst=/work" \
   -e LOAD_NETWORK="$network" -e LOAD_BINARY=/binary \
   -e LOAD_NETWORK_OWNER="$network_owner" \
-  -e LOAD_COMMIT="$(git rev-parse HEAD)" \
+  -e LOAD_COMMIT="${LOAD_COMMIT:-$(git rev-parse HEAD)}" \
   -e LOAD_PROFILE="${LOAD_PROFILE:-pressure}" -e LOAD_SESSIONS="${LOAD_SESSIONS:-1000}" \
   -e LOAD_CORES="${LOAD_CORES:-}" \
   -e LOAD_REPLICAS="${LOAD_REPLICAS:-1}" -e LOAD_DIRECT="${LOAD_DIRECT:-0}" \

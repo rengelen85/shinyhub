@@ -13,6 +13,10 @@ local images. The launcher cross-compiles the current ShinyHub source for the
 engine's architecture. It creates an isolated network, server and generator,
 then removes only that run's containers and network. Nothing is published.
 Evidence is written to the gitignored `loadtest/results/update-capacity-*`.
+On a Linux host without Go, build the binary in a Go container first and pass
+its absolute path as `LOAD_BINARY_OVERRIDE`. For an exported source archive,
+also set `LOAD_COMMIT` to its exact source commit. The report always records
+the executable hash. The binary must match the Docker engine's architecture.
 
 The generator runs in Linux **outside** the server's one-core, 2 GiB cgroup
 (four cores in the roomy profile).
@@ -110,6 +114,9 @@ evidence directory. Use `go tool pprof -top <path>/proxy.cpu.pprof`, Chromium
 DevTools for `generator.cpuprofile`, and Python `pstats` for `load-worker-*.pstats`.
 
 Inspect host and generator measurements before attributing latency to ShinyHub.
+For a virtualized engine, also check the physical host: spare guest CPU does not
+prove the hypervisor has spare compute or memory. Reject a contended host as an
+uncontended performance control.
 A single synchronous Python render runs on one worker regardless of the server's
 total CPU allocation. Multiple workers can spread independent sessions; they
 do not parallelize one session's computation. Availability assertions alone do
