@@ -25,6 +25,8 @@ request. These requests are accounting budgets, separate from runtime CPU quotas
 
 ### Fixed
 
+- **diagnostics**: report a live replica's endpoint and worker identity alongside its PID, including while a scheduled roll is checkpointing its replacement.
+
 - **reload**: preserve every replica ready before the handoff, including capacity above the configured warm floor, and warn when an app starts below its floor. The separate successor readiness budget remains documented as `server.upgrade_timeout + 1m`. Report readiness timeouts and app blockers to the successor server log.
 
 - **runtime**: support long Linux control-socket paths without moving sockets out of their private directories; reject runtime control directories owned by another user.

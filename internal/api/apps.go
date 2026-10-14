@@ -219,6 +219,9 @@ func (s *Server) liveReplicaView(slug string, stored []*db.Replica) []*db.Replic
 			}
 			rep.Status = string(info.Status)
 			rep.Provider, rep.Tier = info.Provider, info.Tier
+			// Runtime identity must come from one observation. During a roll the
+			// live process can be ready before its durable row is checkpointed.
+			rep.EndpointURL, rep.WorkerID = info.EndpointURL, info.WorkerID
 			if info.PID != 0 {
 				pid := info.PID
 				rep.PID = &pid
