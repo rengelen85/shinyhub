@@ -26,7 +26,7 @@ export async function checkUpdateCapacity({ browser, context, page, original, ap
       await page.getByRole('button', { name: 'Recalculate' }).click();
       await output(page, 'v1', 3, 500, original);
       assert.ok(held.every(socket => !socket.isClosed()), 'blocked update keeps existing WebSockets open');
-      report.capacity = { budget_cores: 0.5, concurrent_page_requests: responses.length, held_websockets: held.length };
+      report.capacity = { budget_cores: 0.1, concurrent_page_requests: responses.length, held_websockets: held.length };
     });
     operatorContext = await browser.newContext({ userAgent: 'shinyhub-capacity-test' });
     const operator = await operatorContext.newPage();

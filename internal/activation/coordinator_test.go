@@ -1,8 +1,11 @@
 package activation
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -279,5 +282,49 @@ func TestPausedCoordinatorContinuesAdmittedRepair(t *testing.T) {
 	}
 	if len(store.queue) != 1 || len(store.finished) != 1 {
 		t.Fatalf("queue=%v finished=%v", store.queue, store.finished)
+	}
+}
+
+func TestRepeatedCapacityDeferralWarnsWithOperatorContext(t *testing.T) {
+	// This package does not run tests in parallel; restore the process logger
+	// after each case. The race suite also exercises coordinator goroutines.
+	for _, tc := range []struct {
+		name            string
+		prior, deadline int
+		level           string
+	}{
+		{"first", 0, 0, "level=INFO"}, {"repeated", 3, 0, "level=WARN"}, {"finite deadline", 3, 7200, "level=WARN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+			now := time.Now().UTC()
+			a := &db.ScheduleActivation{ID: 7, AppSlug: "demo", CapacityDeferrals: tc.prior, MaxDeferAgeSeconds: tc.deadline}
+			age := "deferred_age=0s"
+			if tc.prior > 0 {
+				at := now.Add(-time.Hour)
+				a.CapacityDeferredAt = &at
+				age = "deferred_age=1h0m0s"
+			}
+			store := &fakeStore{queue: []*db.ScheduleActivation{a}}
+			c := New(store, fakeRunner{err: &CapacityError{Reason: "CPU budget"}}, time.Second)
+			c.now = func() time.Time { return now }
+			if worked, err := c.ProcessNext(context.Background()); !worked || err != nil {
+				t.Fatalf("process: %v %v", worked, err)
+			}
+			for _, want := range []string{tc.level, fmt.Sprintf("capacity_deferrals=%d", tc.prior+1), age, fmt.Sprintf("max_defer_age_seconds=%d", tc.deadline), "next_action="} {
+				if !strings.Contains(logs.String(), want) {
+					t.Fatalf("missing %q in logs: %s", want, logs.String())
+				}
+			}
+			if tc.prior == 0 && strings.Contains(logs.String(), "level=WARN") {
+				t.Fatal("first deferral escalated prematurely")
+			}
+			if len(store.finished) != 0 || len(store.deferred) != 1 || store.deferred[0] != "deferred_capacity" {
+				t.Fatal("expected one durable capacity deferral")
+			}
+		})
 	}
 }

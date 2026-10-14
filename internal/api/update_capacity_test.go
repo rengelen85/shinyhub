@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/rvben/shinyhub/internal/activation"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/deploy"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/rvben/shinyhub/internal/config"
+	"github.com/rvben/shinyhub/internal/process"
 )
 
 func TestDeployCPUExhaustionKeepsServingGeneration(t *testing.T) {
@@ -169,6 +171,8 @@ func TestDeployCPUAdmissionBudgetsWholePoolAndFailsClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, store, token, mgr, _, runtime := buildManifestE2EServer(t, config.RuntimeConfig{})
 			defer srv.Close()
+			request := 1.0
+			srv.cfg.Server.UpdateCapacity.WorkerCPURequestCores = &request
 			app := createGenerationTestApp(t, store, "cpu-"+tc.name, tc.replicas, 16)
 			if rec := deployBareGeneration(t, srv, token, app.Slug, "print('old')", false); rec.Code != http.StatusOK {
 				t.Fatal(rec.Body.String())
@@ -237,6 +241,7 @@ func TestScheduledRollCPUBlockDefersWithoutLosingWorkersAndRetries(t *testing.T)
 	cfg.Server.DrainTimeout = 5 * time.Millisecond
 	srv, app := newScaleTestServer(t, "cpu-roll", 1, cfg)
 	defer srv.Close()
+	srv.SetHostCapacity(1, "config", 65536, "config")
 	srv.deployReplica = successfulActivationTestDeployer(t, srv, app, 21700)
 	a := seedClaimedActivation(t, srv.store, app)
 	if _, err := srv.store.RequeueRunningScheduleActivations(time.Now().UTC()); err != nil {
@@ -287,5 +292,51 @@ func TestScheduleCreationWarnsWhenRollCPUCannotFit(t *testing.T) {
 	}
 	if rec.Code != http.StatusCreated || !strings.Contains(dto.Advisory, "CPU") || !strings.Contains(dto.Advisory, "defer") {
 		t.Fatalf("CPU roll warning missing: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRecoveredFleetCPUWarningUsesAdmissionWorkerCount(t *testing.T) {
+	srv, store, token, mgr, _, _ := buildManifestE2EServer(t, config.RuntimeConfig{})
+	defer srv.Close()
+	srv.SetHostCapacity(1, "config", 65536, "config")
+	request := 0.25
+	srv.cfg.Server.UpdateCapacity.WorkerCPURequestCores = &request
+	srv.SetAvailableCPUForTest(func() (float64, error) { return 1, nil })
+	app := createGenerationTestApp(t, store, "warning-budget", 1, 16)
+	if rec := deployBareGeneration(t, srv, token, app.Slug, "print('old')", false); rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	if warning := srv.UpdateCPUCapacityWarning(); warning != "" {
+		t.Fatalf("one-worker fleet fits: %s", warning)
+	}
+	// One running generation, one suspended worker and one unconfirmed start.
+	// Terminated and remote workers must not consume local CPU budgets.
+	for i, info := range []process.ProcessInfo{
+		{Status: process.StatusSuspended}, {Status: process.StatusStarting},
+		{Status: process.StatusStopped}, {Status: process.StatusCrashed},
+		{Status: process.StatusRunning, Provider: "fargate"},
+		{Status: process.StatusRunning, Tier: "remote"},
+	} {
+		info.Slug = fmt.Sprintf("recovered-%d", i)
+		mgr.ForceEntry(info.Slug, info)
+	}
+	srv.SetNodeForTier(func(tier string) string {
+		if tier == "remote" {
+			return "remote-node"
+		}
+		return ""
+	})
+	warning := srv.UpdateCPUCapacityWarning()
+	if !strings.Contains(warning, "3 live worker(s)") {
+		t.Fatalf("incorrect recovered fleet warning: %s", warning)
+	}
+	if block := srv.checkUpdateCPU(app, 1); block == nil || !strings.Contains(block.Error(), "CPU budget") {
+		t.Fatalf("warning and admission disagree: %v", block)
+	}
+	// A configured host override cannot conceal the tighter cgroup quota.
+	srv.SetHostCapacity(16, "config", 65536, "config")
+	setTestCPUQuota(srv, 1)
+	if warning := srv.UpdateCPUCapacityWarning(); !strings.Contains(warning, "1.00 effective cores") {
+		t.Fatalf("override bypassed quota warning: %s", warning)
 	}
 }

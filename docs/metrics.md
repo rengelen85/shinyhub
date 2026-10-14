@@ -284,6 +284,8 @@ alert; the retry and overflow results are useful early warnings.
 | `shinyhub_schedule_last_success_seconds` | gauge | `slug`, `schedule` | Unix timestamp of the most recent successful command run; absent until the first success. |
 | `shinyhub_schedule_activation_status` | gauge | `slug`, `schedule`, `status` | Current durable serving-data activation state; the labeled state has value 1. Alert on `repairing`, `deferred_capacity`, `failed`, `cancelled`, or `blocked_unsupported` according to age and policy. |
 | `shinyhub_schedule_activation_age_seconds` | gauge | `slug`, `schedule` | Age of a nonterminal activation. Use with the status metric so ordinary interval damping is not mistaken for a fault. |
+| `shinyhub_schedule_activation_capacity_deferrals` | gauge | `slug`, `schedule` | Deferral count of the latest activation, retained across coalesced producer successes. Historical terminal activations retain their counts. |
+| `shinyhub_schedule_activation_capacity_deferred_age_seconds` | gauge | `slug`, `schedule` | Age since the first capacity deferral of outstanding work, retained across coalesced producer successes. Absent after completion or cancellation; alert on this age directly so new producer successes cannot reset the alert timer. |
 | `shinyhub_schedule_activation_target_generation` | gauge | `slug`, `schedule` | Target serving-data generation of the latest activation. |
 
 ### Application-log durability and delivery

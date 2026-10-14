@@ -6,11 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Upgrade notice
+
+The default live-update CPU accounting request changes from 1 to 0.1 core per
+worker. This restores deploys and scheduled rolls for small idle fleets, while
+retaining memory and measured-pressure checks. CPU-heavy startup workloads that
+rely on the previous conservative accounting should explicitly configure
+`server.update_capacity.worker_cpu_request_cores: 1` or another appropriate
+request. These requests are accounting budgets, separate from runtime CPU quotas.
+
+### Fixed
+
+- **capacity**: lower the default live-update CPU accounting request from 1 to 0.1 core per worker so idle small-host fleets can deploy and roll again. Explicit requests, live-worker accounting, the 10% reserve, memory checks, and measured CPU pressure checks remain in effect. Startup warns against the recovered local fleet; `validate-config` warns when the minimum serving-plus-surge pair cannot fit and reports locally effective cores and their source.
+- **schedules**: escalate repeated capacity deferrals to warning logs with durable deferral count, age, retry delay, and operator guidance. A zero `max_defer_age` still retries indefinitely without stopping serving workers; capacity-deferral age and count metrics survive coalesced producer successes. Preserve the capacity deadline across queued replacements and producer completion during an in-flight roll, without carrying resolved episodes into new work.
+
 ### Added
 
 - **announcements**: root on Linux or macOS can mint an audited, non-renewable announcement-only credential with `shinyhub local-token --scope announcements --ttl 10m`. Credentials expire within fifteen minutes, require a private runtime socket and kernel peer-UID verification, and use the existing announcement CLI and API with a 24-hour notice window and revision protection. Stale runtime sockets recover after crashes, and temporary accept failures retry with bounded backoff.
 
 ## [0.20.8](https://github.com/rvben/shinyhub/compare/v0.20.6...v0.20.8) - 2026-10-14
+
+### Upgrade notice
+
+0.20.8 changed parallel-update admission: every live local worker, including idle
+and suspended workers, is charged a CPU request independently of utilization.
+The 1-core default in this release can block all live updates on 1-vCPU hosts
+and defer scheduled rolls indefinitely. Set
+`server.update_capacity.worker_cpu_request_cores: 0.1` for small idle fleets,
+or choose a workload-appropriate fractional request. Refused uploads return
+HTTP 409; scheduled rolls retain old data while retrying. Memory and pressure
+checks still apply.
 
 ### Fixed
 

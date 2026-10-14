@@ -73,3 +73,34 @@ func TestScheduleFreshnessCollector(t *testing.T) {
 		t.Fatalf("activation age family=%+v, want approximately 120 seconds", age)
 	}
 }
+
+func TestCapacityDeferralMetricsSurviveCoalescedSuccess(t *testing.T) {
+	now := time.Now().Unix()
+	status := "pending" // newer producer success replaced a capacity-deferred row
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewScheduleFreshnessCollector(func() ([]ScheduleSample, error) {
+		return []ScheduleSample{{Slug: "app", Name: "refresh", ActivationStatus: status,
+			ActivationCreatedUnix: now, CapacityDeferredUnix: now - 3600, CapacityDeferrals: 4}}, nil
+	}))
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]float64{}
+	for _, f := range families {
+		values[f.GetName()] = f.Metric[0].GetGauge().GetValue()
+	}
+	if values["shinyhub_schedule_activation_capacity_deferrals"] != 4 || values["shinyhub_schedule_activation_capacity_deferred_age_seconds"] < 3600 || values["shinyhub_schedule_activation_age_seconds"] > 5 {
+		t.Fatalf("coalescing reset capacity age: %v", values)
+	}
+	status = "succeeded"
+	families, err = reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() == "shinyhub_schedule_activation_capacity_deferred_age_seconds" {
+			t.Fatal("completed work still reports a growing capacity age")
+		}
+	}
+}

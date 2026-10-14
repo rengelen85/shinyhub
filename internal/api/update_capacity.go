@@ -11,6 +11,7 @@ import (
 
 	"github.com/rvben/shinyhub/internal/activation"
 	"github.com/rvben/shinyhub/internal/admission"
+	"github.com/rvben/shinyhub/internal/config"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/process"
 )
@@ -18,22 +19,8 @@ import (
 // checkUpdateCPU accounts for live worker requests before checking measured
 // pressure. Callers hold the launch gate through the candidate readiness boundary.
 func (s *Server) checkUpdateCPU(app *db.App, replicas int) error {
-	cores, source := admission.Detect(s.cfg.HostCapacityCores())
-	if s.hostCapacity != nil {
-		cores, source = s.hostCapacity.Cores, s.hostCapacity.CoresSource
-	}
+	cores, source, err := s.effectiveUpdateCPUCores()
 	var available float64
-	var err error
-	if s.cpuQuotaReader == nil {
-		cores, err = admission.EffectiveCPUCores(cores)
-	} else {
-		var quota float64
-		var limited bool
-		quota, limited, err = s.cpuQuotaReader.CPUCapacity()
-		if limited {
-			cores = math.Min(cores, quota)
-		}
-	}
 	if err == nil && s.availableCPUCores != nil {
 		available, err = s.availableCPUCores()
 	} else if err == nil {
@@ -52,28 +39,13 @@ func (s *Server) checkUpdateCPU(app *db.App, replicas int) error {
 	if perWorker <= 0 || math.IsNaN(needed) || math.IsInf(needed, 0) || floor < 0 || math.IsNaN(floor) || math.IsInf(floor, 0) {
 		return &activation.CapacityError{Resource: "cpu", Units: "cores", Reason: "CPU budget cannot be represented; check server.update_capacity worker requests and reserve; current sessions are preserved", RetryAfter: time.Minute}
 	}
-	// Idle workers still own their startup budgets. Count every generation,
-	// including staged, draining and suspended processes, rather than only
-	// the selected serving pool. The launch gate makes this check atomic with
-	// ShinyHub's starts; it does not reserve resources against other programs.
-	liveWorkers := 0
-	if s.manager != nil {
-		for _, worker := range s.manager.All() {
-			if worker.Status == process.StatusStopped || worker.Status == process.StatusCrashed {
-				continue
-			}
-			if worker.Provider == "fargate" || (s.nodeForTier != nil && s.nodeForTier(worker.Tier) != "") {
-				continue
-			}
-			liveWorkers++
-		}
-	}
+	liveWorkers := s.localLiveCPUWorkers()
 	reserved := float64(liveWorkers) * perWorker
-	if reserved+needed+floor > cores {
+	if !s.cfg.Server.UpdateCapacity.CPUFits(cores, liveWorkers, max(1, replicas)) {
 		remaining, required := math.Max(0, cores-reserved-floor), needed
 		return &activation.CapacityError{Resource: "cpu", Units: "cores", Available: &remaining, Required: &required, Reason: fmt.Sprintf("CPU budget: %.2f cores allocated to live workers; %.2f requested for candidates plus %.2f reserved on a %.2f-core node; current sessions are preserved", reserved, needed, floor, cores), RetryAfter: time.Minute}
 	}
-	if available < needed+floor {
+	if !config.FitsCPUBudget(needed+floor, available) {
 		required := needed + floor
 		return &activation.CapacityError{Resource: "cpu", Units: "cores", Available: &available, Required: &required, Reason: fmt.Sprintf("CPU: %.2f cores available; need %.2f for %d startup workers plus %.2f cores of node headroom; current sessions are preserved", available, needed, max(1, replicas), floor), RetryAfter: time.Minute}
 	}
@@ -153,4 +125,67 @@ func (s *Server) blockedUpdateStatus(slug string) map[string]any {
 	return map[string]any{"state": "blocked_capacity", "resource": resource, "reason": reason,
 		"deployment_id": latest.ID, "requested_at": latest.CreatedAt, "automatic_retry": false,
 		"next_action": nextAction}
+}
+
+// localLiveCPUWorkers counts the same fleet for admission and startup advice.
+// Idle, suspended, staged and draining workers retain their accounting requests.
+func (s *Server) localLiveCPUWorkers() int {
+	liveWorkers := 0
+	if s.manager != nil {
+		for _, worker := range s.manager.All() {
+			if worker.Status == process.StatusStopped || worker.Status == process.StatusCrashed {
+				continue
+			}
+			if worker.Provider == "fargate" || (s.nodeForTier != nil && s.nodeForTier(worker.Tier) != "") {
+				continue
+			}
+			liveWorkers++
+		}
+	}
+
+	return liveWorkers
+}
+
+// UpdateCPUCapacityWarning is a pressure-free snapshot after worker recovery.
+// It cannot reserve capacity; admission rechecks under the launch gate.
+func (s *Server) UpdateCPUCapacityWarning() string {
+	cores, source, err := s.effectiveUpdateCPUCores()
+	if err != nil {
+		return "live-update CPU capacity could not be detected; parallel updates fail closed until CPU accounting is available"
+	}
+	warning := s.cfg.Server.UpdateCapacity.CPUFleetWarning(cores, s.localLiveCPUWorkers())
+	if warning != "" {
+		return warning + fmt.Sprintf(" (startup snapshot after worker recovery; capacity source: %s)", source)
+	}
+	return ""
+}
+
+// effectiveUpdateCPUCores is shared by admission and its pressure-free startup
+// advice. An override never enlarges the quota of this process's cgroup.
+func (s *Server) effectiveUpdateCPUCores() (float64, string, error) {
+	cores, source := admission.Detect(s.cfg.HostCapacityCores())
+	if s.hostCapacity != nil {
+		cores, source = s.hostCapacity.Cores, s.hostCapacity.CoresSource
+	}
+	var err error
+	if s.cpuQuotaReader == nil {
+		detected := cores
+		cores, err = admission.EffectiveCPUCores(cores)
+		if cores < detected {
+			source = "cgroup-quota"
+		}
+	} else {
+		quota, limited, quotaErr := s.cpuQuotaReader.CPUCapacity()
+		err = quotaErr
+		if limited && quota < cores {
+			cores, source = quota, "cgroup-quota"
+		}
+	}
+	if err != nil {
+		return cores, source, err
+	}
+	if cores <= 0 || math.IsNaN(cores) || math.IsInf(cores, 0) {
+		return cores, source, fmt.Errorf("invalid effective CPU capacity")
+	}
+	return cores, source, nil
 }

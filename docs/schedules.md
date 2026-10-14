@@ -63,7 +63,7 @@ Fields:
 | `on_success` | `none` (default) leaves serving processes unchanged. `roll` durably and gracefully replaces this app's replicas after a successful run so module-scope data is re-imported. |
 | `min_roll_interval` | Optional damper such as `1h`. Successful runs still advance job history and the target data generation, but queued activation is coalesced and cannot run before this interval after the last completed successful roll. CLI flag: `--min-roll-interval`. |
 | `roll_fallback` | Behavior when the temporary surge cannot be admitted: `defer` (default) keeps serving the old generation and retries, while `restart` stops the old pool first and accepts an availability gap to activate fresh data. CLI flag: `--roll-fallback`. |
-| `max_defer_age` | Optional capacity-deferral deadline such as `6h`. At expiry the activation fails visibly instead of retrying forever. `0` (default) keeps the existing unlimited behavior. CLI flag: `--max-defer-age`. |
+| `max_defer_age` | Optional capacity-deferral deadline such as `6h`. At expiry the activation fails visibly instead of retrying forever. `0` (default) retries indefinitely with backoff capped at 15 minutes; repeated capacity deferrals emit warning logs and never authorize downtime. CLI flag: `--max-defer-age`. |
 
 > **Breaking upgrade:** `run_on_register` has been removed. Replace it with
 > `deploy_trigger = "bundle_change"` for a cache producer, or
@@ -295,9 +295,23 @@ Important behavior:
   and unknown measurements defer the roll just like a memory shortage. See [capacity during live updates](deployment-plan.md#capacity-during-live-updates).
 - Capacity deferrals back off at 1, 2, 4, 8, then 15-minute intervals. The
   persisted `capacity_deferrals` count is separate from rollout `attempts`.
+  Starting with the second capacity deferral, warning logs include the count,
+  elapsed defer age, deadline policy, retry delay, and operator guidance. With
+  the default `max_defer_age = "0"`, retries continue indefinitely while old
+  data keeps serving. For alerting, use
+  `shinyhub_schedule_activation_capacity_deferred_age_seconds` above your freshness threshold
+  (see [schedule metrics](metrics.md)).
   With `max_defer_age` set, the deadline starts at the first capacity defer,
   the next check is clamped to it, and the activation then fails with an
-  explicit expiry reason.
+  explicit expiry reason. New producer successes that supersede queued rolls
+  inherit the earliest capacity-deferred timestamp and largest deferral count,
+  including a deferral recorded after the newer run enqueues. The newer run's
+  snapshotted deadline policy applies to that existing window, so a shorter
+  deadline can expire on the next capacity check. A terminal scheduled outcome
+  other than supersession clears inherited windows on its queued successors;
+  manual restarts do not reset schedule deadlines. Cancellation or expiry ends that request,
+  and future independent requests get a fresh window. Historical rows retain
+  their counts. No deadline automatically authorizes downtime.
 - Activations are globally serialized in the first release, so schedules that
   complete together do not start simultaneous cold imports on one host.
 - A newer queued success supersedes older queued work for the same app while

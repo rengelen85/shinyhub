@@ -1753,6 +1753,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 			for i, fr := range rows {
 				s := metrics.ScheduleSample{
 					Slug: fr.Slug, Name: fr.Name, ActivationStatus: fr.ActivationStatus,
+					CapacityDeferrals: fr.ActivationCapacityDeferrals,
 				}
 				if fr.LastSuccessAt != nil {
 					s.LastSuccessUnix = fr.LastSuccessAt.Unix()
@@ -1760,6 +1761,9 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 				}
 				if fr.ActivationCreatedAt != nil {
 					s.ActivationCreatedUnix = fr.ActivationCreatedAt.Unix()
+				}
+				if fr.ActivationCapacityDeferredAt != nil {
+					s.CapacityDeferredUnix = fr.ActivationCapacityDeferredAt.Unix()
 				}
 				if fr.ActivationGeneration != nil {
 					s.ActivationGeneration = *fr.ActivationGeneration
@@ -2243,6 +2247,8 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	// render_capacity_cores, because one is a reporting scale and the other is a
 	// pacing budget; the detection behind both is the same.
 	hostCores, hostCoreSource := admission.Detect(cfg.HostCapacityCores())
+	slog.Info("live-update CPU accounting", "worker_cpu_request_cores", cfg.Server.UpdateCapacity.CPURequest(),
+		"counts_idle_and_suspended_workers", true)
 	hostMemoryMB, hostMemorySource, hostMemoryOK := admission.DetectMemory(cfg.HostCapacityMemoryMB())
 	if !hostMemoryOK {
 		hostMemoryMB, hostMemorySource = 0, ""
@@ -2770,6 +2776,9 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		publicationFencesHeld = false
 		releaseStartupFence()
 		startupFenceHeld = false
+		if warning := srv.UpdateCPUCapacityWarning(); warning != "" {
+			slog.Warn("live-update capacity after worker recovery", "warning", warning)
+		}
 		ownerReady.Store(true) // recovery complete and worker index is fresh
 		// A settings redeploy whose process exited before reporting is still
 		// owed; serve it now that this owner can boot pools. The scan retries

@@ -303,13 +303,16 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 	// Any newer physical publication invalidates older queued roll requests,
 	// even when the newer writer's current policy is on_success=none. Letting an
 	// old deferred activation run would stamp its obsolete generation onto
-	// consumers that actually load the newer writer's data.
-	if provenancePublication {
+	// consumers that actually load the newer writer's data. Roll publications
+	// supersede below, after carrying queue seniority and capacity history.
+	if provenancePublication && (action != "roll" || sourceIsPending) {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE schedule_activations
 			SET status = 'superseded', finished_at = ?, updated_at = CURRENT_TIMESTAMP
 			WHERE app_id = ? AND target_generation <> ? AND schedule_run_id IS NOT NULL
-			  AND status IN ('pending', 'deferred_interval', 'deferred_capacity')`,
+			  AND status IN ('pending', 'deferred_interval', 'deferred_capacity')
+ AND NOT EXISTS (SELECT 1 FROM replicas r WHERE r.app_id = schedule_activations.app_id AND r.activation_id = schedule_activations.id
+  AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> ''))`,
 			p.FinishedAt, appID, generation); err != nil {
 			return nil, fmt.Errorf("complete schedule run: supersede stale activations: %w", err)
 		}
@@ -361,6 +364,15 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 			dueAt = damperFloor
 		}
 	}
+	// Coalescing advances the requested data generation, not the host's
+	// capacity-deferral window. Carry the oldest outstanding scheduled window
+	// so frequent producer successes cannot erase warnings or postpone expiry.
+	// Manual restarts are independent. Include running scheduled activations:
+	// a new publication can arrive while their retry is executing.
+	window, err := activationCapacityWindow(ctx, tx, appID)
+	if err != nil {
+		return nil, fmt.Errorf("complete schedule run: load capacity deferral window: %w", err)
+	}
 	activationStatus := "pending"
 	if dueAt.After(p.FinishedAt) {
 		activationStatus = "deferred_interval"
@@ -372,12 +384,12 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 			(app_id, app_slug, schedule_id, schedule_name, schedule_run_id,
 			 source_deployment_id, source_app_version, source_content_digest, source_producer_fingerprint, action,
 			 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds,
-			 target_generation, status, phase, due_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'roll', ?, ?, ?, ?, ?, 'pending', ?)
+			 target_generation, status, phase, due_at, capacity_deferred_at, capacity_deferrals, defer_reason)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'roll', ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
 		RETURNING id`,
 		appID, appSlug, scheduleID, scheduleName, p.RunID, sourceDeploymentID, sourceVersion, sourceDigest, producerFingerprint,
 		minInterval, rollFallback,
-		maxDeferAge, generation, activationStatus, dueAt,
+		maxDeferAge, generation, activationStatus, dueAt, window.since, window.count, window.reason,
 	).Scan(&activationID)
 	if err != nil {
 		return nil, fmt.Errorf("complete schedule run: enqueue activation: %w", err)
@@ -664,14 +676,32 @@ func (s *Store) DeferScheduleActivation(id int64, status, reason string, dueAt, 
 	if status == "deferred_capacity" {
 		capacityIncrement = 1
 	}
-	res, err := s.db.Exec(`UPDATE schedule_activations
+	ctx := context.Background()
+	tx, err := s.d.beginWrite(ctx, s.rawDB(), scheduleActivationLockKey)
+	if err != nil {
+		return fmt.Errorf("defer schedule activation: begin: %w", err)
+	}
+	defer tx.Rollback()
+	var ownsRuntime bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+  SELECT 1 FROM replicas r JOIN schedule_activations a ON a.app_id = r.app_id AND a.id = r.activation_id
+  WHERE a.id = ? AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> ''))`, id).Scan(&ownsRuntime); err != nil {
+		return err
+	}
+	persistedStatus := status
+	if status == "deferred_capacity" && ownsRuntime {
+		// A recovered activation can still own replacement replicas when another
+		// admission check blocks. Keep it repairable and never coalesce it away.
+		persistedStatus = "repairing"
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE schedule_activations
 		SET status = ?, phase = CASE WHEN ? = 'repairing' THEN phase ELSE 'pending' END,
 		    due_at = ?, defer_reason = ?,
 		    attempts = attempts + ?, capacity_deferrals = capacity_deferrals + ?,
 		    capacity_deferred_at = CASE WHEN ? = 'deferred_capacity'
 		        THEN COALESCE(capacity_deferred_at, ?) ELSE capacity_deferred_at END,
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE id = ? AND status = 'running'`, status, status, dueAt, reason,
+		WHERE id = ? AND status = 'running'`, persistedStatus, persistedStatus, dueAt, reason,
 		attemptIncrement, capacityIncrement, status, deferredAt, id)
 	if err != nil {
 		return fmt.Errorf("defer schedule activation: %w", err)
@@ -679,7 +709,47 @@ func (s *Store) DeferScheduleActivation(id int64, status, reason string, dueAt, 
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	// A newer producer can enqueue while this activation is running, before
+	// its first capacity deferral. Propagate atomically under the same lock as
+	// enqueue/claim so that completion ordering cannot reset the window.
+	if status == "deferred_capacity" {
+		var appID sql.NullInt64
+		var runID sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT app_id, schedule_run_id FROM schedule_activations WHERE id = ?`, id).Scan(&appID, &runID); err != nil {
+			return err
+		}
+		if appID.Valid && runID.Valid {
+			window, err := activationCapacityWindow(ctx, tx, appID.Int64)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE schedule_activations
+    SET capacity_deferred_at = ?, capacity_deferrals = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE app_id = ? AND id > ? AND schedule_run_id IS NOT NULL
+      AND status IN ('pending', 'deferred_interval', 'deferred_capacity')`,
+				window.since, window.count, appID.Int64, id); err != nil {
+				return err
+			}
+			// Capacity refusal is before the destructive boundary. If a producer
+			// enqueued a newer roll while this one ran, coalesce now rather than
+			// leaving an obsolete deferred request that can resurrect the window.
+			if _, err := tx.ExecContext(ctx, `UPDATE schedule_activations
+    SET status = 'superseded', superseded_by_id = (
+      SELECT MAX(id) FROM schedule_activations WHERE app_id = ? AND id > ?
+       AND schedule_run_id IS NOT NULL AND status IN ('pending', 'deferred_interval', 'deferred_capacity')),
+      finished_at = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND status = 'deferred_capacity'
+      AND NOT EXISTS (SELECT 1 FROM replicas r WHERE r.app_id = schedule_activations.app_id AND r.activation_id = schedule_activations.id
+       AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> ''))
+      AND EXISTS (SELECT 1 FROM schedule_activations WHERE app_id = ? AND id > ?
+       AND schedule_run_id IS NOT NULL AND status IN ('pending', 'deferred_interval', 'deferred_capacity'))`,
+				appID.Int64, id, deferredAt, id, appID.Int64, id); err != nil {
+				return err
+			}
+
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) FinishScheduleActivation(id int64, status, lastError string, finishedAt time.Time, countAttempt bool) error {
@@ -724,6 +794,18 @@ func (s *Store) FinishScheduleActivation(id int64, status, lastError string, fin
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	}
+	// A terminal scheduled request ends its capacity episode. Supersession
+	// deliberately transfers the episode; independent manual operations do not
+	// reset schedule deadlines. Preserve all historical rows.
+	if status != "superseded" && scheduleRunID.Valid {
+		if _, err := tx.ExecContext(ctx, `UPDATE schedule_activations
+   SET capacity_deferred_at = NULL, capacity_deferrals = 0, updated_at = CURRENT_TIMESTAMP
+   WHERE app_id = (SELECT app_id FROM schedule_activations WHERE id = ?)
+     AND id > ? AND schedule_run_id IS NOT NULL
+     AND status IN ('pending', 'deferred_interval', 'deferred_capacity')`, id, id); err != nil {
+			return fmt.Errorf("finish schedule activation: clear resolved capacity window: %w", err)
+		}
 	}
 	if status == "succeeded" && scheduleRunID.Valid {
 		rows, err := tx.QueryContext(ctx, `SELECT id, due_at, min_roll_interval_seconds
@@ -1025,4 +1107,39 @@ func scanScheduleActivation(row rowScanner) (*ScheduleActivation, error) {
 		a.FinishedAt = &v
 	}
 	return &a, nil
+}
+
+// capacityWindow follows an outstanding scheduled activation episode across
+// producer coalescing. MAX avoids double-counting inherited ancestry; compare
+// timestamps in Go so SQLite timestamp text formatting cannot change ordering.
+type capacityWindow struct {
+	since  sql.NullTime
+	count  int
+	reason string
+}
+
+func activationCapacityWindow(ctx context.Context, tx writeTx, appID int64) (capacityWindow, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT capacity_deferred_at, capacity_deferrals, CASE WHEN status = 'deferred_capacity' THEN defer_reason ELSE '' END
+  FROM schedule_activations WHERE app_id = ? AND schedule_run_id IS NOT NULL
+   AND status IN ('pending', 'deferred_interval', 'deferred_capacity', 'running', 'repairing')
+   AND capacity_deferred_at IS NOT NULL`, appID)
+	if err != nil {
+		return capacityWindow{}, err
+	}
+	defer rows.Close()
+	var window capacityWindow
+	for rows.Next() {
+		var since time.Time
+		var count int
+		var reason string
+		if err := rows.Scan(&since, &count, &reason); err != nil {
+			return window, err
+		}
+		if !window.since.Valid || since.Before(window.since.Time) {
+			window.since = sql.NullTime{Time: since, Valid: true}
+			window.reason = reason
+		}
+		window.count = max(window.count, count)
+	}
+	return window, rows.Err()
 }

@@ -1309,6 +1309,9 @@ type ScheduleFreshness struct {
 	ActivationDueAt         *time.Time
 	ActivationGeneration    *int64
 	ActivationError         string
+
+	ActivationCapacityDeferredAt *time.Time
+	ActivationCapacityDeferrals  int
 }
 
 // EffectiveLocation resolves this schedule's timezone against the server
@@ -1407,6 +1410,7 @@ func (s *Store) scheduleFreshness(where string, args ...any) ([]ScheduleFreshnes
 		     AND o.deployment_id=(SELECT id FROM deployments WHERE app_id=sc.app_id AND status='succeeded' ORDER BY id DESC LIMIT 1)
 		     AND o.producer_command_json=sc.command_json ORDER BY o.id DESC LIMIT 1),
 		  sa.status, sa.phase, sa.created_at, sa.updated_at, sa.due_at, sa.target_generation,
+		  sa.capacity_deferred_at, sa.capacity_deferrals,
 		  CASE WHEN sa.last_error <> '' THEN sa.last_error ELSE sa.defer_reason END
 		FROM app_schedules sc JOIN apps a ON a.id = sc.app_id
 		LEFT JOIN schedule_activations sa ON sa.id = (
@@ -1445,14 +1449,15 @@ func (s *Store) scheduleFreshness(where string, args ...any) ([]ScheduleFreshnes
 		var convergenceStatus, convergenceError sql.NullString
 		var activationStatus, activationPhase, activationError sql.NullString
 		var activationCreated, activationUpdated, activationDue sql.NullTime
-		var activationGeneration sql.NullInt64
+		var activationGeneration, activationCapacityDeferrals sql.NullInt64
+		var activationCapacityDeferred sql.NullTime
 		if err := rows.Scan(&fr.ScheduleID, &fr.Slug, &fr.Name, &enabled, &fr.CronExpr, &tz,
 			&fr.CreatedAt, &fr.TimeoutSeconds, &fr.DeployTrigger, &currentDeploymentID, &currentVersion, &currentDigest,
 			&lastRunID, &lastRunAt, &lastStatus, &lastSuccess, &producerDeploymentID, &producerVersion, &producerDigest,
 			&activeRunID, &activeRunAt, &activeRunDigest, &deploySatisfied, &producerRepairRequired,
 			&producerFingerprint, &producerPublishedAt, &obligationID, &convergenceStatus, &obligationRunID, &convergenceError,
 			&activationStatus, &activationPhase, &activationCreated,
-			&activationUpdated, &activationDue, &activationGeneration, &activationError); err != nil {
+			&activationUpdated, &activationDue, &activationGeneration, &activationCapacityDeferred, &activationCapacityDeferrals, &activationError); err != nil {
 			return nil, err
 		}
 		fr.Enabled = enabled != 0
@@ -1513,6 +1518,11 @@ func (s *Store) scheduleFreshness(where string, args ...any) ([]ScheduleFreshnes
 			fr.ActiveRunAt = &v
 		}
 		fr.ActiveRunContentDigest = activeRunDigest.String
+		fr.ActivationCapacityDeferrals = int(activationCapacityDeferrals.Int64)
+		if activationCapacityDeferred.Valid {
+			v := activationCapacityDeferred.Time
+			fr.ActivationCapacityDeferredAt = &v
+		}
 		fr.ActivationStatus = activationStatus.String
 		fr.ActivationPhase = activationPhase.String
 		fr.ActivationError = activationError.String

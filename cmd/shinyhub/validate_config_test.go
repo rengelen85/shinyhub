@@ -25,10 +25,12 @@ func TestValidateConfigCommand(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	valid := filepath.Join(dir, "valid.yaml")
+	blocked := filepath.Join(dir, "blocked.yaml")
 	trusted := filepath.Join(dir, "trusted.yaml")
 	invalid := filepath.Join(dir, "invalid.yaml")
 	malformed := filepath.Join(dir, "malformed.yaml")
 	for path, body := range map[string]string{
+		blocked:   "server:\n  host_capacity_cores: 1\n  update_capacity:\n    worker_cpu_request_cores: 1\n",
 		trusted:   "auth:\n  support_sessions: true\n  support_sessions_trusted_apps: true\nserver:\n  base_url: https://hub.example.com\n",
 		valid:     "auth:\n  support_sessions: true\nserver:\n  base_url: https://hub.example.com\n  app_origin: https://apps.example.com\n",
 		invalid:   "auth:\n  support_sessions: true\nserver:\n  base_url: https://hub.example.com\n  app_origin: https://hub.example.com:8443\n",
@@ -39,12 +41,14 @@ func TestValidateConfigCommand(t *testing.T) {
 		}
 	}
 	for _, tc := range []struct {
-		name      string
-		args      []string
-		envPath   string
-		origin    string
-		wantError string
+		name        string
+		args        []string
+		envPath     string
+		origin      string
+		wantError   string
+		wantWarning bool
 	}{
+		{name: "impossible surge budget", args: []string{"validate-config", "--config", blocked}, wantWarning: true},
 		{name: "trusted apps preflight", args: []string{"validate-config", "--config", trusted}},
 		{name: "flag after command", args: []string{"validate-config", "--config", valid}},
 		{name: "flag before command", args: []string{"--config", valid, "validate-config"}},
@@ -92,18 +96,22 @@ func TestValidateConfigCommand(t *testing.T) {
 				}
 			} else {
 				var result struct {
-					Status string `json:"status"`
-					Valid  bool   `json:"valid"`
+					Status   string   `json:"status"`
+					Valid    bool     `json:"valid"`
+					Warnings []string `json:"warnings"`
 				}
 				if err != nil || json.Unmarshal(output.Bytes(), &result) != nil || result.Status != "valid" || !result.Valid {
 					t.Fatalf("expected validation success; error=%v output=%s", err, output.String())
 				}
 			}
+			if tc.wantWarning && !strings.Contains(output.String(), "cannot admit even one surge worker") {
+				t.Fatalf("missing capacity warning: %s", output.String())
+			}
 			if strings.Contains(output.String(), secret) || (err != nil && strings.Contains(err.Error(), secret)) {
 				t.Fatal("validation exposed the auth secret")
 			}
 			entries, err := os.ReadDir(dir)
-			if err != nil || len(entries) != 4 {
+			if err != nil || len(entries) != 5 {
 				t.Fatalf("validation modified the working directory: entries=%v error=%v", entries, err)
 			}
 		})

@@ -1,8 +1,11 @@
 package db_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/rvben/shinyhub/internal/activation"
 	"testing"
 	"time"
 
@@ -795,5 +798,175 @@ func TestRepairOnlyActivationClaimLeavesUntouchedQueuePending(t *testing.T) {
 	repair, err := store.ClaimNextScheduleActivationRepair(now)
 	if err != nil || repair.ID != a.ID || repair.Phase != "recovering" {
 		t.Fatalf("repair=%+v err=%v", repair, err)
+	}
+}
+
+// A busy producer must not refresh the capacity deadline on every success.
+func TestCoalescedSuccessesPreserveCapacityWindowAndExpire(t *testing.T) {
+	store := newScheduleStore(t)
+	appID := newScheduleAppFixture(t, store, "capacity-window")
+	scheduleID, err := store.CreateSchedule(db.CreateScheduleParams{
+		AppID: appID, Name: "refresh", CronExpr: "*/5 * * * *", CommandJSON: `["true"]`,
+		Enabled: true, TimeoutSeconds: 60, OverlapPolicy: "skip", MissedPolicy: "skip", OnSuccess: "roll",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := store.CreateDeployment(db.CreateDeploymentParams{AppID: appID, Version: "v1", BundleDir: "/b/v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAt := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
+	enqueue := func(at time.Time) *db.ScheduleActivation {
+		t.Helper()
+		id, err := store.InsertScheduleRun(db.InsertScheduleRunParams{
+			ScheduleID: scheduleID, Status: "running", Trigger: "schedule", StartedAt: at,
+			OnSuccess: "roll", MaxDeferAgeSeconds: 3600,
+			DeploymentID: &dep.ID, AppVersion: dep.Version, ContentDigest: "sha256:v1",
+			ProducerFingerprint: "producer", ProducerCommandJSON: `["true"]`, PublishesData: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, err := store.CompleteScheduleRunAndEnqueueActivation(db.CompleteScheduleRunParams{
+			RunID: id, Status: "succeeded", ExitCode: intPtr(0), FinishedAt: at,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	current := enqueue(firstAt)
+	for i := 0; i < 3; i++ {
+		at := firstAt.Add(time.Duration(i) * 15 * time.Minute)
+		claimed, err := store.ClaimNextScheduleActivation(at)
+		if err != nil || claimed.ID != current.ID {
+			t.Fatalf("claim: %+v %v", claimed, err)
+		}
+		if err := store.DeferScheduleActivation(current.ID, "deferred_capacity", "CPU budget", at.Add(time.Minute), at); err != nil {
+			t.Fatal(err)
+		}
+		previousID := current.ID
+		current = enqueue(at.Add(5 * time.Minute))
+		if current.CapacityDeferrals != i+1 || current.CapacityDeferredAt == nil || !current.CapacityDeferredAt.Equal(firstAt) || current.DeferReason != "CPU budget" {
+			t.Fatalf("coalescing erased capacity window: %+v", current)
+		}
+		if current.Attempts != 0 || current.MaxDeferAgeSeconds != 3600 {
+			t.Fatalf("incorrect inherited policy/attempts: %+v", current)
+		}
+		previous, err := store.GetScheduleActivation(previousID)
+		if err != nil || previous.Status != "superseded" || previous.SupersededByID == nil || *previous.SupersededByID != current.ID {
+			t.Fatalf("predecessor: %+v %v", previous, err)
+		}
+	}
+	freshness, err := store.ScheduleFreshnessByApp(appID)
+	if err != nil || len(freshness) != 1 || freshness[0].ActivationCapacityDeferrals != 3 || freshness[0].ActivationCapacityDeferredAt == nil || !freshness[0].ActivationCapacityDeferredAt.Equal(firstAt) {
+		t.Fatalf("freshness lost capacity window: %+v %v", freshness, err)
+	}
+	coordinator := activation.New(store, capacityBlockedRunner{}, time.Second)
+	if worked, err := coordinator.ProcessNext(context.Background()); !worked || err == nil {
+		t.Fatalf("expired activation: worked=%v err=%v", worked, err)
+	}
+	expired, err := store.GetScheduleActivation(current.ID)
+	if err != nil || expired.Status != "failed" || expired.Attempts != 0 {
+		t.Fatalf("deadline reset: %+v %v", expired, err)
+	}
+	next := enqueue(time.Now().UTC())
+	if next.CapacityDeferredAt != nil || next.CapacityDeferrals != 0 {
+		t.Fatalf("terminal window leaked into new work: %+v", next)
+	}
+	// Explicit cancellation also ends that queued request's window.
+	if _, err := store.ClaimNextScheduleActivation(time.Now().UTC().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeferScheduleActivation(next.ID, "deferred_capacity", "CPU budget", time.Now().UTC().Add(time.Hour), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CancelQueuedScheduleActivation(scheduleID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	afterCancel := enqueue(time.Now().UTC().Add(time.Minute))
+	if afterCancel.CapacityDeferredAt != nil || afterCancel.CapacityDeferrals != 0 {
+		t.Fatalf("cancelled window leaked: %+v", afterCancel)
+	}
+
+}
+
+type capacityBlockedRunner struct{}
+
+func (capacityBlockedRunner) Roll(context.Context, *db.ScheduleActivation) error {
+	return &activation.CapacityError{Resource: "cpu", Reason: "CPU budget"}
+}
+
+func TestProducerCompletionDuringRunningActivationRetainsCapacityEpisode(t *testing.T) {
+	for _, priorDeferral := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prior-deferral-%v", priorDeferral), func(t *testing.T) {
+			store := newScheduleStore(t)
+			appID := newScheduleAppFixture(t, store, "inflight-capacity")
+			scheduleID, err := store.CreateSchedule(db.CreateScheduleParams{AppID: appID, Name: "refresh", CronExpr: "*/5 * * * *", CommandJSON: `["true"]`, Enabled: true, TimeoutSeconds: 60, OverlapPolicy: "skip", MissedPolicy: "skip", OnSuccess: "roll"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dep, err := store.CreateDeployment(db.CreateDeploymentParams{AppID: appID, Version: "v1", BundleDir: "/b/v1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+			enqueue := func(at time.Time) *db.ScheduleActivation {
+				t.Helper()
+				runID, err := store.InsertScheduleRun(db.InsertScheduleRunParams{ScheduleID: scheduleID, Status: "running", Trigger: "schedule", StartedAt: at, OnSuccess: "roll", DeploymentID: &dep.ID, ContentDigest: "sha256:v1", ProducerFingerprint: "producer", PublishesData: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				a, err := store.CompleteScheduleRunAndEnqueueActivation(db.CompleteScheduleRunParams{RunID: runID, Status: "succeeded", ExitCode: intPtr(0), FinishedAt: at})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return a
+			}
+			first := enqueue(base)
+			if _, err := store.ClaimNextScheduleActivation(base); err != nil {
+				t.Fatal(err)
+			}
+			if priorDeferral {
+				if err := store.DeferScheduleActivation(first.ID, "deferred_capacity", "CPU budget", base.Add(time.Minute), base); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.ClaimNextScheduleActivation(base.Add(time.Minute)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The first activation is running when the next provenance publisher commits.
+			next := enqueue(base.Add(2 * time.Minute))
+			if err := store.DeferScheduleActivation(first.ID, "deferred_capacity", "CPU budget", base.Add(4*time.Minute), base.Add(3*time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			next, err = store.GetScheduleActivation(next.ID)
+			expectedCount, expectedSince := 1, base.Add(3*time.Minute)
+			if priorDeferral {
+				expectedCount, expectedSince = 2, base
+			}
+			if err != nil || next.CapacityDeferredAt == nil || !next.CapacityDeferredAt.Equal(expectedSince) || next.CapacityDeferrals != expectedCount {
+				t.Fatalf("inflight deferral lost: %+v %v", next, err)
+			}
+			// The capacity-refused older request is now superseded by the newer
+			// queued successor that owns the continuous capacity episode.
+			predecessor, err := store.GetScheduleActivation(first.ID)
+			if err != nil || predecessor.Status != "superseded" || predecessor.SupersededByID == nil || *predecessor.SupersededByID != next.ID {
+				t.Fatalf("obsolete deferred predecessor: %+v %v", predecessor, err)
+			}
+			claimed, err := store.ClaimNextScheduleActivation(base.Add(5 * time.Minute))
+			if err != nil || claimed.ID != next.ID {
+				t.Fatalf("claim successor: %+v %v", claimed, err)
+			}
+			if err := store.FinishScheduleActivation(next.ID, "succeeded", "", base.Add(6*time.Minute), true); err != nil {
+				t.Fatal(err)
+			}
+			// New work after actual serving success has a fresh capacity window.
+			newest := enqueue(base.Add(7 * time.Minute))
+			if newest.CapacityDeferredAt != nil || newest.CapacityDeferrals != 0 {
+				t.Fatalf("resolved episode leaked: %+v", newest)
+			}
+		})
 	}
 }

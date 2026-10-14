@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/rvben/shinyhub/internal/admission"
 	"github.com/rvben/shinyhub/internal/cli"
 	"github.com/rvben/shinyhub/internal/config"
 	"github.com/spf13/cobra"
@@ -17,6 +18,7 @@ var validateConfigCmd = &cobra.Command{
 		"Run with the service's environment, working directory, and file permissions.\n\n" +
 		"An explicitly selected config file must exist. With no explicit path, a missing\n" +
 		"./shinyhub.yaml permits environment-only configuration, as with serve.\n" +
+		"Capacity warnings describe the machine running this command; run it on the server.\n" +
 		"Success does not verify DNS, TLS, SSO, database connectivity, or runtime readiness.",
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -32,9 +34,32 @@ var validateConfigCmd = &cobra.Command{
 				return validationError(err)
 			}
 		}
-		if _, err := config.Load(path); err != nil {
+		cfg, err := config.Load(path)
+		if err != nil {
 			return validationError(err)
 		}
-		return cli.RenderAction(cmd, "valid", map[string]any{"valid": true}, "server configuration is valid")
+		cores, source, warnings := inspectUpdateCPUCapacity(cfg)
+		message := "server configuration is valid"
+		for _, warning := range warnings {
+			message += "\nWarning: " + warning
+		}
+		return cli.RenderAction(cmd, "valid", map[string]any{"valid": true, "warnings": warnings, "effective_cpu_cores": cores, "cpu_capacity_source": source}, message)
 	},
+}
+
+// Use the same effective quota clamp as live-update admission, including when
+// host_capacity_cores overrides autodetection. No pressure sample is needed.
+func inspectUpdateCPUCapacity(cfg *config.Config) (float64, string, []string) {
+	detected, source := admission.Detect(cfg.HostCapacityCores())
+	cores, err := admission.EffectiveCPUCores(detected)
+	if cores < detected {
+		source = "cgroup-quota"
+	}
+	if err != nil {
+		return 0, "unknown", []string{"live-update CPU capacity could not be detected on this machine; check CPU accounting on the server before relying on parallel updates"}
+	}
+	if warning := cfg.Server.UpdateCapacity.CPUWarning(cores); warning != "" {
+		return cores, source, []string{warning + " (on this machine; capacity source: " + source + ")"}
+	}
+	return cores, source, []string{}
 }

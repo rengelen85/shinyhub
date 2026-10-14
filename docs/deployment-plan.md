@@ -168,13 +168,13 @@ Configure the accounting policy under `server.update_capacity`:
 ```yaml
 server:
   update_capacity:
-    worker_cpu_request_cores: 1   # per worker; fractional requests are allowed
+    worker_cpu_request_cores: 0.1 # per worker; default accounting request
     reserved_cpu_cores: 0.1       # absolute control-plane/background-work reserve
     max_surge_replicas: 1         # per app, including retained old generations
 ```
 
-Unset CPU requests default to one core per worker; the unset CPU reserve remains
-10% of effective node capacity. These are conservative defaults, not measured
+Unset CPU requests default to 0.1 core per worker; the unset CPU reserve remains
+10% of effective node capacity. These are accounting defaults, not measured
 startup requirements. Requests differ from `cpu_quota_percent`, which controls
 runtime enforcement; choose requests appropriate to your workers' workload.
 Requests are accounting budgets, not OS reservations against unrelated processes.
@@ -322,3 +322,16 @@ shinyhub deploy . --open
 `--open` waits for health, verifies the routed app when possible, and opens its
 canonical URL. The plan's final command remains copy-pasteable and uses `--wait`
 for automation; replace it with `--open` for the browser handoff.
+
+Startup warns after worker recovery if the local live fleet plus one surge
+candidate cannot fit; with an empty fleet it checks the minimum serving-plus-surge
+pair. The warning is a snapshot: later wakes and starts can consume headroom.
+`validate-config` checks that minimum pair on the machine running the command
+and reports effective cores and their source in JSON. Run it on the server.
+Validation does not inspect the
+running fleet or sample pressure, so a successful validation cannot guarantee
+admission. On a 1-core host the defaults budget four live workers and one
+candidate at 0.5 cores plus a 0.1-core reserve. On a 16-core host, 17 live workers
+and 16 candidates use 3.3 cores plus a 1.6-core reserve. Memory and measured CPU
+pressure must still fit. Verify that a successful update publishes a new serving
+generation; successful traffic probes alone can also describe a refused update.

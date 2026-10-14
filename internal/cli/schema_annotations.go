@@ -125,6 +125,9 @@ var schemaAnnotations = map[string]cmdAnnotation{
 	"validate-config": {Mutating: ro, ArgTypes: map[string]string{"--config": "path"}, OutputFields: []fieldSpec{
 		{Name: "status", Type: "string", Desc: "valid"},
 		{Name: "valid", Type: "boolean", Desc: "configuration passed startup validation"},
+		{Name: "warnings", Type: "array", Desc: "advisory warnings for CPU capacity on the machine running validation"},
+		{Name: "effective_cpu_cores", Type: "number", Desc: "locally detected CPU capacity after cgroup limits; 0 if unknown"},
+		{Name: "cpu_capacity_source", Type: "string", Desc: "source of locally detected capacity"},
 	}},
 	"backup": {Mutating: mut, ArgTypes: map[string]string{"--out": "path"}, OutputFields: []fieldSpec{
 		{Name: "status", Type: "string", Desc: "written"},

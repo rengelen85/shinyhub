@@ -18,6 +18,8 @@ type ScheduleSample struct {
 	ActivationStatus      string
 	ActivationCreatedUnix int64
 	ActivationGeneration  int64
+	CapacityDeferredUnix  int64
+	CapacityDeferrals     int
 }
 
 var scheduleLastSuccessDesc = prometheus.NewDesc(
@@ -44,6 +46,17 @@ var scheduleActivationGenerationDesc = prometheus.NewDesc(
 	[]string{"slug", "schedule"}, nil,
 )
 
+var scheduleCapacityDeferralsDesc = prometheus.NewDesc(
+	"shinyhub_schedule_activation_capacity_deferrals",
+	"Capacity deferral count of the latest activation, retained across coalesced producer successes.",
+	[]string{"slug", "schedule"}, nil,
+)
+var scheduleCapacityDeferredAgeDesc = prometheus.NewDesc(
+	"shinyhub_schedule_activation_capacity_deferred_age_seconds",
+	"Seconds since the first capacity deferral of an outstanding activation, retained across coalesced producer successes.",
+	[]string{"slug", "schedule"}, nil,
+)
+
 // scheduleFreshnessCollector emits one gauge per schedule that has ever
 // succeeded, querying the store live at scrape time so the value survives a
 // process restart (DB-backed, like apps_crashed).
@@ -61,6 +74,8 @@ func (c *scheduleFreshnessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- scheduleActivationStatusDesc
 	ch <- scheduleActivationAgeDesc
 	ch <- scheduleActivationGenerationDesc
+	ch <- scheduleCapacityDeferralsDesc
+	ch <- scheduleCapacityDeferredAgeDesc
 }
 
 func (c *scheduleFreshnessCollector) Collect(ch chan<- prometheus.Metric) {
@@ -81,6 +96,13 @@ func (c *scheduleFreshnessCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(scheduleActivationStatusDesc, prometheus.GaugeValue,
 			1, s.Slug, s.Name, s.ActivationStatus)
+		ch <- prometheus.MustNewConstMetric(scheduleCapacityDeferralsDesc, prometheus.GaugeValue,
+			float64(s.CapacityDeferrals), s.Slug, s.Name)
+		if s.CapacityDeferredUnix > 0 && nonterminalActivationMetricStatus(s.ActivationStatus) {
+			age := max(int64(0), now-s.CapacityDeferredUnix)
+			ch <- prometheus.MustNewConstMetric(scheduleCapacityDeferredAgeDesc, prometheus.GaugeValue,
+				float64(age), s.Slug, s.Name)
+		}
 		if s.ActivationGeneration > 0 {
 			ch <- prometheus.MustNewConstMetric(scheduleActivationGenerationDesc, prometheus.GaugeValue,
 				float64(s.ActivationGeneration), s.Slug, s.Name)

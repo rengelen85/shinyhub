@@ -223,8 +223,15 @@ func (c *Coordinator) ProcessNext(ctx context.Context) (bool, error) {
 			if err := c.store.DeferScheduleActivation(a.ID, "deferred_capacity", capacity.Reason, dueAt, finishedAt); err != nil {
 				return true, fmt.Errorf("defer activation %d: %w", a.ID, err)
 			}
-			slog.Info("schedule activation deferred", "activation_id", a.ID, "schedule_run_id", runID,
-				"app", a.AppSlug, "reason", capacity.Reason, "retry_after", retry)
+			level := slog.LevelInfo
+			if a.CapacityDeferrals > 0 {
+				level = slog.LevelWarn
+			}
+			slog.Log(ctx, level, "schedule activation capacity blocked", "activation_id", a.ID, "schedule_run_id", runID,
+				"app", a.AppSlug, "reason", capacity.Reason, "retry_after", retry,
+				"capacity_deferrals", a.CapacityDeferrals+1, "capacity_deferred_at", capacityDeferredAt,
+				"deferred_age", finishedAt.Sub(capacityDeferredAt), "max_defer_age_seconds", a.MaxDeferAgeSeconds,
+				"next_action", "free or add capacity; serving workers retain old data until the roll succeeds")
 			return true, nil
 		}
 		var retryable *RetryableError

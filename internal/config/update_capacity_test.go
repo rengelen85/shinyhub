@@ -33,3 +33,39 @@ func TestUpdateCapacityRejectsInvalidBudgets(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateCapacityMinimumSurgeWarning(t *testing.T) {
+	one := 1.0
+	for _, tc := range []struct {
+		name   string
+		config config.UpdateCapacityConfig
+		cores  float64
+		warn   bool
+	}{
+		{"small host defaults", config.UpdateCapacityConfig{}, 1, false},
+		{"legacy request", config.UpdateCapacityConfig{WorkerCPURequestCores: &one}, 1, true},
+		{"fractional cgroup", config.UpdateCapacityConfig{}, 0.2, true},
+		{"large reserve", config.UpdateCapacityConfig{ReservedCPUCores: &one}, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			warning := tc.config.CPUWarning(tc.cores)
+			if (warning != "") != tc.warn {
+				t.Fatalf("warning = %q, want warning %v", warning, tc.warn)
+			}
+		})
+	}
+	if got := (config.UpdateCapacityConfig{}).CPURequest(); got != 0.1 {
+		t.Fatalf("default CPU request = %v", got)
+	}
+}
+
+func TestUpdateCapacityExactFractionalFit(t *testing.T) {
+	request, reserve := 0.1, 0.1
+	u := config.UpdateCapacityConfig{WorkerCPURequestCores: &request, ReservedCPUCores: &reserve}
+	if !u.CPUFits(0.3, 1, 1) || u.CPUWarning(0.3) != "" {
+		t.Fatal("floating-point roundoff refused an exact fit")
+	}
+	if u.CPUFits(0.299999, 1, 1) || u.CPUWarning(0.299999) == "" {
+		t.Fatal("roundoff tolerance admitted an actual shortfall")
+	}
+}
