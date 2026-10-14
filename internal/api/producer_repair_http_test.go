@@ -21,6 +21,9 @@ func TestProducerFailureAndRepairThroughHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := strings.Replace(groupedProducerManifest, `deploy_trigger = "first_deploy"`, `deploy_trigger = "bundle_change"`, 1)
+	// A repair requested immediately after the terminal response waits for
+	// publication cleanup instead of relying on an internal audit timing gap.
+	manifest += "overlap = \"queue\"\n"
 	body, contentType := buildMultiFileBundleUpload(t, map[string]string{"app.py": "print('app')", "refresh.py": "print('data')", "shinyhub.toml": manifest})
 	request := func(method, path string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -111,22 +114,6 @@ func TestProducerFailureAndRepairThroughHTTP(t *testing.T) {
 	srv.proxy.ServeHTTP(visitor, httptest.NewRequest(http.MethodGet, "/app/producer-repair/", nil))
 	if visitor.Code != http.StatusServiceUnavailable || !strings.Contains(visitor.Body.String(), "This app is unavailable") || strings.Contains(visitor.Body.String(), "private transient") {
 		t.Fatalf("visitor failure response: %d %s", visitor.Code, visitor.Body.String())
-	}
-	// Wait for the failure callback to finish before repairing; the durable
-	// terminal row can be observed before consumer cleanup/auditing finishes.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		count, err := store.CountAuditEvents("schedule_run_failed")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if count == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("failure callback did not finish")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	runtime.mu.Lock()
 	runtime.producerErr = nil

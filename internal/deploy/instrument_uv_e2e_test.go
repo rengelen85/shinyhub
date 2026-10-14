@@ -53,6 +53,11 @@ func TestInstrumentedProjectModeLaunch_LoadsInstrumentation(t *testing.T) {
 	if _, err := exec.LookPath("uv"); err != nil {
 		t.Skip("uv not in PATH")
 	}
+	// Exercise the supported standard-Python launch, independently of any
+	// free-threaded interpreter installed on the developer's host.
+	previousPolicy := append([]string(nil), process.WithBuildInterpreterPolicy(nil)...)
+	process.SetBuildInterpreterPolicy([]string{"UV_PYTHON=3.14+gil"})
+	t.Cleanup(func() { process.SetBuildInterpreterPolicy(previousPolicy) })
 
 	// The overlay and the app's dependencies come from the package index. An
 	// unreachable index is an environment limit, not a failure of the launch.
