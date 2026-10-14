@@ -104,9 +104,29 @@ func TestWorkerCertRenewal_RoutingSurvivesPastOriginalExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agent listen: %v", err)
 	}
-	go func() { _ = agentSrv.ServeListener(ctx, ln) }()
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = agentSrv.ServeListener(ctx, ln)
+	}()
 	// The heartbeat loop is what drives certificate renewal.
-	go func() { _ = ag.Run(ctx, 150*time.Millisecond) }()
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = ag.Run(ctx, 150*time.Millisecond)
+	}()
+	defer func() {
+		cancel()
+		// Renewal writes certificate files. Wait for both owners to exit
+		// before TempDir removes the worker's state directory.
+		for _, done := range []<-chan struct{}{serveDone, runDone} {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("worker renewal fixture did not stop before cleanup")
+			}
+		}
+	}()
 
 	// Capture the original cert's expiry before renewal can extend it.
 	leaf, err := x509.ParseCertificate(ag.Certs().Get().Certificate[0])
