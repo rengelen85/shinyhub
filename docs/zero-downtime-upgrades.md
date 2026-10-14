@@ -92,12 +92,13 @@ The reference systemd unit uses `shinyhub reload --wait 10m`. The command
 returns success only after the successor acknowledges readiness and its PID
 matches `server.pid_file`. Standalone successors must regain mutation ownership;
 session-preserving standalone reloads also verify that previously serving apps
-have reachable, adopted replicas meeting `min(max(1, min_warm_replicas), ready_before)`.
+have reachable, adopted replicas meeting `ready_before`.
 The predecessor counts ready replicas using the same checks as the successor;
 only normal replica slots count toward the predecessor's obligation, since
 scheduled-roll surge replicas are temporary. Apps with no ready normal replicas
 create no serving obligation. A host already serving
-below its configured warm floor does not need to reach that floor to reload.
+below its configured warm floor does not need to reach that floor to reload;
+the predecessor logs a warning with the ready count and configured floor.
 This includes apps that begin serving while the command waits for admitted work.
 An unavailable app is named in the readiness failure rather than reporting success.
 Clustered successors may be healthy standbys after their first pool sync. A refusal
@@ -267,7 +268,9 @@ limit, deploys a replacement, and revokes access to a relayed session.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `server.pid_file` | (empty) | PID file the ready process writes; required for systemd MAINPID tracking. |
+| `server.env_file` | (empty) | Private reloadable environment settings; see [systemd](deployment/systemd.md#private-service-configuration). |
+| `server.max_retired_lifetime` | `24h` | Maximum preserved-session lifetime after control-plane retirement. Remaining sessions receive WebSocket 1012 when a complete outbound frame permits it; partial frames or slow transports close directly. |
+| `server.pid_file` | (empty) | PID file naming the active server; required for acknowledged reloads and supervision. |
 | `server.upgrade_timeout` | `60s` | How long the old process waits for the successor to become ready before aborting the upgrade and continuing to serve. |
 | `server.drain_timeout` | `60s` | App-generation retirement, replica removal, and ordinary service shutdown session drain. |
 | `server.reload_sessions` | `drain` | Opt-in `preserve` for stable single-host native multiplex WebSockets. Environment: `SHINYHUB_RELOAD_SESSIONS`. |
@@ -330,13 +333,15 @@ limit, deploys a replacement, and revokes access to a relayed session.
   [Getting back to the older build](configuration.md#getting-back-to-the-older-build)
   - a snapshot is moved into place, not fed to `shinyhub restore`, and its
   `-wal` sidecar has to go or the rollback silently undoes itself.
-- **systemd MAINPID.** With `Type=notify`, ShinyHub sends `READY=1` plus
-  `MAINPID=<own pid>` on startup and after each handoff, so systemd retargets the
-  main PID to the successor. The unit sets `Restart=on-failure` (not
-  `Restart=always`): a genuine crash is restarted, but the original PID's
-  deliberate exit 0 after a handoff is a clean success, so systemd does not fight
-  it. After your first `systemctl reload`, verify with
-  `systemctl show -p MainPID shinyhub` that it matches the new PID file.
+- **systemd supervision.** The reference unit runs `serve --supervise`. Its
+  stable direct child remains `MainPID`; each ready server reports that
+  supervisor PID through `NotifyAccess=all`. The supervisor watches the active
+  server's `server.pid_file` with Linux pidfds. An unexpected active-server exit
+  fails the supervisor and triggers `Restart=on-failure`, even while retired
+  parents or replicas remain alive. Do not configure a systemd `PIDFile=` that
+  would retarget `MainPID` away from the supervisor. Installing supervision on
+  an existing unit requires one announced restart; bare `serve` still supports
+  the older notification behavior, with its non-child tracking limitation.
 - **Scope.** This is the systemd/VM path and covers all app runtimes (native,
   Docker, Fargate, remote-worker). Multi-pod Kubernetes rolling upgrades are part
   of the separate high-availability project.
@@ -354,3 +359,25 @@ error. A persistent 503 requires investigating readiness or recovery.
 HTTP-only probes never produce the “no WebSocket has connected” warning. The
 warning requires an upstream WebSocket upgrade to fail and no successful
 upgrade to clear the diagnostic during the grace window.
+
+## Retired generation visibility and lifetime
+
+`shinyhub status --config /etc/shinyhub/shinyhub.yaml` inspects the host-local
+PID file and locked relay registry. JSON output includes `pid` and `retired`
+(`count`, `sessions`, `unknown`, and each generation's PID, retirement time and
+session count). Older relay snapshots have no PID/time metadata. Unknown live
+snapshots remain counted and explicitly flagged, rather than being treated as idle.
+Prometheus exposes `shinyhub_retired_generations`, `shinyhub_retired_sessions`,
+and `shinyhub_retired_state_unknown` from the same registry.
+
+`server.max_retired_lifetime` (or `SHINYHUB_MAX_RETIRED_LIFETIME`) defaults to
+24 hours and must be positive. It bounds preserved WebSockets independently of
+`drain_timeout`; service stop still uses the ordinary shutdown grace. A retiring
+server logs `retired process exiting` after its sessions and owned output finish.
+New shared-user native launches use independent, capped output pumps, allowing
+the retiring server to exit without breaking replica stdout. Isolated native
+replicas use the journal. Legacy replicas whose stdout still terminates in an
+older controller need that output owner until the replicas exit; a handoff cannot
+retroactively replace their pipe endpoints. Their output-only owners stay in the
+registry with zero sessions. Replace those replicas in an announced app rollout
+before expecting the lifetime limit to eliminate every legacy process.

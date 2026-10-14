@@ -20,6 +20,7 @@ const (
 )
 
 type providerLogReadKey struct {
+	resource  string
 	provider  string
 	region    string
 	logGroup  string
@@ -61,9 +62,19 @@ func newProviderLogCoordinator(reader process.ExternalLogReader) *providerLogCoo
 	}
 }
 
+func (c *providerLogCoordinator) available(details *process.ExternalLogs) bool {
+	if c == nil || details == nil {
+		return false
+	}
+	if providers, ok := c.reader.(interface{ Supports(string) bool }); ok && !providers.Supports(details.Provider) {
+		return false
+	}
+	return details.Provider == "systemd_journal" || details.LogGroup != "" && details.LogStream != ""
+}
+
 func (c *providerLogCoordinator) read(ctx context.Context, details process.ExternalLogs, cursor string, limit int32) (process.ExternalLogPage, bool, error) {
 	key := providerLogReadKey{
-		provider: details.Provider, region: details.Region,
+		resource: details.Resource, provider: details.Provider, region: details.Region,
 		logGroup: details.LogGroup, logStream: details.LogStream,
 		cursor: cursor, limit: limit,
 	}

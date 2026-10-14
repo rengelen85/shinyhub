@@ -29,19 +29,35 @@ type RelayBackend struct {
 	Sessions     int64  `json:"sessions"`
 }
 
+type RetiredGeneration struct {
+	PID       int       `json:"pid,omitempty"`
+	RetiredAt time.Time `json:"retired_at,omitempty"`
+	Sessions  int64     `json:"sessions"`
+}
+
+type RetiredStatus struct {
+	Generations []RetiredGeneration `json:"generations"`
+	Count       int                 `json:"count"`
+	Sessions    int64               `json:"sessions"`
+	Unknown     bool                `json:"unknown"`
+}
+
 type relaySnapshot struct {
-	Protocol int            `json:"protocol"`
-	Backends []RelayBackend `json:"backends"`
+	PID       int            `json:"pid,omitempty"`
+	RetiredAt time.Time      `json:"retired_at,omitempty"`
+	Protocol  int            `json:"protocol"`
+	Backends  []RelayBackend `json:"backends"`
 }
 
 // RelayLease holds a kernel lock for its entire lifetime. A missing or invalid
 // snapshot behind a held lock is unknown, never idle. Published counts can only
 // shrink after sealing, so delayed writes conservatively overcount activity.
 type RelayLease struct {
-	mu     sync.Mutex
-	file   *os.File
-	path   string
-	sealed map[RelayBackend]int64
+	mu        sync.Mutex
+	file      *os.File
+	path      string
+	sealed    map[RelayBackend]int64
+	retiredAt time.Time
 }
 
 func NewRelayLease(dir string) (*RelayLease, error) {
@@ -76,7 +92,7 @@ func NewRelayLease(dir string) (*RelayLease, error) {
 		os.Remove(file.Name())
 		return nil, err
 	}
-	return &RelayLease{file: file, path: path}, nil
+	return &RelayLease{file: file, path: path, retiredAt: time.Now().UTC()}, nil
 }
 
 func backendKey(backend RelayBackend) RelayBackend { backend.Sessions = 0; return backend }
@@ -110,7 +126,7 @@ func (l *RelayLease) Publish(backends []RelayBackend) error {
 	if l.sealed != nil && maps.Equal(counts, l.sealed) {
 		return nil
 	}
-	data, err := json.Marshal(relaySnapshot{Protocol: 1, Backends: backends})
+	data, err := json.Marshal(relaySnapshot{Protocol: 1, Backends: backends, PID: os.Getpid(), RetiredAt: l.retiredAt})
 	if err != nil {
 		return err
 	}
@@ -203,12 +219,23 @@ func (r *RelayLeases) Watch(ctx context.Context) func() {
 }
 
 func (r *RelayLeases) Snapshot() (backends []RelayBackend, live int, unknown bool) {
+	backends, status := r.inspect()
+	return backends, status.Count, status.Unknown
+}
+
+// Status uses the same held-lock evidence as session admission and recovery.
+func (r *RelayLeases) Status() RetiredStatus { _, status := r.inspect(); return status }
+
+func (r *RelayLeases) inspect() (backends []RelayBackend, status RetiredStatus) {
+	status.Generations = []RetiredGeneration{}
+
 	entries, err := os.ReadDir(r.Dir)
 	if os.IsNotExist(err) {
-		return nil, 0, false
+		return nil, status
 	}
 	if err != nil {
-		return nil, 0, true
+		status.Unknown = true
+		return nil, status
 	}
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), "relay-") || !strings.HasSuffix(entry.Name(), ".lock") {
@@ -220,7 +247,7 @@ func (r *RelayLeases) Snapshot() (backends []RelayBackend, live int, unknown boo
 			continue
 		}
 		if err != nil {
-			unknown = true
+			status.Unknown = true
 			continue
 		}
 		file := os.NewFile(uintptr(fd), path)
@@ -234,10 +261,10 @@ func (r *RelayLeases) Snapshot() (backends []RelayBackend, live int, unknown boo
 		}
 		file.Close()
 		if !errors.Is(lockErr, unix.EWOULDBLOCK) && !errors.Is(lockErr, unix.EAGAIN) {
-			unknown = true
+			status.Unknown = true
 			continue
 		}
-		live++
+		status.Count++
 		snapshotFD, err := unix.Open(strings.TrimSuffix(path, ".lock")+".json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		var data []byte
 		if err == nil {
@@ -246,12 +273,12 @@ func (r *RelayLeases) Snapshot() (backends []RelayBackend, live int, unknown boo
 			snapshotFile.Close()
 		}
 		if err != nil {
-			unknown = true
+			status.Unknown = true
 			continue
 		}
 		var snapshot relaySnapshot
 		if len(data) > 8<<20 || json.Unmarshal(data, &snapshot) != nil || snapshot.Protocol != 1 {
-			unknown = true
+			status.Unknown = true
 			continue
 		}
 		valid := true
@@ -262,10 +289,27 @@ func (r *RelayLeases) Snapshot() (backends []RelayBackend, live int, unknown boo
 			}
 		}
 		if !valid {
-			unknown = true
+			status.Unknown = true
 			continue
 		}
 		backends = append(backends, snapshot.Backends...)
+		generation := RetiredGeneration{PID: snapshot.PID, RetiredAt: snapshot.RetiredAt}
+		for _, backend := range snapshot.Backends {
+			if backend.Sessions > math.MaxInt64-generation.Sessions {
+				status.Unknown = true
+				generation.Sessions = math.MaxInt64
+				break
+			}
+			generation.Sessions += backend.Sessions
+		}
+		status.Generations = append(status.Generations, generation)
+		if generation.Sessions > math.MaxInt64-status.Sessions {
+			status.Unknown = true
+			status.Sessions = math.MaxInt64
+		} else {
+			status.Sessions += generation.Sessions
+		}
+
 	}
 	return
 }

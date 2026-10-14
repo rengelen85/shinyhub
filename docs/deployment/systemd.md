@@ -4,7 +4,7 @@ description: "Run the standalone binary as an unprivileged service with delegate
 
 # systemd
 
-The standalone binary can run as an unprivileged systemd service with delegated
+The standalone binary (Linux 5.3+) can run as an unprivileged systemd service with delegated
 CPU and memory controllers for native application limits.
 
 ## Install the unit
@@ -27,7 +27,14 @@ only permissions.
 ## Reload the server
 
 Set `server.pid_file: /run/shinyhub/shinyhub.pid`. The unit creates that runtime
-directory with mode `0700`. Its `ExecReload` calls `shinyhub reload --wait 10m`
+directory with mode `0700`. Its `serve --supervise` parent stays systemd's direct
+child across reloads and watches the active server with Linux pidfds.
+`MainPID` remains the supervisor; the PID file names the active server.
+Use `Type=notify`, `NotifyAccess=all`, `GuessMainPID=no`, and
+`KillMode=control-group`, without a systemd `PIDFile=` directive.
+An unexpected active-server exit makes the supervisor fail, allowing
+`Restart=on-failure` to restart the unit even when older relays remain.
+Its `ExecReload` calls `shinyhub reload --wait 10m`
 and waits for the successor's readiness acknowledgement. `systemctl reload`
 returns nonzero when the reload is refused, its transition wait expires, or the
 successor fails to start; the current server keeps serving after a failed handoff.
@@ -48,21 +55,48 @@ world-readable files. Moving the existing value is not a rotation. Follow
 encrypts persistent app secrets.
 
 Keep `shinyhub.yaml` owned by `shinyhub:shinyhub` with mode `0600` when it
-contains proxy, OAuth, deploy, or database credentials. For settings supplied
-through environment variables, create a root-owned `/etc/shinyhub/shinyhub.env`
-with mode `0600` and add the following inside `[Service]` in the unit or a
-drop-in:
+contains proxy, OAuth, deploy, or database credentials. For settings supplied through environment variables, use a service-user-readable
+owner-only `/etc/shinyhub/server.env` (0600) and set:
 
-```ini
-EnvironmentFile=/etc/shinyhub/shinyhub.env
+```yaml
+server:
+  env_file: /etc/shinyhub/server.env
 ```
 
-Use `KEY=value` lines without `export`. Systemd's system service manager reads
-the file before dropping privileges; the path can appear in the public unit,
-but the values should not. Keep the root secret in its secret file rather
-than this environment file. Do not print secret values in diagnostics or
-commit private files. Reload systemd after changing the unit, and restart
-the service to apply changed environment-file values.
+ShinyHub reads this file at startup and again before launching each successor.
+Use `KEY=value` lines; blank lines and full-line `#` comments are allowed.
+Single quotes preserve literal text, double quotes accept escaped characters.
+There is no shell expansion, `export`, or inline comment syntax. Duplicate or
+unsupported keys, malformed quotes, non-regular files, and public permissions
+refuse the reload before spawning a successor. Errors never print file values.
+
+The file overrides inherited values for known `SHINYHUB_*` settings, proxy
+variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their lowercase
+forms), and `UV_*` settings. Removed keys are removed from the successor's
+environment; an empty value also overrides an inherited value. `SHINYHUB_CONFIG`,
+`SHINYHUB_PID_FILE`, and internal handoff/systemd variables cannot be changed by
+this file. Keep `server.pid_file` stable across handoffs. Existing replicas keep
+their launch environments; changed settings affect the new controller and future
+builds/replicas. Root-secret rotation still requires the documented migration;
+keep it in `auth.secret_file`, rather than this environment file.
+
+A systemd `EnvironmentFile=` remains supported, but systemd does not re-read it
+when ShinyHub forks a successor: changes there still require a restart. Moving
+changing settings to `server.env_file` keeps them out of the unit and makes a
+reload sufficient. For systemd-only settings, use a `[Service]` drop-in and
+`systemctl daemon-reload`; clear `ExecReload=` before replacing its command.
+
+Installing `--supervise` on an existing signal-based or unsupervised unit needs
+one announced restart. Future handoffs retain this minimal supervisor. To verify,
+compare `systemctl show -p MainPID shinyhub` (stable supervisor) with the PID file
+(changing active server) and `shinyhub status --config /etc/shinyhub/shinyhub.yaml`.
+
+Broker-native workers with journal output survive controller restarts when
+`server.shutdown_apps: adopt`; see [native user isolation](../native-user-isolation.md).
+Shared-user native replicas remain in this service's cgroup and are stopped by
+`systemctl restart`. `Delegate=` allows resource management; it does not exempt
+sub-cgroups from service termination. `KillMode=mixed` still sends the final
+SIGKILL to the entire cgroup, so it is not a restart-survival setting.
 
 The opt-in [per-app user backend](../native-user-isolation.md) adds a separate
 root broker and dedicated app accounts. The following limitation applies when

@@ -62,6 +62,7 @@ var schemaAnnotations = map[string]cmdAnnotation{
 	"announcements disable": {Mutating: mut, Notes: "Reads the latest revision before PATCH. Use --expected-revision from publish to protect subsequent edits; mismatch returns conflict/exit 5. Already disabled or archived records succeed without writes; ambiguous write outcomes return internal/exit 1.", OutputFields: []fieldSpec{
 		{Name: "status", Type: "string"}, {Name: "id", Type: "string"}, {Name: "publication", Type: "string"}, {Name: "revision", Type: "integer"},
 	}},
+	"status":   {Mutating: ro, Notes: "Host-local active PID publication and retired generations; no server request.", OutputFields: []fieldSpec{{Name: "status", Type: "string"}, {Name: "pid", Type: "integer"}, {Name: "retired", Type: "object"}}},
 	"diagnose": {Mutating: ro},
 	"diagnose python": {Mutating: mut, Stability: "experimental",
 		ArgTypes: map[string]string{"pid": "integer", "--python": "path", "--save": "path"},

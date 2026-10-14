@@ -174,7 +174,10 @@ GET /api/announcements/active
 GET /app/{slug}/.shinyhub/announcements.json
 ```
 
-Both return `announcements`, `server_time`, and `next_transition`. The app-origin feed is read-only and has the same public content regardless of the slug. All feeds use `Cache-Control: no-store`.
+Both return `announcements`, `server_time`, and `next_transition`. The app-origin feed is read-only and has the same public content regardless of the slug. All feeds use `Cache-Control: no-store`. An already-open page retains its last
+successfully fetched active notices when the feed is unreachable, until their
+server-time expiry or dismissal. A successful empty response clears them. This
+retention is in page memory; a fresh page opened during an outage has no cached notice.
 
 Management endpoints require platform-wide administrator credentials or a host-local announcement capability:
 

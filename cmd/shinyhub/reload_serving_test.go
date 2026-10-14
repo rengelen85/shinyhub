@@ -95,7 +95,7 @@ func TestReloadServingReadinessRejectsMissingStoppedAndUndialableReplica(t *test
 	}
 }
 
-func TestReloadServingSnapshotCapsFloorAtReadyReplicas(t *testing.T) {
+func TestReloadServingSnapshotPreservesAllReadyReplicas(t *testing.T) {
 	store, app := storedProducerFixture(t, "roll", "first_deploy", true)
 	dep, err := store.BeginDeployment(app.ID, "v1", t.TempDir())
 	if err != nil {
@@ -138,8 +138,8 @@ func TestReloadServingSnapshotCapsFloorAtReadyReplicas(t *testing.T) {
 		{"one replica restarting", 16, 15, 15, false},
 		{"temporary surge with one normal replica missing", 16, 15, 15, true},
 		{"full floor", 16, 16, 16, false},
-		{"above floor", 2, 16, 2, false},
-		{"no warm floor", 0, 16, 1, false},
+		{"above floor", 2, 16, 16, false},
+		{"no warm floor", 0, 16, 16, false},
 		{"no ready replicas", 16, 0, 0, false},
 		{"only a temporary surge ready", 16, 0, 0, true},
 	} {

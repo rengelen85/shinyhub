@@ -431,6 +431,18 @@ func (f *fakeExternalLogReader) Read(_ context.Context, details process.External
 }
 
 func TestHandleLogsReadsStoppedFargateRunFromExternalProvider(t *testing.T) {
+	testHandleLogsReadsStoppedProvider(t, process.ExternalLogs{
+		Provider: "aws_ecs", Resource: "arn:aws:ecs:eu-west-1:111122223333:task/analytics/task-3",
+		Region: "eu-west-1", Cluster: "analytics", LogGroup: "/shinyhub/apps", LogStream: "app/app/task-3",
+	}, "fargate")
+}
+
+func TestHandleLogsReadsStoppedJournalRunFromExternalProvider(t *testing.T) {
+	testHandleLogsReadsStoppedProvider(t, process.ExternalLogs{Provider: "systemd_journal", Resource: "shinyhub-isolated-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service"}, "native")
+}
+
+func testHandleLogsReadsStoppedProvider(t *testing.T, details process.ExternalLogs, provider string) {
+	t.Helper()
 	srv, store, _ := newLogsTestServer(t)
 	hash, _ := testHashPassword("pass")
 	if err := store.CreateUser(db.CreateUserParams{Username: "owner", PasswordHash: hash, Role: "developer"}); err != nil {
@@ -448,12 +460,8 @@ func TestHandleLogsReadsStoppedFargateRunFromExternalProvider(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	details := process.ExternalLogs{
-		Provider: "aws_ecs", Resource: "arn:aws:ecs:eu-west-1:111122223333:task/analytics/task-3",
-		Region: "eu-west-1", Cluster: "analytics", LogGroup: "/shinyhub/apps", LogStream: "app/app/task-3",
-	}
 	encoded, _ := json.Marshal(details)
-	if err := store.MarkAppLogRunRunning(runID, "fargate", string(encoded)); err != nil {
+	if err := store.MarkAppLogRunRunning(runID, provider, string(encoded)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.FinishAppLogRun(runID, "stopped", time.Now(), false); err != nil {
@@ -535,7 +543,6 @@ func TestHandleLogsReadsStoppedFargateRunFromExternalProvider(t *testing.T) {
 		}
 	}
 }
-
 func TestHandleLogsCoalescesConcurrentReadsForTheSameProviderCursor(t *testing.T) {
 	reader := &blockingExternalLogReader{started: make(chan struct{}, 2), release: make(chan struct{})}
 	srv, token, providerURL := newConcurrentProviderLogsFixture(t, reader)

@@ -43,6 +43,7 @@ type Launch struct {
 	CacheDir      string            `json:"cache_dir,omitempty"`
 	MemoryMB      int               `json:"memory_mb,omitempty"`
 	CPUPercent    int               `json:"cpu_percent,omitempty"`
+	JournalLogs   bool              `json:"journal_logs,omitempty"`
 	Guarded       bool              `json:"guarded"`
 	LifetimeCount int               `json:"lifetime_count"`
 	Labels        map[string]string `json:"labels,omitempty"`
@@ -59,6 +60,7 @@ type Request struct {
 	Unit            string  `json:"unit,omitempty"`
 	Signal          int     `json:"signal,omitempty"`
 	Cursor          string  `json:"cursor,omitempty"`
+	LogLimit        int     `json:"log_limit,omitempty"`
 }
 type State struct {
 	Unit      string            `json:"unit"`
@@ -71,13 +73,24 @@ type State struct {
 	Signaled  bool              `json:"signaled"`
 	Labels    map[string]string `json:"labels,omitempty"`
 }
+type JournalEvent struct {
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+}
+type JournalPage struct {
+	Events     []JournalEvent `json:"events"`
+	NextCursor string         `json:"next_cursor,omitempty"`
+}
+
 type Response struct {
-	Freed      bool    `json:"freed,omitempty"`
-	Error      string  `json:"error,omitempty"`
-	State      *State  `json:"state,omitempty"`
-	States     []State `json:"states,omitempty"`
-	Policy     *Policy `json:"policy,omitempty"`
-	NextCursor string  `json:"next_cursor,omitempty"`
+	Journal     *JournalPage `json:"journal,omitempty"`
+	JournalLogs bool         `json:"journal_logs,omitempty"`
+	Freed       bool         `json:"freed,omitempty"`
+	Error       string       `json:"error,omitempty"`
+	State       *State       `json:"state,omitempty"`
+	States      []State      `json:"states,omitempty"`
+	Policy      *Policy      `json:"policy,omitempty"`
+	NextCursor  string       `json:"next_cursor,omitempty"`
 }
 
 type Client struct{ Socket string }

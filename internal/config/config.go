@@ -550,8 +550,9 @@ type ServerConfig struct {
 	ReloadDrainTimeout *time.Duration `yaml:"reload_drain_timeout"`
 	// ReloadSessions preserves stable single-host native multiplex sessions in
 	// relay-only processes when explicitly enabled. The default remains drain.
-	ReloadSessions   string `yaml:"reload_sessions"`
-	ReloadRelayLimit int    `yaml:"reload_relay_limit"`
+	ReloadSessions     string        `yaml:"reload_sessions"`
+	ReloadRelayLimit   int           `yaml:"reload_relay_limit"`
+	MaxRetiredLifetime time.Duration `yaml:"max_retired_lifetime"`
 
 	// UpgradeTimeout bounds how long the old process waits for a new one to
 	// signal Ready during a zero-downtime upgrade (SIGHUP) before aborting the
@@ -577,9 +578,12 @@ type ServerConfig struct {
 	StopGrace time.Duration `yaml:"stop_grace"`
 
 	// PIDFile, when set, receives the ready process's PID on startup and after
-	// each zero-downtime handoff. Required for the systemd path (MAINPID
-	// tracking via PIDFile=). Empty (default) writes no PID file.
+	// each zero-downtime handoff. Required for reload and --supervise; systemd
+	// tracks the stable supervisor without PIDFile=. Empty writes no PID file.
 	PIDFile string `yaml:"pid_file"`
+
+	// EnvFile is a private KEY=VALUE file re-read for each successor.
+	EnvFile string `yaml:"env_file"`
 
 	// HostBudgetMB is the total RAM (in MiB) the host can allocate to app
 	// worker processes. Used by the host-capacity guard to reject deploys that
@@ -1735,7 +1739,12 @@ func loadRaw(path string) (*Config, error) {
 			},
 		},
 	}
-	if err := applyEnv(cfg); err != nil {
+	environment, err := ServerEnvironment(path, os.Environ())
+	if err != nil {
+		return nil, err
+	}
+	values := environmentValues(environment)
+	if err := applyEnvWith(cfg, func(key string) string { return values[key] }); err != nil {
 		return nil, err
 	}
 	if socket := cfg.Runtime.Native.BrokerSocket; socket != "" && (!filepath.IsAbs(socket) || filepath.Clean(socket) != socket) {
@@ -1844,6 +1853,12 @@ func loadRaw(path string) (*Config, error) {
 	}
 	if cfg.Server.ReloadSessions == "preserve" && cfg.SessionRecheckInterval() <= 0 {
 		return nil, fmt.Errorf("server.reload_sessions preserve requires a positive server.session_recheck_interval")
+	}
+	if cfg.Server.MaxRetiredLifetime == 0 {
+		cfg.Server.MaxRetiredLifetime = 24 * time.Hour
+	}
+	if cfg.Server.MaxRetiredLifetime < 0 {
+		return nil, fmt.Errorf("server.max_retired_lifetime must be positive")
 	}
 	if cfg.Server.ReloadRelayLimit == 0 {
 		cfg.Server.ReloadRelayLimit = 4
@@ -2910,168 +2925,170 @@ func parseRuntime(r rawRuntimeConfig) (RuntimeConfig, error) {
 	return rc, nil
 }
 
-func applyEnv(cfg *Config) error {
-	if v := os.Getenv("SHINYHUB_AUTH_SESSION_TTL"); v != "" {
+func applyEnv(cfg *Config) error { return applyEnvWith(cfg, os.Getenv) }
+
+func applyEnvWith(cfg *Config, getConfigEnv func(string) string) error {
+	if v := getConfigEnv("SHINYHUB_AUTH_SESSION_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_AUTH_SESSION_TTL: %w", err)
 		}
 		cfg.Auth.SessionTTL = &d
 	}
-	if v := os.Getenv("SHINYHUB_AUTH_SESSION_MAX_AGE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_AUTH_SESSION_MAX_AGE"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_AUTH_SESSION_MAX_AGE: %w", err)
 		}
 		cfg.Auth.SessionMaxAge = &d
 	}
-	if v := os.Getenv("SHINYHUB_AUTH_SECRET"); v != "" {
+	if v := getConfigEnv("SHINYHUB_AUTH_SECRET"); v != "" {
 		cfg.Auth.Secret = v
 		cfg.Auth.SecretSource = "env"
 	}
-	if v := os.Getenv("SHINYHUB_AUTH_SECRET_FILE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_AUTH_SECRET_FILE"); v != "" {
 		cfg.Auth.SecretFile = v
 	}
-	if v := os.Getenv("SHINYHUB_AUTH_OAUTH_DEFAULT_ROLE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_AUTH_OAUTH_DEFAULT_ROLE"); v != "" {
 		cfg.Auth.OAuthDefaultRole = v
 	}
-	if v := os.Getenv("SHINYHUB_DEPLOY_TOKEN"); v != "" {
+	if v := getConfigEnv("SHINYHUB_DEPLOY_TOKEN"); v != "" {
 		cfg.Auth.DeployToken = v
 	}
-	if v := os.Getenv("SHINYHUB_DEPLOY_TOKEN_ROLE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_DEPLOY_TOKEN_ROLE"); v != "" {
 		cfg.Auth.DeployTokenRole = v
 	}
-	if v := os.Getenv("SHINYHUB_DEPLOY_TOKEN_APPS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_DEPLOY_TOKEN_APPS"); v != "" {
 		cfg.Auth.DeployTokenApps = splitCSV(v)
 	}
-	if v := os.Getenv("SHINYHUB_OPERATOR_AUDIT_ACCESS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OPERATOR_AUDIT_ACCESS"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_OPERATOR_AUDIT_ACCESS: %w", err)
 		}
 		cfg.Auth.OperatorAuditAccess = b
 	}
-	if v := os.Getenv("SHINYHUB_SUPPORT_SESSIONS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SUPPORT_SESSIONS"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SUPPORT_SESSIONS: %w", err)
 		}
 		cfg.Auth.SupportSessions = b
 	}
-	if v := os.Getenv("SHINYHUB_SUPPORT_SESSIONS_TRUSTED_APPS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SUPPORT_SESSIONS_TRUSTED_APPS"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SUPPORT_SESSIONS_TRUSTED_APPS: %w", err)
 		}
 		cfg.Auth.SupportSessionsTrustedApps = b
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_LOGOUT_URL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_LOGOUT_URL"); v != "" {
 		cfg.Auth.ForwardAuth.LogoutURL = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_LOGOUT_METHOD"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_LOGOUT_METHOD"); v != "" {
 		cfg.Auth.ForwardAuth.LogoutMethod = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_ENABLED"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_ENABLED"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_FORWARD_AUTH_ENABLED: %w", err)
 		}
 		cfg.Auth.ForwardAuth.Enabled = b
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_USER_HEADER"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_USER_HEADER"); v != "" {
 		cfg.Auth.ForwardAuth.UserHeader = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_SHARED_SECRET"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_SHARED_SECRET"); v != "" {
 		cfg.Auth.ForwardAuth.SharedSecret = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_SECRET_HEADER"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_SECRET_HEADER"); v != "" {
 		cfg.Auth.ForwardAuth.SecretHeader = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_EMAIL_HEADER"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_EMAIL_HEADER"); v != "" {
 		cfg.Auth.ForwardAuth.EmailHeader = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_NAME_HEADER"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_NAME_HEADER"); v != "" {
 		cfg.Auth.ForwardAuth.NameHeader = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_GROUPS_HEADER"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_GROUPS_HEADER"); v != "" {
 		cfg.Auth.ForwardAuth.GroupsHeader = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_ADMIN_GROUPS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_ADMIN_GROUPS"); v != "" {
 		cfg.Auth.ForwardAuth.AdminGroups = splitCSV(v)
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_DEFAULT_ROLE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_DEFAULT_ROLE"); v != "" {
 		cfg.Auth.ForwardAuth.DefaultRole = v
 	}
-	if v := os.Getenv("SHINYHUB_FORWARD_AUTH_REQUIRE_GROUPS_HEADER"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FORWARD_AUTH_REQUIRE_GROUPS_HEADER"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_FORWARD_AUTH_REQUIRE_GROUPS_HEADER: %w", err)
 		}
 		cfg.Auth.ForwardAuth.RequireGroupsHeader = b
 	}
-	if v := os.Getenv("SHINYHUB_AUTH_GROUP_ROLE_MAPPINGS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_AUTH_GROUP_ROLE_MAPPINGS"); v != "" {
 		ms, err := parseGroupRoleMappings(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_AUTH_GROUP_ROLE_MAPPINGS: %w", err)
 		}
 		cfg.Auth.GroupRoleMappings = ms
 	}
-	if v := os.Getenv("SHINYHUB_IDENTITY_HEADERS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_IDENTITY_HEADERS"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_IDENTITY_HEADERS: %w", err)
 		}
 		cfg.Auth.IdentityHeaders = &b
 	}
-	if v := os.Getenv("SHINYHUB_AUTH_LOCAL_LOGIN"); v != "" {
+	if v := getConfigEnv("SHINYHUB_AUTH_LOCAL_LOGIN"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_AUTH_LOCAL_LOGIN: %w", err)
 		}
 		cfg.Auth.LocalLogin = &b
 	}
-	if v := os.Getenv("SHINYHUB_SERVER_STATUS_OVERLAY"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SERVER_STATUS_OVERLAY"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SERVER_STATUS_OVERLAY: %w", err)
 		}
 		cfg.Server.StatusOverlay = &b
 	}
-	if v := os.Getenv("SHINYHUB_SERVER_APP_NAV"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SERVER_APP_NAV"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SERVER_APP_NAV: %w", err)
 		}
 		cfg.Server.AppNav = &b
 	}
-	if v := os.Getenv("SHINYHUB_SERVER_COMPRESSION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SERVER_COMPRESSION"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SERVER_COMPRESSION: %w", err)
 		}
 		cfg.Server.Compression = &b
 	}
-	if v := os.Getenv("SHINYHUB_SERVER_WEBSOCKET_COMPRESSION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SERVER_WEBSOCKET_COMPRESSION"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SERVER_WEBSOCKET_COMPRESSION: %w", err)
 		}
 		cfg.Server.WebSocketCompression = &b
 	}
-	if v := os.Getenv("SHINYHUB_DB_DSN"); v != "" {
+	if v := getConfigEnv("SHINYHUB_DB_DSN"); v != "" {
 		cfg.Database.DSN = v
 	}
-	if v := os.Getenv("SHINYHUB_DB_PRE_MIGRATION_SNAPSHOT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_DB_PRE_MIGRATION_SNAPSHOT"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_DB_PRE_MIGRATION_SNAPSHOT: %w", err)
 		}
 		cfg.Database.PreMigrationSnapshot = b
 	}
-	if v := os.Getenv("SHINYHUB_PID_FILE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_PID_FILE"); v != "" {
 		cfg.Server.PIDFile = v
 	}
-	if v := os.Getenv("SHINYHUB_UPGRADE_TIMEOUT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_UPGRADE_TIMEOUT"); v != "" {
 		d, perr := time.ParseDuration(v)
 		if perr != nil {
 			return fmt.Errorf("parse SHINYHUB_UPGRADE_TIMEOUT %q: %w", v, perr)
@@ -3081,24 +3098,31 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Server.UpgradeTimeout = d
 	}
-	if v := os.Getenv("SHINYHUB_RELOAD_SESSIONS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_MAX_RETIRED_LIFETIME"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("SHINYHUB_MAX_RETIRED_LIFETIME must be a positive duration")
+		}
+		cfg.Server.MaxRetiredLifetime = d
+	}
+	if v := getConfigEnv("SHINYHUB_RELOAD_SESSIONS"); v != "" {
 		cfg.Server.ReloadSessions = v
 	}
-	if v := os.Getenv("SHINYHUB_RELOAD_RELAY_LIMIT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RELOAD_RELAY_LIMIT"); v != "" {
 		limit, err := strconv.Atoi(v)
 		if err != nil || limit < 1 || limit > 32 {
 			return fmt.Errorf("SHINYHUB_RELOAD_RELAY_LIMIT must be between 1 and 32")
 		}
 		cfg.Server.ReloadRelayLimit = limit
 	}
-	if v := os.Getenv("SHINYHUB_RELOAD_DRAIN_TIMEOUT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RELOAD_DRAIN_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {
 			return fmt.Errorf("SHINYHUB_RELOAD_DRAIN_TIMEOUT must be a positive duration, got %q", v)
 		}
 		cfg.Server.ReloadDrainTimeout = &d
 	}
-	if v := os.Getenv("SHINYHUB_SESSION_RECHECK_INTERVAL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SESSION_RECHECK_INTERVAL"); v != "" {
 		d, perr := time.ParseDuration(v)
 		if perr != nil {
 			return fmt.Errorf("parse SHINYHUB_SESSION_RECHECK_INTERVAL %q: %w", v, perr)
@@ -3109,7 +3133,7 @@ func applyEnv(cfg *Config) error {
 		interval := SweepInterval(d)
 		cfg.Server.SessionRecheckInterval = &interval
 	}
-	if v := os.Getenv("SHINYHUB_STOP_GRACE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_STOP_GRACE"); v != "" {
 		d, perr := time.ParseDuration(v)
 		if perr != nil {
 			return fmt.Errorf("parse SHINYHUB_STOP_GRACE %q: %w", v, perr)
@@ -3119,17 +3143,17 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Server.StopGrace = d
 	}
-	if v := os.Getenv("SHINYHUB_APPS_DIR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_APPS_DIR"); v != "" {
 		cfg.Storage.AppsDir = v
 	}
-	if v := os.Getenv("SHINYHUB_STORAGE_VERSION_RETENTION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_STORAGE_VERSION_RETENTION"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_STORAGE_VERSION_RETENTION: %q is not an integer: %w", v, err)
 		}
 		cfg.Storage.VersionRetention = n
 	}
-	if v := os.Getenv("SHINYHUB_DB_PRE_MIGRATION_SNAPSHOT_RETENTION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_DB_PRE_MIGRATION_SNAPSHOT_RETENTION"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_DB_PRE_MIGRATION_SNAPSHOT_RETENTION: %q is not an integer: %w", v, err)
@@ -3145,69 +3169,69 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Database.PreMigrationSnapshotRetention = n
 	}
-	if v := os.Getenv("SHINYHUB_AUDIT_RETENTION_DAYS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_AUDIT_RETENTION_DAYS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_AUDIT_RETENTION_DAYS: %q is not an integer: %w", v, err)
 		}
 		cfg.Maintenance.AuditRetentionDays = n
 	}
-	if v := os.Getenv("SHINYHUB_SCHEDULE_RUN_RETENTION_COUNT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SCHEDULE_RUN_RETENTION_COUNT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SCHEDULE_RUN_RETENTION_COUNT: %q is not an integer: %w", v, err)
 		}
 		cfg.Maintenance.ScheduleRunRetentionCount = n
 	}
-	if v := os.Getenv("SHINYHUB_APP_LOG_RUN_RETENTION_COUNT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_APP_LOG_RUN_RETENTION_COUNT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_APP_LOG_RUN_RETENTION_COUNT: %q is not an integer: %w", v, err)
 		}
 		cfg.Maintenance.AppLogRunRetentionCount = n
 	}
-	if v := os.Getenv("SHINYHUB_FLEET_RUN_RETENTION_COUNT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_FLEET_RUN_RETENTION_COUNT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_FLEET_RUN_RETENTION_COUNT: %q is not an integer: %w", v, err)
 		}
 		cfg.Maintenance.FleetRunRetentionCount = n
 	}
-	if v := os.Getenv("SHINYHUB_DEVELOPMENT_SESSION_RETENTION_DAYS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_DEVELOPMENT_SESSION_RETENTION_DAYS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_DEVELOPMENT_SESSION_RETENTION_DAYS: %q is not an integer: %w", v, err)
 		}
 		cfg.Maintenance.DevelopmentSessionRetentionDays = n
 	}
-	if v := os.Getenv("SHINYHUB_APP_QUOTA_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_APP_QUOTA_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_APP_QUOTA_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Storage.AppQuotaMB = n
 	}
-	if v := os.Getenv("SHINYHUB_APP_DATA_DIR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_APP_DATA_DIR"); v != "" {
 		cfg.Storage.AppDataDir = v
 	}
-	if v := os.Getenv("SHINYHUB_APP_CACHE_DIR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_APP_CACHE_DIR"); v != "" {
 		cfg.Storage.AppCacheDir = v
 	}
-	if v := os.Getenv("SHINYHUB_APP_CACHE_MAX_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_APP_CACHE_MAX_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_APP_CACHE_MAX_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Storage.AppCacheMaxMB = &n
 	}
-	if v := os.Getenv("SHINYHUB_MAX_BUNDLE_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_MAX_BUNDLE_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_MAX_BUNDLE_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Storage.MaxBundleMB = n
 	}
-	if v := os.Getenv("SHINYHUB_APP_LOG_MAX_SIZE_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_APP_LOG_MAX_SIZE_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_APP_LOG_MAX_SIZE_MB: %q is not an integer: %w", v, err)
@@ -3217,30 +3241,30 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Storage.AppLogMaxSizeMB = n
 	}
-	if v := os.Getenv("SHINYHUB_BASE_URL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BASE_URL"); v != "" {
 		cfg.Server.BaseURL = v
 	}
-	if v := os.Getenv("SHINYHUB_APP_ORIGIN"); v != "" {
+	if v := getConfigEnv("SHINYHUB_APP_ORIGIN"); v != "" {
 		cfg.Server.AppOrigin = v
 	}
-	if v := os.Getenv("SHINYHUB_SERVER_HOST"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SERVER_HOST"); v != "" {
 		cfg.Server.Host = v
 	}
-	if v := os.Getenv("SHINYHUB_SERVER_PORT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SERVER_PORT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SERVER_PORT: %q is not an integer: %w", v, err)
 		}
 		cfg.Server.Port = n
 	}
-	if v := os.Getenv("SHINYHUB_SERVER_HOST_BUDGET_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SERVER_HOST_BUDGET_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SERVER_HOST_BUDGET_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Server.HostBudgetMB = n
 	}
-	if v := os.Getenv("SHINYHUB_SERVER_MIN_AVAILABLE_MEMORY_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SERVER_MIN_AVAILABLE_MEMORY_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_SERVER_MIN_AVAILABLE_MEMORY_MB: %q is not an integer: %w", v, err)
@@ -3249,177 +3273,177 @@ func applyEnv(cfg *Config) error {
 		// unset, which applies the default).
 		cfg.Server.MinAvailableMemoryMB = &n
 	}
-	if v := os.Getenv("SHINYHUB_HOST_CAPACITY_CORES"); v != "" {
+	if v := getConfigEnv("SHINYHUB_HOST_CAPACITY_CORES"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_HOST_CAPACITY_CORES: %q is not a number: %w", v, err)
 		}
 		cfg.Server.HostCapacityCores = &f
 	}
-	if v := os.Getenv("SHINYHUB_HOST_CAPACITY_MEMORY_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_HOST_CAPACITY_MEMORY_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_HOST_CAPACITY_MEMORY_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Server.HostCapacityMemoryMB = &n
 	}
-	if v := os.Getenv("SHINYHUB_TRUSTED_PROXIES"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRUSTED_PROXIES"); v != "" {
 		cfg.Server.TrustedProxies = splitCSV(v)
 	}
-	if v := os.Getenv("SHINYHUB_SHUTDOWN_APPS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SHUTDOWN_APPS"); v != "" {
 		cfg.Server.ShutdownApps = v
 	}
-	if v := os.Getenv("SHINYHUB_GITHUB_CLIENT_ID"); v != "" {
+	if v := getConfigEnv("SHINYHUB_GITHUB_CLIENT_ID"); v != "" {
 		cfg.OAuth.GitHub.ClientID = v
 	}
-	if v := os.Getenv("SHINYHUB_GITHUB_CLIENT_SECRET"); v != "" {
+	if v := getConfigEnv("SHINYHUB_GITHUB_CLIENT_SECRET"); v != "" {
 		cfg.OAuth.GitHub.ClientSecret = v
 	}
-	if v := os.Getenv("SHINYHUB_GITHUB_CALLBACK_URL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_GITHUB_CALLBACK_URL"); v != "" {
 		cfg.OAuth.GitHub.CallbackURL = v
 	}
-	if v := os.Getenv("SHINYHUB_GOOGLE_CLIENT_ID"); v != "" {
+	if v := getConfigEnv("SHINYHUB_GOOGLE_CLIENT_ID"); v != "" {
 		cfg.OAuth.Google.ClientID = v
 	}
-	if v := os.Getenv("SHINYHUB_GOOGLE_CLIENT_SECRET"); v != "" {
+	if v := getConfigEnv("SHINYHUB_GOOGLE_CLIENT_SECRET"); v != "" {
 		cfg.OAuth.Google.ClientSecret = v
 	}
-	if v := os.Getenv("SHINYHUB_GOOGLE_CALLBACK_URL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_GOOGLE_CALLBACK_URL"); v != "" {
 		cfg.OAuth.Google.CallbackURL = v
 	}
-	if v := os.Getenv("SHINYHUB_OIDC_ISSUER_URL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OIDC_ISSUER_URL"); v != "" {
 		cfg.OAuth.OIDC.IssuerURL = v
 	}
-	if v := os.Getenv("SHINYHUB_OIDC_CLIENT_ID"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OIDC_CLIENT_ID"); v != "" {
 		cfg.OAuth.OIDC.ClientID = v
 	}
-	if v := os.Getenv("SHINYHUB_OIDC_CLIENT_SECRET"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OIDC_CLIENT_SECRET"); v != "" {
 		cfg.OAuth.OIDC.ClientSecret = v
 	}
-	if v := os.Getenv("SHINYHUB_OIDC_CALLBACK_URL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OIDC_CALLBACK_URL"); v != "" {
 		cfg.OAuth.OIDC.CallbackURL = v
 	}
-	if v := os.Getenv("SHINYHUB_OIDC_DISPLAY_NAME"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OIDC_DISPLAY_NAME"); v != "" {
 		cfg.OAuth.OIDC.DisplayName = v
 	}
-	if v := os.Getenv("SHINYHUB_OIDC_GROUPS_CLAIM"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OIDC_GROUPS_CLAIM"); v != "" {
 		cfg.OAuth.OIDC.GroupsClaim = v
 	}
-	if v := os.Getenv("SHINYHUB_OIDC_GROUPS_SCOPE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OIDC_GROUPS_SCOPE"); v != "" {
 		cfg.OAuth.OIDC.GroupsScope = v
 	}
-	if v := os.Getenv("SHINYHUB_OIDC_REQUIRE_VALID_GROUPS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_OIDC_REQUIRE_VALID_GROUPS"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_OIDC_REQUIRE_VALID_GROUPS: %w", err)
 		}
 		cfg.OAuth.OIDC.RequireValidGroups = b
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_MODE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_MODE"); v != "" {
 		cfg.Runtime.Mode = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_NATIVE_ISOLATION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_NATIVE_ISOLATION"); v != "" {
 		level, err := sandbox.ParseLevel(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_NATIVE_ISOLATION: %w", err)
 		}
 		cfg.Runtime.Native.Isolation = string(level)
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DOCKER_SOCKET"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DOCKER_SOCKET"); v != "" {
 		cfg.Runtime.Docker.Socket = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DOCKER_NETWORK_MODE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DOCKER_NETWORK_MODE"); v != "" {
 		cfg.Runtime.Docker.NetworkMode = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DOCKER_DEFAULT_MEMORY_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DOCKER_DEFAULT_MEMORY_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_DOCKER_DEFAULT_MEMORY_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Docker.DefaultMemoryMB = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DOCKER_DEFAULT_CPU_PERCENT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DOCKER_DEFAULT_CPU_PERCENT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_DOCKER_DEFAULT_CPU_PERCENT: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Docker.DefaultCPUPercent = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SNAPSHOT_ENABLED"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SNAPSHOT_ENABLED"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_SNAPSHOT_ENABLED: %w", err)
 		}
 		cfg.Runtime.Snapshot.Enabled = b
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SNAPSHOT_MAX_SUSPENDED"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SNAPSHOT_MAX_SUSPENDED"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_SNAPSHOT_MAX_SUSPENDED: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Snapshot.MaxSuspended = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SNAPSHOT_RECLAIM_MIN_FRACTION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SNAPSHOT_RECLAIM_MIN_FRACTION"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_SNAPSHOT_RECLAIM_MIN_FRACTION: %q is not a number: %w", v, err)
 		}
 		cfg.Runtime.Snapshot.ReclaimMinFraction = f
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_NATIVE_BROKER_SOCKET"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_NATIVE_BROKER_SOCKET"); v != "" {
 		cfg.Runtime.Native.BrokerSocket = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DOCKER_IMAGE_PYTHON"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DOCKER_IMAGE_PYTHON"); v != "" {
 		cfg.Runtime.Docker.Images.Python = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DOCKER_IMAGE_R"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DOCKER_IMAGE_R"); v != "" {
 		cfg.Runtime.Docker.Images.R = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_CLUSTER"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_CLUSTER"); v != "" {
 		cfg.Runtime.Fargate.Cluster = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_TASK_DEFINITION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_TASK_DEFINITION"); v != "" {
 		cfg.Runtime.Fargate.TaskDefinition = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_CONTAINER_NAME"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_CONTAINER_NAME"); v != "" {
 		cfg.Runtime.Fargate.ContainerName = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_SUBNETS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_SUBNETS"); v != "" {
 		cfg.Runtime.Fargate.Subnets = splitCSV(v)
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_SECURITY_GROUPS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_SECURITY_GROUPS"); v != "" {
 		cfg.Runtime.Fargate.SecurityGroups = splitCSV(v)
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_ASSIGN_PUBLIC_IP"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_ASSIGN_PUBLIC_IP"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_FARGATE_ASSIGN_PUBLIC_IP: %w", err)
 		}
 		cfg.Runtime.Fargate.AssignPublicIP = b
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_PLATFORM_VERSION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_PLATFORM_VERSION"); v != "" {
 		cfg.Runtime.Fargate.PlatformVersion = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_REGION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_REGION"); v != "" {
 		cfg.Runtime.Fargate.Region = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_ROUTE_VIA_PUBLIC_IP"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_ROUTE_VIA_PUBLIC_IP"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_FARGATE_ROUTE_VIA_PUBLIC_IP: %w", err)
 		}
 		cfg.Runtime.Fargate.RouteViaPublicIP = b
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_CONTROL_PLANE_URL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_CONTROL_PLANE_URL"); v != "" {
 		cfg.Runtime.Fargate.ControlPlaneURL = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_SECRETS_NAME_PREFIX"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_SECRETS_NAME_PREFIX"); v != "" {
 		cfg.Runtime.Fargate.SecretsNamePrefix = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_SECRETS_KMS_KEY_ID"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_SECRETS_KMS_KEY_ID"); v != "" {
 		cfg.Runtime.Fargate.SecretsKMSKeyID = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_BUNDLE_TOKEN_TTL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_BUNDLE_TOKEN_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_FARGATE_BUNDLE_TOKEN_TTL: %q is not a duration: %w", v, err)
@@ -3429,88 +3453,88 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Runtime.Fargate.BundleTokenTTL = d
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_TASK_CPU_UNITS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_TASK_CPU_UNITS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_FARGATE_TASK_CPU_UNITS: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Fargate.TaskCPUUnits = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_TASK_MEMORY_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_TASK_MEMORY_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_FARGATE_TASK_MEMORY_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Fargate.TaskMemoryMB = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_DEFAULT_MEMORY_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_DEFAULT_MEMORY_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_FARGATE_DEFAULT_MEMORY_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Fargate.DefaultMemoryMB = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_FARGATE_DEFAULT_CPU_PERCENT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_FARGATE_DEFAULT_CPU_PERCENT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_FARGATE_DEFAULT_CPU_PERCENT: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Fargate.DefaultCPUPercent = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_REGION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_REGION"); v != "" {
 		cfg.Runtime.Scaleway.Region = v
-	} else if v := os.Getenv("SCW_DEFAULT_REGION"); v != "" {
+	} else if v := getConfigEnv("SCW_DEFAULT_REGION"); v != "" {
 		cfg.Runtime.Scaleway.Region = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_PROJECT_ID"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_PROJECT_ID"); v != "" {
 		cfg.Runtime.Scaleway.ProjectID = v
-	} else if v := os.Getenv("SCW_DEFAULT_PROJECT_ID"); v != "" {
+	} else if v := getConfigEnv("SCW_DEFAULT_PROJECT_ID"); v != "" {
 		cfg.Runtime.Scaleway.ProjectID = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_NAMESPACE_ID"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_NAMESPACE_ID"); v != "" {
 		cfg.Runtime.Scaleway.NamespaceID = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_IMAGE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_IMAGE"); v != "" {
 		cfg.Runtime.Scaleway.Image = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_NAME_PREFIX"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_NAME_PREFIX"); v != "" {
 		cfg.Runtime.Scaleway.NamePrefix = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_CONTROL_PLANE_URL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_CONTROL_PLANE_URL"); v != "" {
 		cfg.Runtime.Scaleway.ControlPlaneURL = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_PRIVATE_NETWORK_ID"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_PRIVATE_NETWORK_ID"); v != "" {
 		cfg.Runtime.Scaleway.PrivateNetworkID = v
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_BUNDLE_TOKEN_TTL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_BUNDLE_TOKEN_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {
 			return fmt.Errorf("SHINYHUB_RUNTIME_SCALEWAY_BUNDLE_TOKEN_TTL: %q must be a positive duration", v)
 		}
 		cfg.Runtime.Scaleway.BundleTokenTTL = d
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_DEFAULT_MEMORY_MB"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_DEFAULT_MEMORY_MB"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_SCALEWAY_DEFAULT_MEMORY_MB: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Scaleway.DefaultMemoryMB = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_DEFAULT_MVCPU"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_DEFAULT_MVCPU"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_SCALEWAY_DEFAULT_MVCPU: %q is not an integer: %w", v, err)
 		}
 		cfg.Runtime.Scaleway.DefaultMVCpu = n
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_SCALEWAY_DURABLE_DATA"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_SCALEWAY_DURABLE_DATA"); v != "" {
 		enabled, err := strconv.ParseBool(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_SCALEWAY_DURABLE_DATA: %q is not a boolean: %w", v, err)
 		}
 		cfg.Runtime.Scaleway.DurableData = enabled
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DEFAULT_REPLICAS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DEFAULT_REPLICAS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_DEFAULT_REPLICAS: %q is not an integer: %w", v, err)
@@ -3519,7 +3543,7 @@ func applyEnv(cfg *Config) error {
 			cfg.Runtime.DefaultReplicas = n
 		}
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_MAX_REPLICAS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_MAX_REPLICAS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_MAX_REPLICAS: %q is not an integer: %w", v, err)
@@ -3528,7 +3552,7 @@ func applyEnv(cfg *Config) error {
 			cfg.Runtime.MaxReplicas = n
 		}
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DEFAULT_MAX_SESSIONS_PER_REPLICA"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DEFAULT_MAX_SESSIONS_PER_REPLICA"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_DEFAULT_MAX_SESSIONS_PER_REPLICA: %q is not an integer: %w", v, err)
@@ -3537,7 +3561,7 @@ func applyEnv(cfg *Config) error {
 			cfg.Runtime.DefaultMaxSessionsPerReplica = n
 		}
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_DEFAULT_WORKER_ISOLATION"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_DEFAULT_WORKER_ISOLATION"); v != "" {
 		switch v {
 		case string(IsolationMultiplex), string(IsolationGrouped), string(IsolationPerSession):
 			cfg.Runtime.DefaultWorkerIsolation = v
@@ -3545,14 +3569,14 @@ func applyEnv(cfg *Config) error {
 			return fmt.Errorf("SHINYHUB_RUNTIME_DEFAULT_WORKER_ISOLATION: %q is not a valid mode", v)
 		}
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_AUTOSCALE_ENABLED"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_AUTOSCALE_ENABLED"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_AUTOSCALE_ENABLED: %w", err)
 		}
 		cfg.Runtime.Autoscale.Enabled = b
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_AUTOSCALE_SCAN_INTERVAL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_AUTOSCALE_SCAN_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_AUTOSCALE_SCAN_INTERVAL: %q is not a duration: %w", v, err)
@@ -3562,7 +3586,7 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Runtime.Autoscale.ScanInterval = d
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_AUTOSCALE_COOLDOWN"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_AUTOSCALE_COOLDOWN"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_AUTOSCALE_COOLDOWN: %q is not a duration: %w", v, err)
@@ -3572,7 +3596,7 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Runtime.Autoscale.Cooldown = d
 	}
-	if v := os.Getenv("SHINYHUB_RUNTIME_AUTOSCALE_DEFAULT_TARGET"); v != "" {
+	if v := getConfigEnv("SHINYHUB_RUNTIME_AUTOSCALE_DEFAULT_TARGET"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_RUNTIME_AUTOSCALE_DEFAULT_TARGET: %q is not a number: %w", v, err)
@@ -3582,129 +3606,129 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Runtime.Autoscale.DefaultTarget = f
 	}
-	if v := os.Getenv("SHINYHUB_DEFAULTS_APP_VISIBILITY"); v != "" {
+	if v := getConfigEnv("SHINYHUB_DEFAULTS_APP_VISIBILITY"); v != "" {
 		cfg.Defaults.AppVisibility = v
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_ENABLED"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_ENABLED"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_TRACING_ENABLED: %w", err)
 		}
 		cfg.Tracing.Enabled = b
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_AUTO_INSTRUMENT_APPS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_AUTO_INSTRUMENT_APPS"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_TRACING_AUTO_INSTRUMENT_APPS: %w", err)
 		}
 		cfg.Tracing.AutoInstrumentApps = b
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_ASGI_EVENTS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_ASGI_EVENTS"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_TRACING_ASGI_EVENTS: %w", err)
 		}
 		cfg.Tracing.ASGIEvents = b
 	}
-	if v := os.Getenv("SHINYHUB_METRICS_ENABLED"); v != "" {
+	if v := getConfigEnv("SHINYHUB_METRICS_ENABLED"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_METRICS_ENABLED: %w", err)
 		}
 		cfg.Metrics.Enabled = b
 	}
-	if v := os.Getenv("SHINYHUB_USAGE_ENABLED"); v != "" {
+	if v := getConfigEnv("SHINYHUB_USAGE_ENABLED"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_USAGE_ENABLED: %w", err)
 		}
 		cfg.Usage.Enabled = b
 	}
-	if v := os.Getenv("SHINYHUB_USAGE_IDENTITY_MODE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_USAGE_IDENTITY_MODE"); v != "" {
 		cfg.Usage.IdentityMode = UsageIdentityMode(strings.TrimSpace(v))
 	}
-	if v := os.Getenv("SHINYHUB_USAGE_RAW_RETENTION_DAYS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_USAGE_RAW_RETENTION_DAYS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_USAGE_RAW_RETENTION_DAYS: %q is not an integer: %w", v, err)
 		}
 		cfg.Usage.RawRetentionDays = n
 	}
-	if v := os.Getenv("SHINYHUB_USAGE_AGGREGATE_RETENTION_DAYS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_USAGE_AGGREGATE_RETENTION_DAYS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_USAGE_AGGREGATE_RETENTION_DAYS: %q is not an integer: %w", v, err)
 		}
 		cfg.Usage.AggregateRetentionDays = n
 	}
-	if v := os.Getenv("SHINYHUB_METRICS_ADDR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_METRICS_ADDR"); v != "" {
 		cfg.Metrics.Addr = v
 	}
-	if v := os.Getenv("SHINYHUB_METRICS_PROCESS_INTERVAL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_METRICS_PROCESS_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_METRICS_PROCESS_INTERVAL: %w", err)
 		}
 		cfg.Metrics.ProcessInterval = d
 	}
-	if v := os.Getenv("SHINYHUB_METRICS_HISTORY_WINDOW"); v != "" {
+	if v := getConfigEnv("SHINYHUB_METRICS_HISTORY_WINDOW"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_METRICS_HISTORY_WINDOW: %q is not a duration: %w", v, err)
 		}
 		cfg.Metrics.HistoryWindow = d
 	}
-	if v := os.Getenv("SHINYHUB_METRICS_HISTORY_INTERVAL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_METRICS_HISTORY_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_METRICS_HISTORY_INTERVAL: %q is not a duration: %w", v, err)
 		}
 		cfg.Metrics.HistoryInterval = d
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_OTLP_ENDPOINT"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_OTLP_ENDPOINT"); v != "" {
 		cfg.Tracing.OTLPEndpoint = v
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_OTLP_PROTOCOL"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_OTLP_PROTOCOL"); v != "" {
 		cfg.Tracing.OTLPProtocol = v
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_OTLP_HEADERS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_OTLP_HEADERS"); v != "" {
 		cfg.Tracing.OTLPHeaders = v
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_SAMPLE_RATIO"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_SAMPLE_RATIO"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_TRACING_SAMPLE_RATIO: %q is not a number: %w", v, err)
 		}
 		cfg.Tracing.SampleRatio = f
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_SLOW_REQUEST_MS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_SLOW_REQUEST_MS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_TRACING_SLOW_REQUEST_MS: %q is not an integer: %w", v, err)
 		}
 		cfg.Tracing.SlowRequestMS = n
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_RING_BUFFER_SIZE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_RING_BUFFER_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_TRACING_RING_BUFFER_SIZE: %q is not an integer: %w", v, err)
 		}
 		cfg.Tracing.RingBufferSize = n
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_TRACE_LINK_TEMPLATE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_TRACE_LINK_TEMPLATE"); v != "" {
 		cfg.Tracing.TraceLinkTemplate = v
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_RESOURCE_ATTRIBUTES"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_RESOURCE_ATTRIBUTES"); v != "" {
 		attrs, err := parseResourceAttributesEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_TRACING_RESOURCE_ATTRIBUTES: %w", err)
 		}
 		cfg.Tracing.ResourceAttributes = attrs
 	}
-	if v := os.Getenv("SHINYHUB_TRACING_AUTO_INSTRUMENT_EXTRA_PACKAGES"); v != "" {
+	if v := getConfigEnv("SHINYHUB_TRACING_AUTO_INSTRUMENT_EXTRA_PACKAGES"); v != "" {
 		cfg.Tracing.AutoInstrumentExtraPackages = strings.Fields(v)
 	}
-	if v := os.Getenv("SHINYHUB_SCHEDULER_TIMEZONE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_SCHEDULER_TIMEZONE"); v != "" {
 		cfg.Scheduler.DefaultTimezone = v
 	}
 	setEnvironment := func(value string, assign func(*EnvironmentConfig, string)) {
@@ -3716,48 +3740,48 @@ func applyEnv(cfg *Config) error {
 		}
 		assign(cfg.Branding.Environment, value)
 	}
-	setEnvironment(os.Getenv("SHINYHUB_BRANDING_ENVIRONMENT_LABEL"), func(e *EnvironmentConfig, v string) { e.Label = v })
-	setEnvironment(os.Getenv("SHINYHUB_BRANDING_ENVIRONMENT_COLOR"), func(e *EnvironmentConfig, v string) { e.Color = v })
-	setEnvironment(os.Getenv("SHINYHUB_BRANDING_ENVIRONMENT_MESSAGE"), func(e *EnvironmentConfig, v string) { e.Message = v })
-	setEnvironment(os.Getenv("SHINYHUB_BRANDING_ENVIRONMENT_PRODUCTION_URL"), func(e *EnvironmentConfig, v string) { e.ProductionURL = v })
-	if v := os.Getenv("SHINYHUB_BRANDING_SITE_TITLE"); v != "" {
+	setEnvironment(getConfigEnv("SHINYHUB_BRANDING_ENVIRONMENT_LABEL"), func(e *EnvironmentConfig, v string) { e.Label = v })
+	setEnvironment(getConfigEnv("SHINYHUB_BRANDING_ENVIRONMENT_COLOR"), func(e *EnvironmentConfig, v string) { e.Color = v })
+	setEnvironment(getConfigEnv("SHINYHUB_BRANDING_ENVIRONMENT_MESSAGE"), func(e *EnvironmentConfig, v string) { e.Message = v })
+	setEnvironment(getConfigEnv("SHINYHUB_BRANDING_ENVIRONMENT_PRODUCTION_URL"), func(e *EnvironmentConfig, v string) { e.ProductionURL = v })
+	if v := getConfigEnv("SHINYHUB_BRANDING_SITE_TITLE"); v != "" {
 		cfg.Branding.SiteTitle = v
 	}
-	if v := os.Getenv("SHINYHUB_BRANDING_ASSETS_DIR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BRANDING_ASSETS_DIR"); v != "" {
 		cfg.Branding.AssetsDir = v
 	}
-	if v := os.Getenv("SHINYHUB_BRANDING_LOGO"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BRANDING_LOGO"); v != "" {
 		cfg.Branding.Logo = v
 	}
-	if v := os.Getenv("SHINYHUB_BRANDING_FAVICON"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BRANDING_FAVICON"); v != "" {
 		cfg.Branding.Favicon = v
 	}
-	if v := os.Getenv("SHINYHUB_BRANDING_PRIMARY_COLOR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BRANDING_PRIMARY_COLOR"); v != "" {
 		cfg.Branding.Theme.PrimaryColor = v
 	}
-	if v := os.Getenv("SHINYHUB_BRANDING_LANDING_PAGE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BRANDING_LANDING_PAGE"); v != "" {
 		cfg.Branding.LandingPage = v
 	}
-	if v := os.Getenv("SHINYHUB_BRANDING_ROOT_BEHAVIOR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BRANDING_ROOT_BEHAVIOR"); v != "" {
 		cfg.Branding.RootBehavior = v
 	}
-	if v := os.Getenv("SHINYHUB_WORKER_ENABLED"); v != "" {
+	if v := getConfigEnv("SHINYHUB_WORKER_ENABLED"); v != "" {
 		b, err := parseBoolEnv(v)
 		if err != nil {
 			return fmt.Errorf("SHINYHUB_WORKER_ENABLED: %w", err)
 		}
 		cfg.Worker.Enabled = b
 	}
-	if v := os.Getenv("SHINYHUB_WORKER_JOIN_TOKEN_FILE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_WORKER_JOIN_TOKEN_FILE"); v != "" {
 		cfg.Worker.JoinTokenFile = v
 	}
-	if v := os.Getenv("SHINYHUB_WORKER_CA_DIR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_WORKER_CA_DIR"); v != "" {
 		cfg.Worker.CADir = v
 	}
-	if v := os.Getenv("SHINYHUB_WORKER_LISTEN_ADDR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_WORKER_LISTEN_ADDR"); v != "" {
 		cfg.Worker.ListenAddr = v
 	}
-	if v := os.Getenv("SHINYHUB_WORKER_ADVERTISE_HOSTS"); v != "" {
+	if v := getConfigEnv("SHINYHUB_WORKER_ADVERTISE_HOSTS"); v != "" {
 		var hosts []string
 		for _, h := range strings.Split(v, ",") {
 			if s := strings.TrimSpace(h); s != "" {
@@ -3766,13 +3790,13 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Worker.AdvertiseHosts = hosts
 	}
-	if v := os.Getenv("SHINYHUB_BUILD_PYTHON_PREFERENCE"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BUILD_PYTHON_PREFERENCE"); v != "" {
 		cfg.Build.PythonPreference = v
 	}
-	if v := os.Getenv("SHINYHUB_BUILD_PYTHON"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BUILD_PYTHON"); v != "" {
 		cfg.Build.Python = v
 	}
-	if v := os.Getenv("SHINYHUB_BUILD_PYTHON_INSTALL_MIRROR"); v != "" {
+	if v := getConfigEnv("SHINYHUB_BUILD_PYTHON_INSTALL_MIRROR"); v != "" {
 		cfg.Build.PythonInstallMirror = v
 	}
 	return nil

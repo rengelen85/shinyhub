@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,14 +19,6 @@ import (
 func Bootstrap(gate string) error {
 	if os.Geteuid() == 0 {
 		return errors.New("worker bootstrap must not run as root")
-	}
-	raw, err := os.ReadFile(filepath.Join(os.Getenv("CREDENTIALS_DIRECTORY"), "launch.json"))
-	if err != nil {
-		return err
-	}
-	var launch Launch
-	if json.Unmarshal(raw, &launch) != nil {
-		return errors.New("invalid launch credential")
 	}
 	conn, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: gate, Net: "unixpacket"})
 	if err != nil {
@@ -47,8 +38,9 @@ func Bootstrap(gate string) error {
 	if err != nil {
 		return err
 	}
-	if string(payload) != "ready" {
-		return errors.New("invalid descriptor handoff")
+	var launch Launch
+	if json.Unmarshal(payload, &launch) != nil || len(launch.Argv) == 0 || launch.LifetimeCount < 0 || launch.LifetimeCount > MaxFiles-2 {
+		return errors.New("invalid launch handoff")
 	}
 	expected := launch.LifetimeCount + 1
 	if launch.Guarded {
@@ -104,7 +96,14 @@ func Bootstrap(gate string) error {
 	}
 	// Work at high FD numbers first so replacing stdin/stdout/FD 3 cannot
 	// overwrite a source descriptor or close an inherited publication lock.
+	targetBase := 1
 	sources := append([]*os.File{files[0], files[0]}, files[index:]...)
+	if launch.JournalLogs {
+		// Keep systemd-owned stdout/stderr. Neither endpoint belongs to the
+		// controller, so its restart cannot create EPIPE in the app.
+		targetBase = 3
+		sources = files[index:]
+	}
 	duplicates := make([]int, len(sources))
 	for i, f := range sources {
 		duplicates[i], err = unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 256)
@@ -117,7 +116,7 @@ func Bootstrap(gate string) error {
 	}
 	files = nil
 	for i, fd := range duplicates {
-		target := i + 1
+		target := i + targetBase
 		if err = unix.Dup3(fd, target, 0); err != nil {
 			return err
 		}

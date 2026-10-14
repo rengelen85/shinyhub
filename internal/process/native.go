@@ -100,11 +100,13 @@ var (
 
 // NativeRuntime runs app processes as direct OS child processes.
 type NativeRuntime struct {
-	observer        WorkloadObserver
-	observationEnds map[int]func()
-	mu              sync.Mutex
-	cmds            map[int]*exec.Cmd
-	procs           map[int]*gops.Process // cached gopsutil handles for CPU delta computation
+	outputPumpBinary string
+	outputPumps      map[int]*outputPump
+	observer         WorkloadObserver
+	observationEnds  map[int]func()
+	mu               sync.Mutex
+	cmds             map[int]*exec.Cmd
+	procs            map[int]*gops.Process // cached gopsutil handles for CPU delta computation
 
 	// Per-app cgroup state, shared by warm-wake (Snapshotter) and native resource
 	// limits. snapshotEnabled is the warm-wake intent; cgroupBaseReady is set once
@@ -142,12 +144,16 @@ func NewNativeRuntime() *NativeRuntime {
 	return &NativeRuntime{
 		observationEnds: make(map[int]func()),
 		cmds:            make(map[int]*exec.Cmd),
+		outputPumps:     make(map[int]*outputPump),
 		procs:           make(map[int]*gops.Process),
 		appCgroups:      make(map[int]string),
 		oomBaseline:     make(map[int]uint64),
 		oomVerdict:      make(map[int]bool),
 	}
 }
+
+// SetOutputPump enables independently owned local stdout. Set before Start.
+func (r *NativeRuntime) SetOutputPump(binary string) { r.outputPumpBinary = binary }
 
 // SetSnapshot enables warm-wake (SIGSTOP freeze + per-app cgroup reclaim) and
 // sets the reclaim-success threshold. Called once at startup from buildRuntime,
@@ -611,6 +617,21 @@ func (r *NativeRuntime) Start(_ context.Context, p StartParams, logWriter io.Wri
 	cmd.Env = append(nativeChildEnv(p), extraEnv...)
 	cmd.Stdout = logWriter
 	cmd.Stderr = logWriter
+	var pump *outputPump
+	var output *os.File
+	if local, ok := logWriter.(*LogFile); ok && r.outputPumpBinary != "" {
+		pump, output, err = startOutputPump(r.outputPumpBinary, local)
+		if err != nil {
+			if startupGuardReader != nil {
+				startupGuardReader.Close()
+				startupGuardWriter.Close()
+			}
+			return ReplicaEndpoint{}, err
+		}
+		defer output.Close()
+		cmd.Stdout, cmd.Stderr = output, output
+	}
+
 	// logWriter is not an *os.File, so os/exec hands the child a pipe and
 	// cmd.Wait blocks until every holder of its write end closes it - not just
 	// the leader. A launcher (uv, Rscript, a shell) forks a child that inherits
@@ -629,6 +650,10 @@ func (r *NativeRuntime) Start(_ context.Context, p StartParams, logWriter io.Wri
 			_ = startupGuardReader.Close()
 			_ = startupGuardWriter.Close()
 		}
+		if pump != nil {
+			_ = pump.command.Process.Kill()
+			pump.finish()
+		}
 		return ReplicaEndpoint{}, fmt.Errorf("start process: %w", err)
 	}
 	if startupGuardReader != nil {
@@ -637,6 +662,9 @@ func (r *NativeRuntime) Start(_ context.Context, p StartParams, logWriter io.Wri
 	pid := cmd.Process.Pid
 	r.mu.Lock()
 	r.cmds[pid] = cmd
+	if pump != nil {
+		r.outputPumps[pid] = pump
+	}
 	r.mu.Unlock()
 	// Move the replica into its own cgroup for isolated warm-wake reclaim and to
 	// enforce memory.max / cpu.max when a limit is set. No-op when neither
@@ -645,10 +673,11 @@ func (r *NativeRuntime) Start(_ context.Context, p StartParams, logWriter io.Wri
 	r.placeInAppCgroup(p, pid)
 	r.ObserveWorkload(p, RunHandle{PID: pid})
 	ep := ReplicaEndpoint{
-		URL:      fmt.Sprintf("http://127.0.0.1:%d", p.Port),
-		Provider: "native",
-		WorkerID: strconv.Itoa(pid),
-		Handle:   RunHandle{PID: pid},
+		URL:            fmt.Sprintf("http://127.0.0.1:%d", p.Port),
+		Provider:       "native",
+		WorkerID:       strconv.Itoa(pid),
+		Handle:         RunHandle{PID: pid},
+		DetachedOutput: pump != nil,
 	}
 	// Assign only a concrete non-nil file. Converting a nil *os.File directly
 	// into io.WriteCloser would create a non-nil interface and make ordinary,
@@ -704,6 +733,13 @@ func (r *NativeRuntime) Wait(ctx context.Context, handle RunHandle) error {
 	}
 
 	rootErr := cmd.Wait()
+	r.mu.Lock()
+	pump := r.outputPumps[handle.PID]
+	delete(r.outputPumps, handle.PID)
+	r.mu.Unlock()
+	if pump != nil {
+		defer pump.finish()
+	}
 	// cmd.Wait observes only the process-group leader. Anything left in its PGID
 	// is now orphaned from the serving runtime and must be killed before the
 	// manager reports the slot exited or permits replacement/publication.

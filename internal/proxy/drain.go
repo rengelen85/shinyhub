@@ -119,6 +119,10 @@ func (t *connTracker) closeAll() int {
 // fully idempotent: the underlying conn is closed exactly once and the cached
 // error is returned on every subsequent call.
 type trackedConn struct {
+	writeMu      sync.Mutex
+	writeFrames  wsFrameScanner
+	writeStarted bool
+	writeHeader  []byte
 	net.Conn
 	tracker *connTracker
 	// principal is fixed at the upgrade and never mutated, so the recheck sweep
@@ -145,10 +149,13 @@ func (c *trackedConn) Read(p []byte) (int, error) {
 }
 
 func (c *trackedConn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if c.session != nil {
 		c.session.beginIO()
 	}
 	n, err := c.Conn.Write(p)
+	c.observeOutbound(p[:n])
 	if c.session != nil {
 		c.session.finishIO("client", n, err, false, nil)
 	}
@@ -355,13 +362,26 @@ func (p *Proxy) sealedRelaySnapshot() []upgrade.RelayBackend {
 
 // PreserveUpgraded has no reload deadline. Service shutdown still applies the
 // ordinary bounded drain, and access rechecks continue independently.
-func (p *Proxy) PreserveUpgraded(ctx context.Context, lease *upgrade.RelayLease, shutdownGrace time.Duration) int {
+func (p *Proxy) PreserveUpgraded(ctx context.Context, lease *upgrade.RelayLease, shutdownGrace time.Duration, maxLifetime ...time.Duration) int {
+	var expiry <-chan time.Time
+	if len(maxLifetime) > 0 {
+		timer := time.NewTimer(maxLifetime[0])
+		defer timer.Stop()
+		expiry = timer.C
+	}
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for p.ActiveUpgradedConns() > 0 {
 		select {
 		case <-ctx.Done():
 			return p.DrainUpgraded(shutdownGrace)
+		case <-expiry:
+			open := p.conns.snapshot()
+			for _, conn := range open {
+				_ = conn.closeForReconnect("retired_lifetime_exceeded")
+			}
+			_ = lease.Publish(nil)
+			return len(open)
 		case <-ticker.C:
 			backends := p.sealedRelaySnapshot()
 			if lease.Publish(backends) != nil {

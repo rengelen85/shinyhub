@@ -145,9 +145,8 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request) {
 			DeploymentID: run.DeploymentID, UpdatedAt: run.StartedAt,
 			StartedAt: &started, FinishedAt: run.FinishedAt, OOMKilled: run.OOMKilled,
 			ExitCode: run.ExitCode, ExitSignal: run.Signal, ExitReason: run.ExitReason,
-			ExternalLogs: externalLogs,
-			InlineAvailable: s.providerLogs != nil && externalLogs != nil &&
-				externalLogs.LogGroup != "" && externalLogs.LogStream != "",
+			ExternalLogs:    externalLogs,
+			InlineAvailable: s.providerLogs.available(externalLogs),
 		}
 		if file, ok := fileByRun[run.RunID]; ok {
 			modified := file.ModifiedAt
@@ -164,7 +163,7 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request) {
 		if current {
 			applyCurrentLogSourceState(src, replicaByIndex[run.ReplicaIndex], liveByIndex[run.ReplicaIndex])
 		}
-		src.StreamAvailable = src.Provider != "fargate"
+		src.StreamAvailable = src.Provider != "fargate" && externalLogs == nil
 		out = append(out, src)
 	}
 
@@ -233,9 +232,12 @@ func decodeExternalLogs(raw string) *process.ExternalLogs {
 		return nil
 	}
 	var details process.ExternalLogs
-	if json.Unmarshal([]byte(raw), &details) != nil || details.Provider != "aws_ecs" ||
+	if json.Unmarshal([]byte(raw), &details) != nil || (details.Provider != "aws_ecs" && details.Provider != "systemd_journal") ||
 		details.Resource == "" || len(details.Resource) > 2048 {
 		return nil
+	}
+	if details.Provider == "systemd_journal" {
+		return &process.ExternalLogs{Provider: details.Provider, Resource: details.Resource}
 	}
 	if details.ConsoleURL != "" {
 		if !isSafeExternalLogURL(details.ConsoleURL,
@@ -407,7 +409,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		details := decodeExternalLogs(run.ExternalLogs)
-		if s.providerLogs == nil || details == nil || details.LogGroup == "" || details.LogStream == "" {
+		if !s.providerLogs.available(details) {
 			writeError(w, http.StatusServiceUnavailable, "provider logs are not available through ShinyHub")
 			return
 		}

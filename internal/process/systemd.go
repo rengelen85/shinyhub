@@ -25,6 +25,7 @@ type SystemdRuntime struct {
 	policy             nativebroker.Policy
 	mu                 sync.Mutex
 	stats              *NativeRuntime
+	journalLogs        bool
 	snapshotEnabled    bool
 	reclaimMinFraction float64
 	logs               map[string]systemdLog
@@ -68,7 +69,7 @@ func NewSystemdRuntime(ctx context.Context, socket string) (*SystemdRuntime, err
 			return nil, fmt.Errorf("control plane must belong to the private group for registered app %q (restart after provisioning groups)", a.Slug)
 		}
 	}
-	return &SystemdRuntime{client: c, policy: p, stats: NewNativeRuntime(), logs: map[string]systemdLog{}}, nil
+	return &SystemdRuntime{client: c, policy: p, journalLogs: response.JournalLogs, stats: NewNativeRuntime(), logs: map[string]systemdLog{}}, nil
 }
 func (r *SystemdRuntime) HostPreparesDeps() bool      { return true }
 func (r *SystemdRuntime) HostProvidesAppData() bool   { return true }
@@ -159,7 +160,7 @@ func (r *SystemdRuntime) launch(ctx context.Context, p StartParams, kind string,
 	}
 	launch := nativebroker.Launch{AppID: p.AppID, Slug: p.Slug, Kind: kind, Dir: dir, Argv: argv, Env: nativeChildEnv(p),
 		DataDir: p.AppDataPath, CacheDir: p.AppCachePath, MemoryMB: p.MemoryLimitMB, CPUPercent: p.CPUQuotaPercent,
-		Guarded: true, LifetimeCount: len(p.LifetimeFiles), Labels: labels}
+		JournalLogs: r.journalLogs && kind == "replica", Guarded: true, LifetimeCount: len(p.LifetimeFiles), Labels: labels}
 	files := append([]*os.File{logWrite, guardRead}, p.LifetimeFiles...)
 	response, err := r.client.Call(ctx, nativebroker.Request{Op: "start", Launch: &launch}, files)
 	if err != nil {
@@ -170,9 +171,13 @@ func (r *SystemdRuntime) launch(ctx context.Context, p StartParams, kind string,
 	}
 	ep := ReplicaEndpoint{URL: fmt.Sprintf("http://127.0.0.1:%d", p.Port), Provider: "native", WorkerID: response.State.Unit,
 		Handle: RunHandle{PID: response.State.PID, ContainerID: response.State.Unit}}
-	r.mu.Lock()
-	r.logs[ep.WorkerID] = systemdLog{reader: logRead, done: logDone}
-	r.mu.Unlock()
+	if launch.JournalLogs {
+		ep.ExternalLogs = &ExternalLogs{Provider: "systemd_journal", Resource: ep.WorkerID}
+	} else {
+		r.mu.Lock()
+		r.logs[ep.WorkerID] = systemdLog{reader: logRead, done: logDone}
+		r.mu.Unlock()
+	}
 	if kind == "replica" || kind == "job" {
 		r.stats.ObserveWorkload(p, ep.Handle)
 	}
@@ -565,4 +570,24 @@ func (r *SystemdRuntime) ValidateControlPath(path string) error {
 		}
 	}
 	return nil
+}
+
+// Read retrieves bounded journal pages via the root broker. Its inventory
+// check prevents untrusted persisted metadata from selecting arbitrary units.
+func (r *SystemdRuntime) Read(ctx context.Context, details ExternalLogs, cursor string, limit int32) (ExternalLogPage, error) {
+	if details.Provider != "systemd_journal" {
+		return ExternalLogPage{}, errors.New("unsupported native log provider")
+	}
+	response, err := r.client.Call(ctx, nativebroker.Request{Op: "logs", Unit: details.Resource, Cursor: cursor, LogLimit: int(min(max(limit, 1), 100))}, nil)
+	if err != nil {
+		return ExternalLogPage{}, err
+	}
+	if response.Journal == nil {
+		return ExternalLogPage{}, errors.New("broker omitted journal page")
+	}
+	page := ExternalLogPage{Events: make([]ExternalLogEvent, 0, len(response.Journal.Events)), NextCursor: response.Journal.NextCursor}
+	for _, event := range response.Journal.Events {
+		page.Events = append(page.Events, ExternalLogEvent{Message: event.Message, Timestamp: event.Timestamp})
+	}
+	return page, nil
 }

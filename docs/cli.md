@@ -69,7 +69,8 @@ Run and administer the server:
 | Command | What it does |
 |---|---|
 | `init` | Set up ShinyHub for its first run |
-| `serve` | Run the ShinyHub server |
+| `serve` | Run the ShinyHub server; use `--supervise` with the reference systemd unit |
+| `status` | Inspect the local active server PID and retired generations with `--config`; supports `--output json` |
 | `local-token` | Mint a short-lived announcement capability as root on the server host; see [release notices](announcements.md#host-local-release-automation) |
 | `reload` | Reload the local server and acknowledge successor readiness; `--wait` allows temporary transitions before handoff; successor readiness separately waits `server.upgrade_timeout + 1m` (2m by default); see [zero-downtime upgrades](zero-downtime-upgrades.md) |
 | `validate-config` | Validate server configuration before restarting; see [configuration preflight](configuration.md#validate-before-restarting) |

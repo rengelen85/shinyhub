@@ -679,3 +679,16 @@ See [Caddy browser logout and reconnect](reverse-proxy/caddy.md#browser-logout-a
 for proxy routing, separate app-origin cleanup, and protocol requirements.
 Without this URL ShinyHub still stays logged out until explicit reconnect;
 it does not end the upstream authentication service's session.
+
+## Reload environment and retired generations
+
+`server.env_file` names a private (0600) KEY=VALUE file re-read at startup and
+before each reload. It supports known server environment settings, proxy
+variables and UV index settings. See [systemd](deployment/systemd.md) for syntax,
+precedence, deletion behavior and secret handling.
+
+`server.max_retired_lifetime` defaults to `24h`; use a positive duration to bound
+preserved WebSocket sessions after handoff. Sessions receive close code 1012
+when the limit expires. `shinyhub status --config /path/to/shinyhub.yaml` reports
+retired generations and their sessions. See [reload retirement](zero-downtime-upgrades.md)
+for legacy output owners and metrics.

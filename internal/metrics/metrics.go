@@ -579,3 +579,23 @@ func (r *Registry) Middleware(next http.Handler) http.Handler {
 		r.httpDuration.WithLabelValues(req.Method, route, statusStr).Observe(time.Since(start).Seconds())
 	})
 }
+
+// RegisterRetiredGauges reports all locked retired generations, including
+// legacy output-only owners. The unknown gauge identifies incomplete counts.
+func (r *Registry) RegisterRetiredGauges(snapshot func() (int, int64, bool)) {
+	for _, item := range []struct {
+		name, help string
+		value      func(int, int64, bool) float64
+	}{
+		{"shinyhub_retired_generations", "Number of live retired server generations.", func(count int, _ int64, _ bool) float64 { return float64(count) }},
+		{"shinyhub_retired_sessions", "Sessions held by retired server generations.", func(_ int, sessions int64, _ bool) float64 { return float64(sessions) }},
+		{"shinyhub_retired_state_unknown", "Whether live retired state could not be verified.", func(_ int, _ int64, unknown bool) float64 {
+			if unknown {
+				return 1
+			}
+			return 0
+		}},
+	} {
+		r.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: item.name, Help: item.help}, func() float64 { count, sessions, unknown := snapshot(); return item.value(count, sessions, unknown) }))
+	}
+}

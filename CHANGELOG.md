@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Upgrade notice
+
+The reference systemd unit now uses `serve --supervise` (Linux 5.3+) and omits
+`PIDFile=` so a direct child detects active-server crashes after every handoff.
+Adopting this unit requires one announced restart. Broker-native replicas need
+one rollout to switch from controller pipes to journal output before restart
+survival is available. Shared-user native replicas still stop with the service.
+
+### Fixed
+
+- **reload**: preserve every replica ready before the handoff, including capacity above the configured warm floor, and warn when an app starts below its floor. The separate successor readiness budget remains documented as `server.upgrade_timeout + 1m`.
+
+### Added
+
+- **reload**: re-read private `server.env_file` settings before handoff, removing deleted overrides; add `server.max_retired_lifetime` (24h default) with reconnect close code 1012, `shinyhub status`, retired-generation metrics, and exit logs. New shared-user native replicas use independent output helpers so retired controllers can exit.
+- **native isolation**: broker-native replicas use systemd journal output independent of the controller and expose bounded authenticated journal pages in the log viewer. With `shutdown_apps: adopt`, separate worker units and their output survive controller restarts. Launch data travels over the authenticated bootstrap socket, keeping secrets out of unit properties.
+
 ## [0.20.9](https://github.com/rvben/shinyhub/compare/v0.20.8...v0.20.9) - 2026-10-14
 
 ### Upgrade notice

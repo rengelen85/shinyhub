@@ -469,18 +469,9 @@ func (s *Server) launch(ctx context.Context, l *Launch, files []*os.File) (State
 	}
 	// Actual argv and secret env never enter systemd's public unit properties.
 	l.Env = append(l.Env, "HOME="+a.CacheRoot, "XDG_CACHE_HOME="+a.CacheRoot, "UV_CACHE_DIR="+filepath.Join(a.CacheRoot, "uv"), "UV_PYTHON_INSTALL_DIR="+filepath.Join(a.CacheRoot, "python"), "RENV_PATHS_ROOT="+filepath.Join(a.CacheRoot, "renv"))
-	cred, err := os.CreateTemp(s.policy.StateDir, ".launch-")
-	if err != nil {
-		return State{}, err
-	}
-	credPath := cred.Name()
-	defer os.Remove(credPath)
-	if err = json.NewEncoder(cred).Encode(l); err != nil {
-		cred.Close()
-		return State{}, err
-	}
-	if err = cred.Close(); err != nil {
-		return State{}, err
+	launchPayload, err := json.Marshal(l)
+	if err != nil || len(launchPayload) > MaxMessage {
+		return State{}, errors.New("launch handoff exceeds message limit")
 	}
 	props := map[string]string{
 		"User": strconv.Itoa(a.UID), "Group": strconv.Itoa(a.GID), "Type": "exec", "RemainAfterExit": "yes",
@@ -489,7 +480,7 @@ func (s *Server) launch(ctx context.Context, l *Launch, files []*os.File) (State
 		"CapabilityBoundingSet": "", "AmbientCapabilities": "", "RestrictNamespaces": "yes", "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
 		"KillMode": "control-group", "TimeoutStopSec": "10s", "TasksMax": "512", "MemoryAccounting": "yes", "CPUAccounting": "yes",
 		"ReadWritePaths": strings.Join([]string{a.BundleRoot, a.DataRoot, a.CacheRoot}, " "),
-		"LoadCredential": "launch.json:" + credPath,
+		"StandardOutput": "journal", "StandardError": "journal",
 	}
 	if l.MemoryMB > 0 {
 		props["MemoryMax"] = strconv.Itoa(l.MemoryMB) + "M"
@@ -545,7 +536,7 @@ func (s *Server) launch(ctx context.Context, l *Launch, files []*os.File) (State
 			c.Close()
 			continue
 		}
-		err = sendPacket(c, []byte("ready"), files)
+		err = sendPacket(c, launchPayload, files)
 		c.Close()
 		if err != nil {
 			return State{}, err
@@ -562,7 +553,10 @@ func (s *Server) dispatch(ctx context.Context, r Request, files []*os.File) (Res
 	if r.Op != "limits" && r.Limits != nil {
 		return Response{}, errors.New("unexpected resource settings")
 	}
-	if r.Op != "list" && r.Cursor != "" {
+	if r.Op != "logs" && r.LogLimit != 0 {
+		return Response{}, errors.New("unexpected log limit")
+	}
+	if r.Op != "list" && r.Op != "logs" && r.Cursor != "" {
 		return Response{}, errors.New("unexpected inventory cursor")
 	}
 	if r.Op == "start" {
@@ -597,7 +591,7 @@ func (s *Server) dispatch(ctx context.Context, r Request, files []*os.File) (Res
 		if r.Unit != "" || r.Signal != 0 {
 			return Response{}, errors.New("unexpected hello fields")
 		}
-		return Response{Policy: &s.policy}, nil
+		return Response{Policy: &s.policy, JournalLogs: true}, nil
 	}
 	if r.Op == "list" {
 		if r.Cursor != "" && !unitPattern.MatchString(r.Cursor) {
@@ -645,6 +639,18 @@ func (s *Server) dispatch(ctx context.Context, r Request, files []*os.File) (Res
 			out.States = append(out.States, state)
 		}
 		return out, nil
+	}
+	if r.Op == "logs" {
+		if r.Signal != 0 {
+			return Response{}, errors.New("unexpected signal field")
+		}
+		// Only recorded broker workers are readable. No caller-selected unit or
+		// journal match can escape the registered inventory.
+		if _, err := s.load(r.Unit); err != nil {
+			return Response{}, err
+		}
+		page, err := readJournal(ctx, r.Unit, r.Cursor, r.LogLimit)
+		return Response{Journal: &page}, err
 	}
 	if r.Op != "status" && r.Op != "stop" && r.Op != "signal" && r.Op != "freeze" && r.Op != "thaw" && r.Op != "suspend" && r.Op != "limits" {
 		return Response{}, errors.New("unknown broker operation")

@@ -70,6 +70,7 @@ function shellQuote(value) {
 
 export function externalLogsCommand(source) {
   const details = source && source.external_logs;
+  if (details?.provider === 'systemd_journal' && /^shinyhub-isolated-[0-9]+-[0-9a-f]{32}\.service$/.test(details.resource || '')) return `journalctl --unit=${shellQuote(details.resource)}`;
   if (!details || details.provider !== 'aws_ecs' || !details.resource || !details.region) return '';
   if (details.log_group && details.log_stream) {
     return `aws logs get-log-events --log-group-name ${shellQuote(details.log_group)} --log-stream-name ${shellQuote(details.log_stream)} --region ${shellQuote(details.region)}`;
@@ -520,22 +521,23 @@ export function createLogsViewer({
     const resource = source.external_logs && source.external_logs.resource;
     if (!resource) return '';
     const taskID = resource.split('/').at(-1);
-    return taskID ? `Task ${taskID}` : resource;
+    return source.external_logs.provider === 'systemd_journal' ? `Unit ${resource}` : taskID ? `Task ${taskID}` : resource;
   }
 
   function renderExternalLogs() {
-    const external = scopedSources().filter((source) => source.external_logs && source.external_logs.provider === 'aws_ecs');
+    const external = scopedSources().filter((source) => source.external_logs && ['aws_ecs', 'systemd_journal'].includes(source.external_logs.provider));
     if (!external.length) {
       externalPanel.hidden = true;
       externalPanel.replaceChildren();
       return;
     }
+    const journal = external.some(source => source.external_logs.provider === 'systemd_journal');
     const intro = doc.createElement('div');
     intro.className = 'logs-external-intro';
     const title = doc.createElement('strong');
-    title.textContent = external.length === 1 ? 'AWS log source' : `${external.length} AWS log sources`;
+    title.textContent = journal ? (external.length === 1 ? 'Provider log source' : `${external.length} provider log sources`) : external.length === 1 ? 'AWS log source' : `${external.length} AWS log sources`;
     const explanation = doc.createElement('span');
-    explanation.textContent = external.some(isInlineProviderLogSource)
+    explanation.textContent = journal ? 'Read output retained by the log provider. System journal output survives controller restarts.' : external.some(isInlineProviderLogSource)
       ? 'Read on demand from CloudWatch. Direct AWS access remains available as a fallback.'
       : 'ShinyHub cannot read this output directly. Access remains subject to your AWS permissions.';
     intro.append(title, explanation);
@@ -582,12 +584,14 @@ export function createLogsViewer({
         const copyCommand = doc.createElement('button');
         copyCommand.type = 'button';
         copyCommand.className = 'btn-row';
-        copyCommand.textContent = 'Copy AWS command';
-        copyCommand.title = 'Copy an AWS CLI command that identifies this exact ECS task';
+        const journalSource = source.external_logs.provider === 'systemd_journal';
+        const commandLabel = journalSource ? 'journal' : 'AWS task';
+        copyCommand.textContent = journalSource ? 'Copy journal command' : 'Copy AWS command';
+        copyCommand.title = journalSource ? 'Copy a command to read this exact worker unit on the host' : 'Copy an AWS CLI command that identifies this exact ECS task';
         copyCommand.addEventListener('click', async () => {
           try {
             await win.navigator.clipboard.writeText(command);
-            announce(`AWS task command copied for replica ${source.replica}.`);
+            announce(`${journalSource ? "Journal" : "AWS task"} command copied for replica ${source.replica}.`);
           } catch {
             let fallback = row.querySelector('.logs-external-command');
             if (!fallback) {
@@ -597,7 +601,7 @@ export function createLogsViewer({
               row.appendChild(fallback);
             }
             fallback.textContent = command;
-            announce(`Could not copy the AWS task command for replica ${source.replica}. The command is shown for manual copying.`);
+            announce(`Could not copy the ${commandLabel} command for replica ${source.replica}. The command is shown for manual copying.`);
           }
         });
         actions.appendChild(copyCommand);
@@ -645,8 +649,8 @@ export function createLogsViewer({
     const source = sources.find((item) => item.source_id === selected);
     if (selected !== 'all' && source && source.external_logs) {
       downloadButton.disabled = true;
-      downloadButton.textContent = isInlineProviderLogSource(source) ? 'AWS-retained logs' : 'External logs';
-      downloadButton.title = 'Copy visible output or use the AWS access details above';
+      downloadButton.textContent = source.external_logs.provider === 'systemd_journal' ? 'Journal-retained logs' : isInlineProviderLogSource(source) ? 'AWS-retained logs' : 'External logs';
+      downloadButton.title = source.external_logs.provider === 'systemd_journal' ? 'Copy visible output or use the journal command above on the host' : 'Copy visible output or use the AWS access details above';
       return;
     }
     const retainedURL = selected === 'all' ? '' : retainedLogDownloadURL(app.slug, source);
@@ -663,6 +667,7 @@ export function createLogsViewer({
     const externalSources = scoped.filter(isExternalLogSource);
     const followable = live.filter(isFollowableLogSource);
     const inlineProvider = live.filter(isInlineProviderLogSource);
+    const logProviderLabel = inlineProvider.some(source => source.external_logs?.provider === 'systemd_journal') ? 'provider' : 'CloudWatch';
     const external = live.length - followable.length - inlineProvider.length;
     const connectedCount = followable.filter((source) => connected.has(source.source_id)).length;
     const degradedCount = followable.filter((source) => degraded.has(source.source_id)).length;
@@ -678,7 +683,7 @@ export function createLogsViewer({
     pauseButton.disabled = availableTotal === 0;
     if (live.length === 0) {
       statusText.textContent = scoped.length === 1 && isInlineProviderLogSource(scoped[0])
-        ? `${titleCase(scoped[0].status)} · CloudWatch logs available`
+        ? `${titleCase(scoped[0].status)} · ${scoped[0].external_logs.provider === "systemd_journal" ? "Journal" : "CloudWatch"} logs available`
         : externalSources.length === scoped.length && scoped.length
         ? `${scoped.length === 1 ? titleCase(scoped[0].status) : `${scoped.length} external sources`} · logs retained in AWS`
         : scoped.length
@@ -690,8 +695,8 @@ export function createLogsViewer({
       statusText.textContent = `Delayed · ${totalDegraded} live source${totalDegraded === 1 ? '' : 's'} waiting for log storage${disconnectedCount ? ` · ${disconnectedCount} reconnecting` : ''}`;
     } else if (availableCount === availableTotal) {
       statusText.textContent = inlineProvider.length === availableTotal
-        ? `Live · ${availableCount} CloudWatch source${availableCount === 1 ? '' : 's'} connected`
-        : `Live · ${availableCount} connected source${availableCount === 1 ? '' : 's'}${inlineProvider.length ? ` · ${inlineProvider.length} via CloudWatch` : ''}${external ? ` · ${external} external` : ''}`;
+        ? `Live · ${availableCount} ${logProviderLabel} source${availableCount === 1 ? '' : 's'} connected`
+        : `Live · ${availableCount} connected source${availableCount === 1 ? '' : 's'}${inlineProvider.length ? ` · ${inlineProvider.length} via ${logProviderLabel}` : ''}${external ? ` · ${external} external` : ''}`;
     } else {
       statusText.textContent = `Reconnecting · ${availableCount} of ${availableTotal} available live sources connected`;
     }
@@ -771,9 +776,9 @@ export function createLogsViewer({
       if (firstFailure && !error.throttled) {
         addEntry({
           kind: 'event', replica: source.replica,
-          line: `Replica #${source.replica} CloudWatch output is unavailable in ShinyHub; use the AWS access above`,
+          line: source.external_logs?.provider === "systemd_journal" ? `Replica #${source.replica} journal output is unavailable in ShinyHub; use the journal command above on the host` : `Replica #${source.replica} CloudWatch output is unavailable in ShinyHub; use the AWS access above`,
         });
-        announce(`CloudWatch output for replica ${source.replica} is unavailable in ShinyHub. Direct AWS access remains available.`);
+        announce(source.external_logs?.provider === "systemd_journal" ? `Journal output for replica ${source.replica} is unavailable in ShinyHub. The journal command remains available.` : `CloudWatch output for replica ${source.replica} is unavailable in ShinyHub. Direct AWS access remains available.`);
       }
       return {
         entries: [], outcome: error.throttled ? 'throttled' : 'error', retryAfterMs: error.retryAfterMs || 0,

@@ -55,6 +55,7 @@ type RepeatableUpgrader struct {
 	guardRelease   func()
 	beforeReady    func() error
 	upgradeFailure func(error)
+	environment    func() ([]string, error)
 }
 
 // NewRepeatable uses tableflip's listener descriptors but a negotiated
@@ -217,6 +218,14 @@ func (u *RepeatableUpgrader) SetBeforeReady(fn func() error) {
 	u.beforeReady = fn
 }
 
+// SetEnvironment supplies a freshly read environment for every successor.
+// Failure refuses the handoff before a process is launched.
+func (u *RepeatableUpgrader) SetEnvironment(fn func() ([]string, error)) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.environment = fn
+}
+
 // SetUpgradeFailure restores owner publication after a killed or crashed child
 // that may have published its endpoint but never completed readiness.
 func (u *RepeatableUpgrader) SetUpgradeFailure(fn func(error)) {
@@ -276,6 +285,7 @@ func (u *RepeatableUpgrader) Upgrade() (result error) {
 	}
 	guard := u.guard
 	failure := u.upgradeFailure
+	environment := u.environment
 	u.mu.Unlock()
 	var release func()
 	if guard != nil {
@@ -325,7 +335,15 @@ func (u *RepeatableUpgrader) Upgrade() (result error) {
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.ExtraFiles = append([]*os.File{readyW, namesR}, files...)
-	for _, value := range os.Environ() {
+	successorEnv := os.Environ()
+	if environment != nil {
+		var err error
+		successorEnv, err = environment()
+		if err != nil {
+			return fmt.Errorf("reload environment: %w", err)
+		}
+	}
+	for _, value := range successorEnv {
 		if !strings.HasPrefix(value, inheritedEnv+"=") && !strings.HasPrefix(value, relayAwareEnv+"=") {
 			cmd.Env = append(cmd.Env, value)
 		}

@@ -44,7 +44,7 @@ tiers; it is not a per-app selection.
 
 ## Boundary and requirements
 
-Use Linux with systemd as PID 1, cgroup v2, and systemd support for `LoadCredential`,
+Use Linux with systemd as PID 1, cgroup v2, and systemd support for transient units,
 `ProtectProc`, transient services and freeze/thaw (tested on Ubuntu 24.04,
 systemd 255). The broker binary, policy, state and runtime directories and their
 ancestors must be root-owned and not writable by other users. The controller
@@ -271,3 +271,31 @@ The checks exercise private app identity/storage, actual Shiny startup, guard
 abort, descriptor-lock lifetime, client replacement, isolated builds, memory
 limits and detached-descendant shutdown. Test real deploys and recovery with
 synthetic data before enabling this on an existing fleet.
+
+## Controller restart survival and logs
+
+With the updated broker, new replica units keep their systemd-owned stdout and
+stderr connected to journald. `server.shutdown_apps: adopt` leaves those separate
+units running on a controller stop or crash; the next controller re-adopts their
+durable unit identities. WebSockets reconnect, but the replica and its in-memory
+data do not cold-start. This does not make an app or worker-unit OOM survivable,
+and the controller's OOM must be confined to its own cgroup.
+
+The broker advertises journal support to the controller. Install the broker
+update before relying on this feature; older brokers retain pipe-based output.
+Existing workers keep their original output endpoint until an app rollout replaces
+them. Builds and one-shot jobs retain their command-capture pipes.
+
+ShinyHub records `systemd_journal` plus the exact unit in each immutable log run.
+The Logs view reads bounded pages through the authenticated broker and offers
+`journalctl --unit='<unit>'` for host-side access. The broker accepts only its own
+recorded worker units. Journal retention and rate limits follow the host's
+journald configuration; configure persistent journal storage if logs must survive
+a reboot. These logs are not copied into ShinyHub's shared database log store.
+Stopping the controller is not a request to delete worker units; use ShinyHub's
+app stop/delete operations for that. Keep the reference controller
+`KillMode=control-group`; it cannot terminate sibling broker worker units.
+
+Launch arguments and environment travel over the root-authenticated bootstrap
+socket together with file descriptors after the broker verifies the bootstrap
+PID and app UID. They are not stored in public systemd unit properties.

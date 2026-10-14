@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
@@ -31,7 +32,10 @@ func reloadServingCheck(store *db.Store, mgr *process.Manager, prx *proxy.Proxy)
 					// A warm floor is a capacity target, not a prerequisite for
 					// reloading a host already serving below that target.
 					if ready > 0 {
-						serving = append(serving, upgrade.ReloadApp{ID: app.ID, Slug: app.Slug, MinimumReady: min(max(1, app.MinWarmReplicas), ready)})
+						if ready < app.MinWarmReplicas {
+							slog.Warn("reload preserves serving capacity below configured warm floor", "slug", app.Slug, "ready", ready, "min_warm_replicas", app.MinWarmReplicas)
+						}
+						serving = append(serving, upgrade.ReloadApp{ID: app.ID, Slug: app.Slug, MinimumReady: ready})
 					}
 				}
 			}

@@ -1106,7 +1106,7 @@ func (m *Manager) Start(p StartParams) (*ProcessInfo, error) {
 	}
 	done := make(chan struct{})
 	pool[p.Index] = &entry{
-		info: info, handle: handle, tier: tier, logRun: &run, done: done, ownsOutput: true,
+		info: info, handle: handle, tier: tier, logRun: &run, done: done, ownsOutput: ep.ExternalLogs == nil && !ep.DetachedOutput,
 		startupGuard: ep.StartupGuard, incarnation: m.nextIncarnation.Add(1),
 	}
 	m.entries[poolKey] = pool

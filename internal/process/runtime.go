@@ -57,11 +57,12 @@ var ErrIncarnationGone = errors.New("replica incarnation gone")
 // and the operational RunHandle for Signal/Wait/Stats/removal. A remote runtime
 // returns a non-loopback URL here; local runtimes return http://127.0.0.1:<port>.
 type ReplicaEndpoint struct {
-	URL          string        // route URL, e.g. "http://127.0.0.1:34521"
-	Provider     string        // runtime provider, e.g. native, docker, fargate, scaleway_serverless
-	WorkerID     string        // stable identity: PID (stringified), container ID, task ARN
-	Handle       RunHandle     // operational handle
-	ExternalLogs *ExternalLogs // provider-owned log destination, when ShinyHub cannot stream output
+	URL            string        // route URL, e.g. "http://127.0.0.1:34521"
+	Provider       string        // runtime provider, e.g. native, docker, fargate, scaleway_serverless
+	WorkerID       string        // stable identity: PID (stringified), container ID, task ARN
+	Handle         RunHandle     // operational handle
+	DetachedOutput bool          // output lifetime is independent of the controller
+	ExternalLogs   *ExternalLogs // provider-owned log destination, when ShinyHub cannot stream output
 	// StartupGuard blocks app execution until the control plane writes "ready\n"
 	// and closes the guard after durably persisting the runtime identity. Closing
 	// without acknowledgement aborts the launch.

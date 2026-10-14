@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -187,11 +188,9 @@ func WireSignals(ctx context.Context, upg Upgrader, sighup <-chan os.Signal, log
 	return state
 }
 
-// NotifyReady tells systemd (Type=notify) that this process is the live service:
-// it sends READY=1 and MAINPID=<own pid> to $NOTIFY_SOCKET so systemd retargets
-// MAINPID to the successor after every zero-downtime handoff. It is a no-op when
-// $NOTIFY_SOCKET is unset (dev, macOS, non-systemd). Call once, right after
-// Upgrader.Ready().
+// NotifyReady announces server readiness to systemd. Supervised services keep
+// MAINPID on their stable parent; unsupervised services announce their own PID.
+// It is a no-op without NOTIFY_SOCKET. Call once after Upgrader.Ready().
 func NotifyReady() error {
 	sock := os.Getenv("NOTIFY_SOCKET")
 	if sock == "" {
@@ -206,7 +205,15 @@ func NotifyReady() error {
 		return fmt.Errorf("sd_notify dial: %w", err)
 	}
 	defer conn.Close()
-	if _, err := fmt.Fprintf(conn, "READY=1\nMAINPID=%d\n", os.Getpid()); err != nil {
+	mainPID := os.Getpid()
+	if value := os.Getenv(supervisorPIDEnv); value != "" {
+		pid, err := strconv.Atoi(value)
+		if err != nil || pid <= 1 {
+			return errors.New("invalid supervisor PID")
+		}
+		mainPID = pid
+	}
+	if _, err := fmt.Fprintf(conn, "READY=1\nMAINPID=%d\n", mainPID); err != nil {
 		return fmt.Errorf("sd_notify write: %w", err)
 	}
 	return nil

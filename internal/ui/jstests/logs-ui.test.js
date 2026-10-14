@@ -1135,3 +1135,9 @@ test('a search that misses names unloaded history as the reason rather than repo
     'an empty search result over a truncated buffer must not read as a plain no-match',
   );
 });
+
+test("journal handoffs only copy commands for isolated worker units", () => {
+ const source = {external_logs: {provider: "systemd_journal", resource: "shinyhub-isolated-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service"}};
+ assert.equal(externalLogsCommand(source), "journalctl --unit='shinyhub-isolated-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service'");
+ assert.equal(externalLogsCommand({external_logs: {provider: "systemd_journal", resource: "shinyhub.service; malicious"}}), "");
+});

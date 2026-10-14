@@ -120,8 +120,28 @@ var serveCmd = &cobra.Command{
 		}
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer cancel()
+		environment, err := config.ServerEnvironment(serverConfigPath(), os.Environ())
+		if err != nil {
+			return err
+		}
+		config.ApplyServerEnvironment(environment)
 		logger := logging.New()
 		slog.SetDefault(logger)
+		if serveSupervise {
+			cfg, err := config.LoadForMaintenance(serverConfigPath())
+			if err != nil {
+				return err
+			}
+			hup := make(chan os.Signal, 1)
+			signal.Notify(hup, syscall.SIGHUP)
+			defer signal.Stop(hup)
+			err = upgrade.Supervise(ctx, []string{os.Args[0], "serve", "--config", serverConfigPath(), "--no-browser"}, os.Environ(), cfg.Server.PIDFile, hup, logger)
+			var exit *exec.ExitError
+			if errors.As(err, &exit) {
+				return &cli.ExitCodeError{Code: exit.ExitCode(), Err: err}
+			}
+			return err
+		}
 		return runServe(ctx, logger, serveOptions{
 			FirstRun:  setup,
 			NoBrowser: serveNoBrowser,
@@ -133,6 +153,7 @@ var serveCmd = &cobra.Command{
 var (
 	backupOut      string
 	serveNoBrowser bool
+	serveSupervise bool
 )
 
 var backupCmd = &cobra.Command{
@@ -441,6 +462,7 @@ func serverConfigPath() string {
 func init() {
 	cli.SetVersion(version)
 	reloadCmd.Flags().DurationVar(&reloadWait, "wait", 0, "Wait for temporary transitions before handoff (0..24h); readiness separately waits server.upgrade_timeout + 1m")
+	serveCmd.Flags().BoolVar(&serveSupervise, "supervise", false, "Keep a stable systemd supervisor across reloads (Linux 5.3+; requires server.pid_file)")
 	serveCmd.Flags().BoolVar(&serveNoBrowser, "no-browser", false, "Do not open a browser after interactive first-run setup")
 	backupCmd.Flags().StringVar(&backupOut, "out", "", "Destination archive path (.tar.gz)")
 	_ = backupCmd.MarkFlagRequired("out")
@@ -449,7 +471,7 @@ func init() {
 		"Confirm every old server and listed job process tree is stopped, then record uncertainty and clear the fence")
 	restoreCmd.Flags().Bool("force", false, "Restore even if a running server is detected (only after confirming the server is stopped)")
 	const configUsage = "Path to the server config file (overrides SHINYHUB_CONFIG; default ./shinyhub.yaml)"
-	for _, c := range []*cobra.Command{serveCmd, reloadCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd} {
+	for _, c := range []*cobra.Command{serveCmd, statusCmd, reloadCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd} {
 		c.Flags().StringVar(&configPath, "config", "", configUsage)
 	}
 }
@@ -461,7 +483,7 @@ var buildRootOnce sync.Once
 // tests to call; registration happens exactly once per process.
 func buildRoot() *cobra.Command {
 	buildRootOnce.Do(func() {
-		rootCmd.AddCommand(newLocalTokenCmd(), newRelayProtocolCmd(), newInitCmd(), serveCmd, reloadCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd, newHealthcheckCmd(), newWorkerCmd(), newSandboxCmd())
+		rootCmd.AddCommand(newOutputPumpCmd(), newLocalTokenCmd(), newRelayProtocolCmd(), newInitCmd(), serveCmd, statusCmd, reloadCmd, validateConfigCmd, backupCmd, restoreCmd, rotateSecretCmd, migrateBackendCmd, resolveLegacyWritersCmd, newHealthcheckCmd(), newWorkerCmd(), newSandboxCmd())
 		cli.AddCommandsTo(rootCmd)
 	})
 	return rootCmd
@@ -825,7 +847,7 @@ func buildRuntime(ctx context.Context, tier config.TierConfig, cfg *config.Confi
 					return nil, fmt.Errorf("native user isolation: %w", err)
 				}
 			}
-			for _, path := range []string{serverConfigPath(), cfg.Auth.SecretFile} {
+			for _, path := range []string{serverConfigPath(), cfg.Auth.SecretFile, cfg.Server.EnvFile} {
 				if err := rt.ValidateControlPath(path); err != nil {
 					return nil, fmt.Errorf("native user isolation: %w", err)
 				}
@@ -845,6 +867,7 @@ func buildRuntime(ctx context.Context, tier config.TierConfig, cfg *config.Confi
 		// runtime degrades gracefully: Suspend reports not-supported and the
 		// watcher hibernates via Stop exactly as before.
 		nativeRT.SetSnapshot(cfg.Runtime.Snapshot.Enabled, cfg.Runtime.Snapshot.ReclaimMinFraction)
+		nativeRT.SetOutputPump(os.Args[0])
 		nativeRT.SetIsolation(sandbox.Level(cfg.Runtime.Native.Isolation))
 		return nativeRT, nil
 	case "fargate":
@@ -1027,6 +1050,12 @@ func (h *hostSampler) Sample(handle process.RunHandle) (process.Stats, error) {
 }
 
 func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) error {
+	environment, envErr := config.ServerEnvironment(serverConfigPath(), os.Environ())
+	if envErr != nil {
+		return fmt.Errorf("load server environment: %w", envErr)
+	}
+	// Apply before creating any proxy, build command, or successor.
+	config.ApplyServerEnvironment(environment)
 	cfg, err := config.Load(serverConfigPath())
 	if err != nil {
 		return &cli.ExitCodeError{Code: 1, Kind: cli.KindValidation, Err: fmt.Errorf("load config: %w", err)}
@@ -1101,6 +1130,16 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		return fmt.Errorf("init upgrader: %w", err)
 	}
 	defer upg.(*upgrade.RepeatableUpgrader).Close()
+	upg.(*upgrade.RepeatableUpgrader).SetEnvironment(func() ([]string, error) {
+		next, err := config.LoadForMaintenance(serverConfigPath())
+		if err != nil {
+			return nil, err
+		}
+		if next.Server.PIDFile != cfg.Server.PIDFile {
+			return nil, fmt.Errorf("server.pid_file cannot change during a handoff")
+		}
+		return config.ServerEnvironment(serverConfigPath(), os.Environ())
+	})
 	// Preflight the handoff's re-exec target now: a SIGHUP re-execs argv[0], and
 	// an unresolvable argv[0] fails every upgrade attempt (the process keeps
 	// serving, so the failure is safe but silent until upgrade time).
@@ -1656,6 +1695,10 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		slog.Info("pool syncer started", "interval", proxy.PoolSyncInterval)
 	}
 
+	providerLogs := process.ExternalLogReaders{}
+	if cfg.Runtime.Native.BrokerSocket != "" {
+		providerLogs["systemd_journal"] = process.NewJournalLogReader(cfg.Runtime.Native.BrokerSocket)
+	}
 	if fc := cfg.Runtime.Fargate; fc.Cluster != "" {
 		var opts []func(*awsconfig.LoadOptions) error
 		if fc.Region != "" {
@@ -1664,8 +1707,11 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		if awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...); err != nil {
 			slog.Warn("CloudWatch application logs unavailable; using AWS console handoff", "err", err)
 		} else {
-			srv.SetExternalLogReader(cloudlogs.NewSDKReader(cloudwatchlogs.NewFromConfig(awsCfg), awsCfg.Region))
+			providerLogs["aws_ecs"] = cloudlogs.NewSDKReader(cloudwatchlogs.NewFromConfig(awsCfg), awsCfg.Region)
 		}
+	}
+	if len(providerLogs) > 0 {
+		srv.SetExternalLogReader(providerLogs)
 	}
 	if isClustered(cfg) {
 		srv.SetCluster(cfg.Server.InstanceID)
@@ -1742,6 +1788,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 				return float64(n)
 			},
 		)
+		reg.RegisterRetiredGauges(func() (int, int64, bool) { st := relayLeases.Status(); return st.Count, st.Sessions, st.Unknown })
 		// Schedule last-success gauge: DB-backed (restart-safe), one sample per
 		// schedule that has ever succeeded.
 		if err := reg.Register(metrics.NewScheduleFreshnessCollector(func() ([]metrics.ScheduleSample, error) {
@@ -3579,7 +3626,7 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 		forced := 0
 		if preservingReload {
 			slog.Info("control plane retired; preserving established multiplex sessions", "count", n)
-			forced = prx.PreserveUpgraded(ctx, relayLease, cfg.Server.DrainTimeout)
+			forced = prx.PreserveUpgraded(ctx, relayLease, cfg.Server.DrainTimeout, cfg.Server.MaxRetiredLifetime)
 		} else {
 			forced = prx.DrainUpgradedForReload(drainCtx, drainTimeout, cfg.Server.DrainTimeout)
 		}
@@ -3612,8 +3659,9 @@ func runServe(ctx context.Context, logger *slog.Logger, serveOpts serveOptions) 
 	}
 	if preservingReload {
 		// Session accounting can retire independently of the native log pipes.
-		_ = relayLease.Close()
+		_ = relayLease.Publish(nil)
 		mgr.WaitOwnedOutput(ctx)
+		slog.Info("retired process exiting", "pid", os.Getpid())
 	}
 
 	switch cfg.Server.ShutdownApps {

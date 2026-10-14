@@ -10,6 +10,7 @@ import (
 )
 
 func TestNotifyReady_SendsReadyAndMainPID(t *testing.T) {
+	t.Setenv(supervisorPIDEnv, "")
 	// The socket path must fit in sockaddr_un.sun_path (104 bytes on macOS, 108
 	// on Linux). t.TempDir() embeds the long test name, and on macOS $TMPDIR
 	// lives under /var/folders/..., so that path overruns the limit and bind()
@@ -57,5 +58,33 @@ func TestNotifyReady_NoSocketIsNoop(t *testing.T) {
 	t.Setenv("NOTIFY_SOCKET", "")
 	if err := NotifyReady(); err != nil {
 		t.Fatalf("NotifyReady with no socket must be a no-op, got %v", err)
+	}
+}
+
+func TestNotifyReadyKeepsStableSupervisorMainPID(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sdnotify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socket := dir + "/notify.sock"
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: socket, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	t.Setenv("NOTIFY_SOCKET", socket)
+	t.Setenv(supervisorPIDEnv, "12345")
+	if err := NotifyReady(); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 256)
+	n, _, err := conn.ReadFromUnix(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "READY=1\nMAINPID=12345\n" {
+		t.Fatalf("notification=%q", buf[:n])
 	}
 }

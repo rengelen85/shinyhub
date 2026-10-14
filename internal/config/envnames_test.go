@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-var envLookupLiteral = regexp.MustCompile(`(?:os\.Getenv|os\.LookupEnv)\(\s*"(SHINYHUB_[A-Z0-9_]*)"`)
+var envLookupLiteral = regexp.MustCompile(`(?:os\.Getenv|os\.LookupEnv|getConfigEnv)\(\s*"(SHINYHUB_[A-Z0-9_]*)"`)
 
 // skippedScanDirs are directories with no Go source of ours in them.
 var skippedScanDirs = map[string]bool{

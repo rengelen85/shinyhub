@@ -453,3 +453,9 @@ These metrics observe the server's actual pool and carry no DSN or query-text
 labels. Wait time excludes query execution and SQLite lock contention. Compare
 counter increases over the same interval as request latency and CPU usage;
 connection waits alone do not identify a slow query.
+
+Retired reload generations are reported by `shinyhub_retired_generations` and
+`shinyhub_retired_sessions`. `shinyhub_retired_state_unknown` is 1 when a held
+registry lock has an unreadable or invalid snapshot; session counts then cover
+only verified snapshots. These gauges include legacy output-only owners until
+exit, with zero sessions. See [reload visibility](zero-downtime-upgrades.md#retired-generation-visibility-and-lifetime).
