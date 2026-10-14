@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.20.9](https://github.com/rvben/shinyhub/compare/v0.20.8...v0.20.9) - 2026-10-14
+
 ### Upgrade notice
 
 The default live-update CPU accounting request changes from 1 to 0.1 core per
@@ -23,6 +25,9 @@ request. These requests are accounting budgets, separate from runtime CPU quotas
 - **schedules**: cap grouped-roll surge admission at the configured worker limit, including when warm spares exceed that limit.
 - **capacity**: lower the default live-update CPU accounting request from 1 to 0.1 core per worker so idle small-host fleets can deploy and roll again. Explicit requests, live-worker accounting, the 10% reserve, memory checks, and measured CPU pressure checks remain in effect. Startup warns against the recovered local fleet; `validate-config` warns when the minimum serving-plus-surge pair cannot fit and reports locally effective cores and their source.
 - **schedules**: escalate repeated capacity deferrals to warning logs with durable deferral count, age, retry delay, and operator guidance. A zero `max_defer_age` still retries indefinitely without stopping serving workers; capacity-deferral age and count metrics survive coalesced producer successes. Preserve the capacity deadline across queued replacements and producer completion during an in-flight roll, without carrying resolved episodes into new work.
+- **test**: report the detected Node version in compatibility errors ([57dadc3](https://github.com/rvben/shinyhub/commit/57dadc39172db95b32f1ddbdad43d45970242255))
+- **loadtest**: support current Docker daemons and evidence ownership ([22a1ce6](https://github.com/rvben/shinyhub/commit/22a1ce68e5fa949c2636694faf3ff8cf52f0ee88))
+- **loadtest**: capture worker profiles during pressure ([ca9740c](https://github.com/rvben/shinyhub/commit/ca9740cc5528e79e3161bd8fbe6218e13ab5eb21))
 
 ### Added
 
