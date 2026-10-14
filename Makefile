@@ -99,7 +99,7 @@ test-js:
 # left unquoted for the shell to expand, as in test-js.
 test-worker:
 	@command -v node >/dev/null 2>&1 || { echo "node not found (Node 22.18+ required for Worker tests)"; exit 1; }
-	@node -e 'const [maj,min]=process.versions.node.split(".").map(Number); if (maj<22 || (maj===22 && min<18)) { console.error(`Node ${process.versions.node} cannot run TypeScript tests directly (22.18+ required)`); process.exit(1); }'
+	@node -e 'const [maj,min]=process.versions.node.split(".").map(Number); if (maj<22 || (maj===22 && min<18)) { console.error(`Node $${process.versions.node} cannot run TypeScript tests directly (22.18+ required)`); process.exit(1); }'
 	node --test deploy/cloudflare-demo/src/*.test.ts
 
 # test-identity runs the client-helper suites plus the cross-language
