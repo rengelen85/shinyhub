@@ -134,8 +134,13 @@ try {
         const text = await readFile(config, 'utf8');
         await writeFile(config, text.replace('reload_sessions: preserve', 'reload_sessions: drain\n  reload_drain_timeout: 2s'), { mode: 0o600 });
       }
-      await command(['sudo', '-n', 'systemd-run', '--quiet', `--unit=${unit}`, '--property=Type=notify', '--property=NotifyAccess=all', `--property=User=${process.getuid()}`, '--property=Delegate=cpu memory pids', '--property=CPUQuota=400%', '--property=MemoryMax=3G', '--property=NoNewPrivileges=true', '--property=ProtectSystem=full', '--property=PrivateTmp=true', `--property=BindPaths=${dirname(tools)} ${work}`, '--property=LimitNOFILE=65536', '--', '/usr/bin/env', ...Object.entries(environment).map(([k,v]) => `${k}=${v}`), binary, 'serve', '--config', config, '--no-browser'], join(work, 'service-start.log'));
+      await command(['sudo', '-n', 'systemd-run', '--quiet', `--unit=${unit}`, '--property=Type=notify', '--property=NotifyAccess=all', '--property=Restart=on-failure', '--property=RestartSec=5s', '--property=RestartPreventExitStatus=7', `--property=User=${process.getuid()}`, '--property=Delegate=cpu memory pids', '--property=CPUQuota=400%', '--property=MemoryMax=3G', '--property=NoNewPrivileges=true', '--property=ProtectSystem=full', '--property=PrivateTmp=true', `--property=BindPaths=${dirname(tools)} ${work}`, '--property=LimitNOFILE=65536', '--', '/usr/bin/env', ...Object.entries(environment).map(([k,v]) => `${k}=${v}`), binary, 'serve', '--supervise', '--config', config, '--no-browser'], join(work, 'service-start.log'));
       await poll(() => fetch(`${host}/activez`).then(r => r.ok).catch(() => false), 'systemd service ready');
+      const supervisorPID = Number((await command(['systemctl', 'show', unit, '--property=MainPID', '--value'])).trim());
+      const serverPID = Number((await readFile(join(work, 'hub.pid'), 'utf8')).trim());
+      assert.ok(supervisorPID > 0 && serverPID > 0);
+      assert.notEqual(supervisorPID, serverPID, 'systemd tracks a stable supervisor separately from the active controller');
+      result.supervisor_pid = supervisorPID;
       const response = await fetch(`${host}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'matrix-admin', password }) }); assert.equal(response.status, 200); ({ token } = await response.json());
       const created = await fetch(`${host}/api/apps`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'shinyhub-runtime-matrix' }, body: JSON.stringify({ slug: id, name: id, access: 'public' }) });
       assert.equal(created.status, 201, await created.text());
@@ -317,6 +322,29 @@ try {
         assert.ok(browserSockets.every(s => !s.isClosed()));
         assert.equal((await api()).compatibility_quarantined, false);
         check(preserving ? 'preserving reload retains every session and its applied calculation' : 'draining reload recovers the complete population with correct calculations');
+      }
+      if (preserving) {
+        const state = JSON.parse(await command([binary, 'status', '--config', config, '--output', 'json'], join(work, 'before-controller-crash.log')));
+        assert.equal(Number((await command(['systemctl', 'show', unit, '--property=MainPID', '--value'])).trim()), supervisorPID,
+          'every handoff keeps systemd tracking the original supervisor');
+        assert.notEqual(state.pid, supervisorPID);
+        assert.ok(state.retired.count > 0 && state.retired.sessions > 0,
+          'controller crash must occur while a retired generation retains real sessions');
+        result.retired_before_controller_crash = state.retired;
+        browserPlanned = true; clients.forEach(c => { c.planned = true; }); plannedInterruption = true;
+        await command(['kill', '-KILL', String(state.pid)], join(work, 'controller-crash.log'));
+        await poll(async () => {
+          const current = Number((await command(['systemctl', 'show', unit, '--property=MainPID', '--value'])).trim());
+          return current > 0 && current !== supervisorPID
+            && await fetch(`${host}/activez`).then(r => r.ok).catch(() => false);
+        }, 'systemd restarts the crashed active controller despite a live retired relay');
+        await poll(async () => (await api()).replicas_status?.some(row => row.status === 'running'),
+          'controller crash recovers a warm worker without a demand request');
+        await resetPopulation(); plannedInterruption = false;
+        await Promise.all(clients.map(c => c.compute())); await browserCompute(released);
+        assert.equal((await api()).compatibility_quarantined, false);
+        result.restarted_supervisor_pid = Number((await command(['systemctl', 'show', unit, '--property=MainPID', '--value'])).trim());
+        check('systemd recovers an active-controller crash while the retired relay remains alive');
       }
       // A complete service restart deliberately ends sessions. Require warm
       // recovery before any page request can trigger an on-demand spawn.

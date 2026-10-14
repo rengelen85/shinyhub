@@ -23,6 +23,17 @@ and containers. Existing ShinyHub-managed containers cause an early refusal;
 unrelated containers are left alone. Results remain under the ignored
 `loadtest/results/runtime-matrix-*` directory.
 
+The service uses `serve --supervise` and the reference unit's `Restart=on-failure`,
+five-second restart delay, and permanent-exit-code protection. It requires Linux
+pidfds (kernel 5.3+). Systemd must track the supervisor separately from the active
+controller. Native multiplex cases also require that the same supervisor remains
+MainPID across handoffs. After a preserving reload, the test deliberately kills
+the active controller while a retired generation still holds initialized sessions.
+Systemd must restart the service and restore a warm worker before any app page
+request can trigger spawning; a fresh population must calculate correctly without
+compatibility quarantine. This deliberate crash interrupts sessions and is
+recorded separately from transitions that must preserve them.
+
 The default matrix has eight cases: Python/R × native/Docker ×
 multiplex/grouped. Grouped cases use `worker.warm_spares=1`, `max_workers=1` and
 `grouped_size=64`, leaving capacity for a replacement; multiplex cases use
@@ -47,6 +58,7 @@ Supported guarantees are deliberately separate:
 | --- | --- | --- | --- |
 | Real app, browser, calculations and kernel worker limits | Required | Required | Required |
 | Full restart recovers a warm worker without demand | Required | Required | Required |
+| Active-controller crash with a live retired relay triggers service restart | Required | Not exercised | Not exercised |
 | Candidate startup failure preserves the previous generation | Required | Required | Live handoff refused before startup |
 | Live code deployment | Required, overlapping reload | Required | Explicit native-only refusal checked |
 | Atomic producer publication and scheduled roll | Required, adjacent reload | Required | Explicit local-native-tier refusal checked |
@@ -55,8 +67,8 @@ Supported guarantees are deliberately separate:
 A passing Docker case **does not certify zero-downtime deployments or preserving
 reloads**. A passing native grouped case **does not certify preserving reloads**.
 These cases certify their supported behavior, safe capability refusals, and
-recovery after a deliberately draining reload. Page interruptions during drain
-and full service restart are recorded separately. Other tested transitions
+recovery after a deliberately draining reload. Page interruptions during drain,
+deliberate controller crash, and full service restart are recorded separately. Other tested transitions
 require zero page errors, zero session errors and zero unexpected closes.
 Old-generation drain deadlines and explicit test teardown closures are counted
 as planned. Producer consumers must see the completed atomic snapshot,
