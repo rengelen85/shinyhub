@@ -59,7 +59,8 @@ async function command(args, name, extra = {}) {
   const { expectedExit = 0, ...spawnExtra } = extra;
   const child = spawn(args[0], args.slice(1), { cwd: root, env, signal: abort.signal, ...spawnExtra });
   children.add(child);
-  let stdout = '';
+  let stdout = '', stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk; });
   child.stdout.on('data', chunk => { stdout += chunk; });
   child.stdout.pipe(log, { end: false });
   child.stderr.pipe(log, { end: false });
@@ -68,6 +69,9 @@ async function command(args, name, extra = {}) {
     if (expectedExit === 'nonzero') assert.notEqual(code, 0, `${name} unexpectedly succeeded`);
     else assert.equal(code, expectedExit, `${name} failed; inspect ${name}.log`);
     return stdout;
+  } catch (error) {
+    error.stderr = stderr;
+    throw error;
   } finally { children.delete(child); log.end(); }
 }
 
@@ -141,7 +145,9 @@ try {
   await new Promise(resolve => reservation.close(resolve));
   const host = `http://127.0.0.1:${port}`;
   await writeFile(passwordFile, password, { mode: 0o600 });
-  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: ${relayMode ? 16 : 4}\n${capacityMode ? '  host_capacity_cores: 0.5\n' : ''}  drain_timeout: ${producerReloadMode ? '20s' : '5s'}\n${producerReloadMode ? '  reload_drain_timeout: 2s\n  upgrade_timeout: 5s\n' : ''}${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
+  // Tiny idle fixture workers need an explicit budget on small CI runners.
+  // The capacity mode keeps production defaults to exercise genuine refusal.
+  await writeFile(config, `server:\n  host: 127.0.0.1\n  port: ${port}\n  render_capacity_cores: ${relayMode ? 16 : 4}\n${capacityMode ? '  host_capacity_cores: 0.5\n' : '  update_capacity:\n    worker_cpu_request_cores: 0.1\n    reserved_cpu_cores: 0.1\n'}  drain_timeout: ${producerReloadMode ? '20s' : '5s'}\n${producerReloadMode ? '  reload_drain_timeout: 2s\n  upgrade_timeout: 5s\n' : ''}${relayMode ? `  reload_sessions: preserve\n  reload_relay_limit: 2\n  pid_file: ${JSON.stringify(join(state, 'hub.pid'))}\n` : ''}  shutdown_apps: stop\n  session_recheck_interval: ${sweepSeconds}s\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: ${JSON.stringify(join(state, 'hub.db'))}\nstorage:\n  apps_dir: ${JSON.stringify(join(state, 'apps'))}\n  app_data_dir: ${JSON.stringify(join(state, 'app-data'))}\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
   await command([binary, 'init', '--config', config, '--admin-user', username, '--admin-password-file', passwordFile], 'init', { cwd: state });
   const log = createWriteStream(join(work, 'server.log'), { mode: 0o600 });
   server = spawn(binary, ['serve', '--config', config, '--no-browser'], { cwd: state, env, detached: true });
@@ -196,10 +202,21 @@ try {
   await writeFile(join(app, 'requirements.txt'), requirements.replace(/^shinyhub-identity==[^\n]+$/m, `./${wheel}`));
   // The CLI uses its own config resolution; XDG_CONFIG_HOME alone does not
   // isolate it from an existing operator config or an inaccessible home.
-  const deploy = (slug = 'browser', extra = {}) => {
+  const deploy = async (slug = 'browser', extra = {}) => {
     const { flags = [], ...execution } = extra;
-    return command([binary, 'deploy', app, '--config', clientConfig, '--slug', slug, '--visibility', 'private', '--output', 'json', ...flags], 'deploy',
-      { ...execution, env: { ...env, SHINYHUB_HOST: host, SHINYHUB_TOKEN: token } });
+    const end = Date.now() + 30_000;
+    for (;;) {
+      try {
+        return await command([binary, 'deploy', app, '--config', clientConfig, '--slug', slug, '--visibility', 'private', '--output', 'json', ...flags], 'deploy',
+          { ...execution, env: { ...env, SHINYHUB_HOST: host, SHINYHUB_TOKEN: token } });
+      } catch (error) {
+        // Admission legitimately refuses brief host pressure. Retry only that
+        // conflict, with a deadline; deliberate capacity-refusal checks never retry.
+        if (capacityMode || execution.expectedExit !== undefined || error.actual !== 5
+          || !error.stderr?.includes('working version preserved: CPU:') || Date.now() >= end) throw error;
+        await delay(500, undefined, { signal: abort.signal });
+      }
+    }
   };
   await check('deploy real Shiny v1', deploy);
   const viewerRecord = await request('POST', '/api/users', { username: viewer, password: viewerPassword, role: 'viewer' }, 201);
