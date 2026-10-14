@@ -92,7 +92,12 @@ The reference systemd unit uses `shinyhub reload --wait 10m`. The command
 returns success only after the successor acknowledges readiness and its PID
 matches `server.pid_file`. Standalone successors must regain mutation ownership;
 session-preserving standalone reloads also verify that previously serving apps
-have reachable, adopted replicas meeting their warm floor (at least one replica).
+have reachable, adopted replicas meeting `min(max(1, min_warm_replicas), ready_before)`.
+The predecessor counts ready replicas using the same checks as the successor;
+only normal replica slots count toward the predecessor's obligation, since
+scheduled-roll surge replicas are temporary. Apps with no ready normal replicas
+create no serving obligation. A host already serving
+below its configured warm floor does not need to reach that floor to reload.
 This includes apps that begin serving while the command waits for admitted work.
 An unavailable app is named in the readiness failure rather than reporting success.
 Clustered successors may be healthy standbys after their first pool sync. A refusal
@@ -100,9 +105,14 @@ or failed readiness check returns nonzero, so `systemctl reload` reports failure
 A refusal before handoff leaves the current process serving; after an accepted
 handoff, inspect the successor and the named app before retrying.
 The unit allows fourteen minutes for the default ten-minute transition wait,
-startup acknowledgement, and a separate readiness budget. If you increase
-`--wait` or `server.upgrade_timeout`, set `TimeoutStartSec` to at least
-`wait + 2 * upgrade_timeout + 70s`.
+startup acknowledgement, and a separate readiness budget. `--wait` only bounds
+the transition wait before handoff. After handoff acknowledgement, readiness has
+its own `server.upgrade_timeout + 1m` limit (2 minutes with the default 60s
+upgrade timeout), regardless of `--wait`. On timeout, the CLI names the blockers
+and reports them to the successor for an error log in the server journal. This
+report is best effort if the successor's control socket is unavailable.
+If you increase `--wait` or `server.upgrade_timeout`, set `TimeoutStartSec` to at least
+`wait + 2 * upgrade_timeout + 75s`.
 
 For a local invocation without systemd:
 
@@ -128,6 +138,12 @@ and replica so they can be matched to WebSocket logs.
 These admission protections run in the retiring server. When upgrading from
 0.20.6, arrange the first reload after active producers and rolls have finished;
 replacing the binary cannot change the already-running process's retirement logic.
+The readiness replica cap is also captured by the retiring server; a first reload
+from 0.20.7 or 0.20.8 still uses that server's uncapped warm-floor requirement.
+For that first reload, temporarily lower the live app's `min_warm_replicas` to
+its current ready count, then restore the target once the fixed server is running.
+If it has already handed off with a nonzero exit, verify the successor PID and
+readiness before retrying.
 
 `make test-browser-reload-producers-e2e` exercises this boundary with real native
 processes, a cron producer overlapping a scheduled roll, and a Shiny browser

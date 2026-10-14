@@ -440,7 +440,7 @@ func serverConfigPath() string {
 
 func init() {
 	cli.SetVersion(version)
-	reloadCmd.Flags().DurationVar(&reloadWait, "wait", 0, "Wait up to this duration for temporary transitions before reloading (0..24h)")
+	reloadCmd.Flags().DurationVar(&reloadWait, "wait", 0, "Wait for temporary transitions before handoff (0..24h); readiness separately waits server.upgrade_timeout + 1m")
 	serveCmd.Flags().BoolVar(&serveNoBrowser, "no-browser", false, "Do not open a browser after interactive first-run setup")
 	backupCmd.Flags().StringVar(&backupOut, "out", "", "Destination archive path (.tar.gz)")
 	_ = backupCmd.MarkFlagRequired("out")

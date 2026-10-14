@@ -22,6 +22,9 @@ type reloadRequest struct {
 	Wait    time.Duration `json:"wait"`
 	Check   bool          `json:"check,omitempty"`
 	Apps    []ReloadApp   `json:"apps,omitempty"`
+	// The caller reports its last observed blockers after its readiness budget
+	// expires, so the successor can include the failure in the server journal.
+	ReadinessFailure string `json:"readiness_failure,omitempty"`
 }
 
 // ReloadApp records a serving obligation from the retiring process. The
@@ -96,6 +99,9 @@ func StartReloadControl(ctx context.Context, pidFile string, upgradeTimeout time
 					result.Error = "invalid reload request"
 				} else if request.Version != 1 || request.Wait < 0 || request.Wait > 24*time.Hour {
 					result.Error = "unsupported reload request or wait outside 0..24h"
+				} else if request.Check && request.ReadinessFailure != "" {
+					result.PID = os.Getpid()
+					log.Error("reload handoff accepted but successor readiness timed out", "pid", os.Getpid(), "blockers", request.ReadinessFailure)
 				} else if request.Check {
 					result.PID = os.Getpid()
 					result.Ready = ready()
@@ -224,6 +230,13 @@ func RequestReload(ctx context.Context, pidFile string, wait, upgradeTimeout tim
 	for {
 		probe, err := exchangeReload(ctx, reloadSocket(pidFile, result.PID), reloadRequest{Version: 1, Check: true, Apps: result.Apps})
 		if err != nil {
+			if ctx.Err() != nil {
+				return reloadReadinessFailure(ctx, pidFile, result, notReadyReason, ctx.Err())
+			}
+			// A socket deadline can fire just before the context timer does.
+			if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+				return reloadReadinessFailure(ctx, pidFile, result, notReadyReason, context.DeadlineExceeded)
+			}
 			return result, fmt.Errorf("handoff accepted, but successor readiness could not be verified (%s); check the live PID before retrying: %w", notReadyReason, err)
 		}
 		if probe.Error != "" {
@@ -250,10 +263,23 @@ func RequestReload(ctx context.Context, pidFile string, wait, upgradeTimeout tim
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return result, fmt.Errorf("successor %d did not become ready (%s): %w", result.PID, notReadyReason, ctx.Err())
+			return reloadReadinessFailure(ctx, pidFile, result, notReadyReason, ctx.Err())
 		case <-timer.C:
 		}
 	}
+}
+
+func reloadReadinessFailure(ctx context.Context, pidFile string, result ReloadResult, reason string, cause error) (ReloadResult, error) {
+	result.NotReadyReason = reason
+	if errors.Is(cause, context.DeadlineExceeded) {
+		// The readiness context has expired. Use a fresh, tightly bounded budget
+		// for the diagnostic, never another handoff request. Older servers ignore
+		// the extra field, preserving protocol compatibility during upgrades.
+		reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+		_, _ = exchangeReload(reportCtx, reloadSocket(pidFile, result.PID), reloadRequest{Version: 1, Check: true, ReadinessFailure: reason})
+	}
+	return result, fmt.Errorf("handoff accepted, but successor %d did not become ready (%s): %w", result.PID, reason, cause)
 }
 
 func exchangeReload(ctx context.Context, path string, request reloadRequest) (ReloadResult, error) {

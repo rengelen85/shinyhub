@@ -1,10 +1,12 @@
 package upgrade
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -457,5 +459,123 @@ func TestReloadWaitHookLifecycle(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestReloadReadinessTimeoutLogsBlockersInSuccessor(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sh-reload-log-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	pidFile := filepath.Join(dir, "pid")
+	previousPID, successorPID := os.Getpid()+1, os.Getpid()
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprint(previousPID)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	reason := "token-finops: 0 ready replicas after reload, need 1 (status running)"
+	successorUpgrader := newFakeUpgrader()
+	stop, err := StartReloadControl(context.Background(), pidFile, time.Second, successorUpgrader, &SignalState{}, func() bool { return true }, slog.New(slog.NewTextHandler(&logs, nil)), ReloadServingCheck{
+		Check: func([]ReloadApp) string { return reason },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	predecessor, err := net.Listen("unix", reloadSocket(pidFile, previousPID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer predecessor.Close()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := predecessor.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		var request reloadRequest
+		if err := json.NewDecoder(conn).Decode(&request); err != nil {
+			done <- err
+			return
+		}
+		if err := os.WriteFile(pidFile, []byte(fmt.Sprint(successorPID)), 0600); err != nil {
+			done <- err
+			return
+		}
+		done <- json.NewEncoder(conn).Encode(ReloadResult{PreviousPID: previousPID, PID: successorPID, Apps: []ReloadApp{{ID: 42, Slug: "token-finops", MinimumReady: 1}}})
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
+	result, err := RequestReload(ctx, pidFile, 0, time.Second)
+	if !errors.Is(err, context.DeadlineExceeded) || result.Ready || result.NotReadyReason != reason || !strings.Contains(err.Error(), "handoff accepted") {
+		t.Fatalf("timeout result = %+v, %v", result, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	stop() // Wait for server handlers before inspecting their log output.
+	if successorUpgrader.upgradeCount() != 0 {
+		t.Fatal("readiness probes or timeout report started another handoff")
+	}
+	for _, want := range []string{"level=ERROR", "reload handoff accepted but successor readiness timed out", reason} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("server log %q missing %q", logs.String(), want)
+		}
+	}
+}
+
+func TestReloadReadinessTimeoutReportIsSafeForLegacySuccessor(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sh-reload-legacy-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	pidFile := filepath.Join(dir, "pid")
+	if err := os.Mkdir(filepath.Join(dir, ".reload"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	pid := os.Getpid() + 1
+	listener, err := net.Listen("unix", reloadSocket(pidFile, pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	// Match the old wire format: the decoder ignores readiness_failure. A
+	// timeout diagnostic must still decode as a probe, never a reload request.
+	type legacyRequest struct {
+		Version int         `json:"version"`
+		Check   bool        `json:"check"`
+		Apps    []ReloadApp `json:"apps"`
+	}
+	requests := make(chan legacyRequest, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var request legacyRequest
+		if err := json.NewDecoder(conn).Decode(&request); err != nil {
+			return
+		}
+		requests <- request
+		_ = json.NewEncoder(conn).Encode(ReloadResult{PID: pid, Ready: true})
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := reloadReadinessFailure(ctx, pidFile, ReloadResult{PID: pid}, "app: no ready replica", context.DeadlineExceeded)
+	if !errors.Is(err, context.DeadlineExceeded) || result.Ready || result.NotReadyReason != "app: no ready replica" {
+		t.Fatalf("legacy timeout result: %+v, %v", result, err)
+	}
+	select {
+	case request := <-requests:
+		if request.Version != 1 || !request.Check || len(request.Apps) != 0 {
+			t.Fatalf("legacy successor received handoff request: %+v", request)
+		}
+	default:
+		t.Fatal("timeout report did not reach legacy successor")
 	}
 }

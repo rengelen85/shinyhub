@@ -24,7 +24,15 @@ func reloadServingCheck(store *db.Store, mgr *process.Manager, prx *proxy.Proxy)
 			var serving []upgrade.ReloadApp
 			for _, app := range apps {
 				if pools[app.Slug].Replicas > 0 {
-					serving = append(serving, upgrade.ReloadApp{ID: app.ID, Slug: app.Slug, MinimumReady: max(1, app.MinWarmReplicas)})
+					ready, err := reloadReadyReplicas(app, store, mgr, prx, true)
+					if err != nil {
+						return nil, fmt.Errorf("%s: count ready replicas before reload: %w", app.Slug, err)
+					}
+					// A warm floor is a capacity target, not a prerequisite for
+					// reloading a host already serving below that target.
+					if ready > 0 {
+						serving = append(serving, upgrade.ReloadApp{ID: app.ID, Slug: app.Slug, MinimumReady: min(max(1, app.MinWarmReplicas), ready)})
+					}
 				}
 			}
 			return serving, nil
@@ -37,27 +45,10 @@ func reloadServingCheck(store *db.Store, mgr *process.Manager, prx *proxy.Proxy)
 					blockers = append(blockers, expected.Slug+": serving app unavailable after reload")
 					continue
 				}
-				rows, err := store.ListReplicas(app.ID)
+				ready, err := reloadReadyReplicas(app, store, mgr, prx, false)
 				if err != nil {
 					blockers = append(blockers, expected.Slug+": cannot verify replicas after reload")
 					continue
-				}
-				ready := 0
-				for _, row := range rows {
-					info, ok := mgr.GetReplica(app.Slug, row.Index)
-					if row.Status != db.ReplicaStatusRunning || !ok || info.Status != process.StatusRunning ||
-						row.EndpointURL == "" || prx.ReplicaTargetURL(app.Slug, row.Index) != row.EndpointURL || info.EndpointURL != row.EndpointURL {
-						continue
-					}
-					endpoint, err := url.Parse(row.EndpointURL)
-					if err != nil {
-						continue
-					}
-					conn, err := net.DialTimeout("tcp", endpoint.Host, 200*time.Millisecond)
-					if err == nil {
-						_ = conn.Close()
-						ready++
-					}
 				}
 				if ready < max(1, expected.MinimumReady) {
 					blockers = append(blockers, fmt.Sprintf("%s: %d ready replicas after reload, need %d (status %s)", app.Slug, ready, max(1, expected.MinimumReady), app.Status))
@@ -66,4 +57,36 @@ func reloadServingCheck(store *db.Store, mgr *process.Manager, prx *proxy.Proxy)
 			return strings.Join(blockers, "; ")
 		},
 	}
+}
+
+// Use the same readiness evidence on both sides of the handoff: persisted and
+// managed running state, a registered proxy target, and a reachable endpoint.
+func reloadReadyReplicas(app *db.App, store *db.Store, mgr *process.Manager, prx *proxy.Proxy, canonicalOnly bool) (int, error) {
+	rows, err := store.ListReplicas(app.ID)
+	if err != nil {
+		return 0, err
+	}
+	ready := 0
+	for _, row := range rows {
+		// A roll's surge slot is temporary and will disappear before handoff.
+		// It must not raise the predecessor's durable serving obligation.
+		if canonicalOnly && row.Index >= app.Replicas {
+			continue
+		}
+		info, ok := mgr.GetReplica(app.Slug, row.Index)
+		if row.Status != db.ReplicaStatusRunning || !ok || info.Status != process.StatusRunning ||
+			row.EndpointURL == "" || prx.ReplicaTargetURL(app.Slug, row.Index) != row.EndpointURL || info.EndpointURL != row.EndpointURL {
+			continue
+		}
+		endpoint, err := url.Parse(row.EndpointURL)
+		if err != nil {
+			continue
+		}
+		conn, err := net.DialTimeout("tcp", endpoint.Host, 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			ready++
+		}
+	}
+	return ready, nil
 }

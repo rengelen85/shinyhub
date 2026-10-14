@@ -21,7 +21,9 @@ var reloadCmd = &cobra.Command{
 		"server.pid_file with a private .reload directory beside it. Exits nonzero if the\n" +
 		"server refuses the reload or the successor fails to become ready.\n" +
 		"--wait allows temporary app transitions to finish before handoff;\n" +
-		"permanent blockers fail immediately. No remote API credentials are used.",
+		"permanent blockers fail immediately. After handoff, readiness has a separate\n" +
+		"server.upgrade_timeout + 1m budget (2m by default), independent of --wait.\n" +
+		"No remote API credentials are used.",
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		cfg, err := config.LoadForMaintenance(serverConfigPath())

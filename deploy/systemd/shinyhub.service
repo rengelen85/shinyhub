@@ -30,7 +30,7 @@ ExecStart=/usr/local/bin/shinyhub serve --config /etc/shinyhub/shinyhub.yaml
 ExecReload=/usr/local/bin/shinyhub reload --config /etc/shinyhub/shinyhub.yaml --wait 10m --output table
 PIDFile=/run/shinyhub/shinyhub.pid
 # Allow transition wait, startup acknowledgement, and fresh readiness budget.
-# Increase with --wait or upgrade_timeout: wait + 2*upgrade_timeout + 70s.
+# Increase with --wait or upgrade_timeout: wait + 2*upgrade_timeout + 75s.
 TimeoutStartSec=14min
 
 # Restart only on genuine failure. A zero-downtime handoff is safe: the
