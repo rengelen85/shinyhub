@@ -1,0 +1,4 @@
+[app]
+replicas = 1
+min_warm_replicas = 1
+max_sessions_per_replica = 0
