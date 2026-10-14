@@ -124,7 +124,7 @@ class Client {
       this.socket.on('open', () => {
         this.sent = performance.now();
         this.sentNS = process.hrtime.bigint();
-        this.socket.send(JSON.stringify({ method: 'init', data: { tick: 0, work_ms: this.index < 20 ? 50 : 5,
+        this.socket.send(JSON.stringify({ method: 'init', data: { tick: 0, profile: false, work_ms: this.index < 20 ? 50 : 5,
           '.clientdata_output_result_hidden': false, '.clientdata_url_protocol': 'http:',
           '.clientdata_url_hostname': '127.0.0.1', '.clientdata_url_pathname': '/app/load/' } }));
       });
@@ -164,7 +164,8 @@ class Client {
               const interval = this.index < 20 ? cadence : 120_000;
               this.tick++; this.pending = true; this.sent = performance.now(); this.next = Date.now() + interval;
               this.sentNS = process.hrtime.bigint();
-              this.socket.send(JSON.stringify({ method: 'update', data: { tick: this.tick } }));
+              this.socket.send(JSON.stringify({ method: 'update', data: { tick: this.tick,
+                profile: workerProfile && phase === 'latency-pressure' } }));
             }, 50);
           }
         } catch (error) {
@@ -338,6 +339,13 @@ try {
     await writeFile(join(work, 'generator.cpuprofile'), JSON.stringify(profileResult.profile));
     generatorProfiler.disconnect(); generatorProfiler = undefined;
     await proxyProfileTask;
+    if (workerProfile) {
+      const output = await docker('exec', container, '/usr/local/bin/python', '-c',
+        'import glob,json,pstats; print(json.dumps([{"path":p,"seconds":pstats.Stats(p).total_tt} for p in glob.glob("/tmp/load-worker-*.pstats")]))');
+      report.worker_profiles = JSON.parse(output);
+      assert.equal(report.worker_profiles.length, replicas, 'every worker produced its diagnostic profile');
+      assert.ok(report.worker_profiles.every(row => row.seconds >= 20), 'worker profiles cover the heavy window');
+    }
     assert.ok(clients.slice(0, 20).every((client, i) => client.acknowledgedTick > before[i]), 'every frequent session makes progress');
     assert.ok(clients.every(client => !client.closed), 'all measured sessions remain available');
     browserDriving = false; await browserTask;

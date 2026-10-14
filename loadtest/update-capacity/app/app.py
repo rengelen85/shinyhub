@@ -10,7 +10,7 @@ import os
 import time
 import uuid
 import cProfile
-import threading
+import asyncio
 from pathlib import Path
 
 from shiny import App, render, ui
@@ -20,20 +20,13 @@ SESSION_KIB = int(os.environ.get("LOAD_SESSION_KIB", "128"))
 DATA_FILE = Path(os.environ["SHINYHUB_APP_DATA"]) / "producer.txt"
 DATA_SNAPSHOT = DATA_FILE.read_text() if DATA_FILE.exists() else "initial"
 
-# Optional diagnostic pass, separate from latency controls: cProfile adds
-# overhead. Keep its snapshots outside app-data and serving publications.
-if Path(__file__).with_name("profile.enabled").exists():
-    profiler = cProfile.Profile()
-    profiler.enable()
-
-    def snapshot_profile():
-        while True:
-            time.sleep(10)
-            profiler.dump_stats(f"/tmp/load-worker-{os.getpid()}.pstats")
-
-    threading.Thread(target=snapshot_profile, daemon=True).start()
+# cProfile changes the workload, so enable it only in a separate diagnostic
+# pass. Start on a pressure-phase input, then stop/dump on the owning thread.
+profiler = cProfile.Profile() if Path(__file__).with_name("profile.enabled").exists() else None
+profile_started = False
 
 app_ui = ui.page_fluid(ui.input_numeric("work_ms", "Computation (CPU milliseconds)", 50, min=1, max=100),
+                       ui.input_checkbox("profile", "Profile worker (diagnostic only)", False),
                        ui.input_action_button("tick", "Compute"), ui.output_text_verbatim("result"))
 
 
@@ -45,6 +38,11 @@ def server(input, output, session):
 
     @render.text
     def result():
+        global profile_started
+        if profiler is not None and input.profile() and not profile_started:
+            profile_started = True
+            profiler.enable()
+            asyncio.get_running_loop().call_later(30, profiler.dump_stats, f"/tmp/load-worker-{os.getpid()}.pstats")
         started_ns = time.monotonic_ns()
         sequence = input.tick()
         cpu_ms = input.work_ms()

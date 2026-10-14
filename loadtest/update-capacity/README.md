@@ -103,7 +103,9 @@ Per-second diagnostics record process CPU counters, host CPU and pressure,
 generator CPU and event-loop delays, and server cgroup throttling. The latency
 profile also collects a 30-second Go CPU profile through the existing
 loopback-only metrics listener and a Node CPU profile. Optional Python profiling
-writes periodic per-worker cProfile snapshots. All profiles stay in the ignored
+writes a 30-second per-worker cProfile snapshot starting on a pressure-phase
+input and rejects profiles that stop before covering the heavy window.
+All profiles stay in the ignored
 evidence directory. Use `go tool pprof -top <path>/proxy.cpu.pprof`, Chromium
 DevTools for `generator.cpuprofile`, and Python `pstats` for `load-worker-*.pstats`.
 
