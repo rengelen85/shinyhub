@@ -115,6 +115,8 @@ func newScaleTestServer(t *testing.T, slug string, replicas int, cfg *config.Con
 	}
 	srv := New(cfg, store, process.NewManager(t.TempDir(), process.NewNativeRuntime()), proxy.New())
 	srv.SetAvailableCPUForTest(func() (float64, error) { return 64, nil })
+	srv.SetHostCapacity(64, "config", 0, "")
+	setTestCPUQuota(srv, 64)
 	return srv, app
 }
 

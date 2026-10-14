@@ -7,8 +7,9 @@ import (
 	"github.com/rvben/shinyhub/internal/admission"
 )
 
-// Fake runtime processes consume no host CPU. Model their kernel allocation
-// alongside the existing headroom sampler, rather than inheriting CI quotas.
+// Lifecycle fixtures model worker budgets alongside their headroom sampler,
+// rather than inheriting unrelated CI quotas. Native load tests exercise real
+// pressure and the default kernel reader.
 func setTestCPUQuota(srv *Server, cores float64) {
 	srv.SetCPUQuotaReaderForTest(admission.NewCgroupReader(fstest.MapFS{
 		"proc/self/cgroup":       {Data: []byte("0::/\n")},
