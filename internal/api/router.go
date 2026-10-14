@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rvben/shinyhub/internal/admission"
 	"github.com/rvben/shinyhub/internal/auth"
 	"github.com/rvben/shinyhub/internal/config"
 	"github.com/rvben/shinyhub/internal/db"
@@ -144,6 +145,7 @@ type Server struct {
 	activateProxyGeneration func(string, int64) (int64, error)
 	availableMemoryMB       func() (int, error)
 	availableCPUCores       func() (float64, error)
+	cpuQuotaReader          *admission.CgroupReader
 	// deployReplica boots a single replica at one index, used by the autoscale
 	// scale-up primitive to grow a pool by one without cycling the whole pool.
 	// Defaults to deploy.RunReplica; overridable in tests.
@@ -783,6 +785,12 @@ func (s *Server) SetAvailableCPUForTest(fn func() (float64, error)) {
 	if fn != nil {
 		s.availableCPUCores = fn
 	}
+}
+
+// SetCPUQuotaReaderForTest models the kernel quota boundary for synthetic
+// runtimes. Nil retains the real kernel reader. Call before requests start.
+func (s *Server) SetCPUQuotaReaderForTest(reader *admission.CgroupReader) {
+	s.cpuQuotaReader = reader
 }
 
 // SetDeployToken installs a pre-shared deploy credential. Must be called before

@@ -199,7 +199,7 @@ try {
   await writeFile(join(work, 'config.yaml'), `server:\n  host: 0.0.0.0\n  port: 8080\n  render_capacity_cores: ${cores}\n  drain_timeout: 12s\n  reload_drain_timeout: 2s\n  reload_sessions: preserve\n  reload_relay_limit: 4\n  pid_file: /state/hub.pid\n  shutdown_apps: stop\n  update_capacity:\n    worker_cpu_request_cores: ${requestCores}\n    reserved_cpu_cores: ${reserveCores}\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: /state/hub.db\nstorage:\n  apps_dir: /state/apps\n  app_data_dir: /state/app-data\nmetrics:\n  enabled: ${profile === 'latency'}\n  addr: 127.0.0.1:9090\nruntime:\n  default_max_sessions_per_replica: 2000\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
   const networkArgs = process.env.LOAD_NETWORK_OWNER ? ['--network', `container:${process.env.LOAD_NETWORK_OWNER}`]
     : [...(process.env.LOAD_NETWORK ? ['--network', process.env.LOAD_NETWORK] : []), '-p', '127.0.0.1::8080'];
-  await docker('run', '-d', '--name', container, '--label', `shinyhub.load_run=${process.env.LOAD_NETWORK || container}`,
+  await docker('run', '-d', '--init', '--name', container, '--label', `shinyhub.load_run=${process.env.LOAD_NETWORK || container}`,
     ...networkArgs, '--cpus', String(cores), '--memory', '2g', '--memory-swap', '2g',
     'shinyhub-update-load:local', 'sleep', 'infinity');
   await docker('exec', container, 'mkdir', '-p', '/state');

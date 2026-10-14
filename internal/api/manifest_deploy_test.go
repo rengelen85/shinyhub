@@ -198,6 +198,7 @@ func buildManifestE2EServer(t *testing.T, runtime config.RuntimeConfig) (srv *Se
 	mgr = process.NewManager(appsDir, fakeRuntime)
 	srv = New(cfg, store, mgr, proxy.New())
 	srv.SetAvailableCPUForTest(func() (float64, error) { return 64, nil })
+	setTestCPUQuota(srv, 64)
 	srv.SetHostCapacity(64, "config", 65536, "config")
 
 	// Replace the deploy runner to inject a no-op health check so tests

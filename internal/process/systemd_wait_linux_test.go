@@ -148,6 +148,24 @@ func TestSystemdExitWaitAcrossUIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Go's build directory is private to root. Copy only this fixture into
+	// an accessible directory so the other UID can execute it.
+	dir, err := os.MkdirTemp("", "shinyhub-cross-uid-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary = filepath.Join(dir, "process.test")
+	if err := os.WriteFile(binary, contents, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	helper := exec.Command(binary, "-test.run=^TestSystemdExitWaitAcrossUIDs$")
 	helper.Env = append(os.Environ(), "SHINYHUB_TEST_WAIT_PID="+strconv.Itoa(worker.Process.Pid))
 	helper.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65533, Gid: 65533}}

@@ -12,6 +12,8 @@ Requires Go, Docker with a Linux engine, and network access to build the two
 local images. The launcher cross-compiles the current ShinyHub source for the
 engine's architecture. It creates an isolated network, server and generator,
 then removes only that run's containers and network. Nothing is published.
+Server and generator containers use Docker's init process to reap orphaned
+children, matching the process-reaping behavior of a normal Linux host.
 Evidence is written to the gitignored `loadtest/results/update-capacity-*`.
 On a Linux host without Go, build the binary in a Go container first and pass
 its absolute path as `LOAD_BINARY_OVERRIDE`. For an exported source archive,

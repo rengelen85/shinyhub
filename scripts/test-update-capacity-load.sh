@@ -40,7 +40,7 @@ if [ "${LOAD_PROFILE:-pressure}" = latency ]; then
     --network "$network" shinyhub-update-load:local sleep infinity >/dev/null
   network_mode="container:$network_owner"
 fi
-docker create --name "$network-driver" --label "shinyhub.load_run=$network" --network "$network_mode" \
+docker create --init --name "$network-driver" --label "shinyhub.load_run=$network" --network "$network_mode" \
   --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
   --mount "type=bind,src=$root,dst=/work" \
   -e LOAD_NETWORK="$network" -e LOAD_BINARY=/binary \

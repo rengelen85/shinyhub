@@ -23,7 +23,17 @@ func (s *Server) checkUpdateCPU(app *db.App, replicas int) error {
 		cores, source = s.hostCapacity.Cores, s.hostCapacity.CoresSource
 	}
 	var available float64
-	cores, err := admission.EffectiveCPUCores(cores)
+	var err error
+	if s.cpuQuotaReader == nil {
+		cores, err = admission.EffectiveCPUCores(cores)
+	} else {
+		var quota float64
+		var limited bool
+		quota, limited, err = s.cpuQuotaReader.CPUCapacity()
+		if limited {
+			cores = math.Min(cores, quota)
+		}
+	}
 	if err == nil && s.availableCPUCores != nil {
 		available, err = s.availableCPUCores()
 	} else if err == nil {

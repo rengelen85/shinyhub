@@ -2520,11 +2520,13 @@ func TestDeleteApp_CleanupFailureRetainsTombstone(t *testing.T) {
 	if err := os.MkdirAll(appsPath, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	// Make the parent read-only so removing demo/ inside it fails (EACCES).
-	if err := os.Chmod(cfg.Storage.AppsDir, 0o500); err != nil {
+	// A looping parent fails cleanup even when Linux CI runs as root, which
+	// can bypass directory permission bits.
+	loop := filepath.Join(t.TempDir(), "loop")
+	if err := os.Symlink(loop, loop); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(cfg.Storage.AppsDir, 0o750) })
+	cfg.Storage.AppsDir = loop
 
 	rr := httptest.NewRecorder()
 	srv.Router().ServeHTTP(rr, authedRequest(t, "DELETE", "/api/apps/demo", nil, token))
