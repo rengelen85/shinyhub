@@ -112,6 +112,46 @@ func TestGroupedRollingRestartUsesDistinctServingIdentity(t *testing.T) {
 	}
 }
 
+func TestGroupedRollCapsWarmSpareSurgeAtWorkerLimit(t *testing.T) {
+	srv, store, token, _, _, rt := buildManifestE2EServer(t, config.RuntimeConfig{})
+	defer srv.Close()
+	rt.serveTraffic = true
+	app := createGenerationTestApp(t, store, "bounded-grouped-roll", 1, 16)
+	if _, err := store.DB().Exec("UPDATE apps SET worker_isolation='grouped',worker_grouped_size=4,worker_max_workers=1,worker_warm_spares=1 WHERE id=?", app.ID); err != nil {
+		t.Fatal(err)
+	}
+	if rec := deployBareGeneration(t, srv, token, app.Slug, "print('serving')", false); rec.Code != http.StatusOK {
+		t.Fatal(rec.Body.String())
+	}
+	srv.cfg.Server.UpdateCapacity.MaxSurgeReplicas = 1
+	srv.SetDeployRunForTest(func(p deploy.Params) (*deploy.PoolResult, error) {
+		p.HealthCheck = func(string, time.Duration, http.RoundTripper) error { return nil }
+		return deploy.Run(p)
+	})
+	app, err := store.GetAppByID(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetServingDeployment(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueRollingRestart(app, before); err != nil {
+		t.Fatal(err)
+	}
+	a, err := store.ClaimNextScheduleActivation(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Roll(context.Background(), a); err != nil {
+		t.Fatalf("one-worker candidate should fit the surge ceiling: %v", err)
+	}
+	after, err := store.GetServingDeployment(app.ID)
+	if err != nil || after.ID == before.ID {
+		t.Fatalf("roll did not publish a new serving generation: %+v %v", after, err)
+	}
+}
+
 func TestGroupedRestartFallbackKeepsAppLockDuringReadiness(t *testing.T) {
 	srv, store, token, _, _, _ := buildManifestE2EServer(t, config.RuntimeConfig{})
 	defer srv.Close()

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -120,7 +119,7 @@ func Request(ctx context.Context, pidFile, scope string, ttl time.Duration) (str
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	c, err := (&net.Dialer{}).DialContext(ctx, "unix", socket(pidFile, pid))
+	c, err := runtimesocket.DialContext(ctx, socket(pidFile, pid))
 	if err != nil {
 		return "", fmt.Errorf("local-token socket unavailable: %w", err)
 	}

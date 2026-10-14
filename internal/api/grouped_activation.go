@@ -91,7 +91,7 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 		return &activation.RetryableError{Reason: "previous grouped generation cleanup is unconfirmed", RetryAfter: 5 * time.Second}
 	}
 	projected := *app
-	projected.Replicas = max(1, 1+app.WorkerWarmSpares)
+	projected.Replicas = groupedCandidateWorkers(app)
 	if !restarting {
 		if err := s.generationHandoffCapacityCheck(&projected); err != nil {
 			if a.RollFallback != "restart" {

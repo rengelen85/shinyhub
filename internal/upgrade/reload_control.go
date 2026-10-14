@@ -5,16 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/rvben/shinyhub/internal/runtimesocket"
 	"io"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rvben/shinyhub/internal/runtimesocket"
 )
 
 type reloadRequest struct {
@@ -283,7 +283,7 @@ func reloadReadinessFailure(ctx context.Context, pidFile string, result ReloadRe
 }
 
 func exchangeReload(ctx context.Context, path string, request reloadRequest) (ReloadResult, error) {
-	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
+	conn, err := runtimesocket.DialContext(ctx, path)
 	if err != nil {
 		return ReloadResult{}, err
 	}

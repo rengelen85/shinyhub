@@ -30,7 +30,7 @@ export const AUDIT_ACTIONS = [
   'announcement.create', 'announcement.update', 'announcement.draft',
   'announcement.published', 'announcement.disabled', 'announcement.archived',
   // Token and service-credential management (amber - security)
-  'create_token', 'delete_token', 'trusted_publish',
+  'create_token', 'delete_token', 'trusted_publish', 'local_token_issued',
   'create_service_credential', 'delete_service_credential',
   // Environment (blue - config)
   'env.set', 'env.delete', 'env.apply',
