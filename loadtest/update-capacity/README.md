@@ -72,3 +72,43 @@ recommendations**. Adjust with `LOAD_CPU_REQUEST`, `LOAD_CPU_RESERVE` and
 This fixture tests lifecycle behavior, not the throughput of a real dashboard.
 Production sizing must include that dashboard's computation, data, libraries,
 background work and latency target.
+
+## Locating reactive latency
+
+Run these controls sequentially on an otherwise idle Linux engine:
+
+```sh
+LOAD_PROFILE=latency bash scripts/test-update-capacity-load.sh
+LOAD_PROFILE=latency LOAD_DIRECT=1 bash scripts/test-update-capacity-load.sh
+LOAD_PROFILE=latency LOAD_REPLICAS=2 bash scripts/test-update-capacity-load.sh
+LOAD_PROFILE=latency LOAD_CORES=1 bash scripts/test-update-capacity-load.sh
+# Separate diagnostic pass: Python profiling changes the measured workload.
+LOAD_PROFILE=latency LOAD_WORKER_PROFILE=1 bash scripts/test-update-capacity-load.sh
+```
+
+The latency profile uses four cores by default and holds the heavy workload
+for 60 seconds after the same ramp and light phase. It performs no update.
+Two-worker controls must actually distribute initialized sessions over both
+workers. The direct control requires one worker. Both proxied and direct latency
+controls share a network namespace with their server to reach its loopback-bound
+native workers, while retaining separate compute and memory cgroups.
+
+Each computation records Linux monotonic timestamps at the client send, Python
+render start/finish, and client receipt. The report separates input-to-render
+waiting (including input transport), render execution, and result delivery.
+Initialization is excluded from those component quantiles. Component p95 values
+must not be added: their percentiles need not describe the same request.
+
+Per-second diagnostics record process CPU counters, host CPU and pressure,
+generator CPU and event-loop delays, and server cgroup throttling. The latency
+profile also collects a 30-second Go CPU profile through the existing
+loopback-only metrics listener and a Node CPU profile. Optional Python profiling
+writes periodic per-worker cProfile snapshots. All profiles stay in the ignored
+evidence directory. Use `go tool pprof -top <path>/proxy.cpu.pprof`, Chromium
+DevTools for `generator.cpuprofile`, and Python `pstats` for `load-worker-*.pstats`.
+
+Inspect host and generator measurements before attributing latency to ShinyHub.
+A single synchronous Python render runs on one worker regardless of the server's
+total CPU allocation. Multiple workers can spread independent sessions; they
+do not parallelize one session's computation. Availability assertions alone do
+not establish acceptable response time.

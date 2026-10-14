@@ -9,6 +9,8 @@ import json
 import os
 import time
 import uuid
+import cProfile
+import threading
 from pathlib import Path
 
 from shiny import App, render, ui
@@ -17,6 +19,19 @@ VERSION = Path(__file__).with_name("version.txt").read_text().strip()
 SESSION_KIB = int(os.environ.get("LOAD_SESSION_KIB", "128"))
 DATA_FILE = Path(os.environ["SHINYHUB_APP_DATA"]) / "producer.txt"
 DATA_SNAPSHOT = DATA_FILE.read_text() if DATA_FILE.exists() else "initial"
+
+# Optional diagnostic pass, separate from latency controls: cProfile adds
+# overhead. Keep its snapshots outside app-data and serving publications.
+if Path(__file__).with_name("profile.enabled").exists():
+    profiler = cProfile.Profile()
+    profiler.enable()
+
+    def snapshot_profile():
+        while True:
+            time.sleep(10)
+            profiler.dump_stats(f"/tmp/load-worker-{os.getpid()}.pstats")
+
+    threading.Thread(target=snapshot_profile, daemon=True).start()
 
 app_ui = ui.page_fluid(ui.input_numeric("work_ms", "Computation (CPU milliseconds)", 50, min=1, max=100),
                        ui.input_action_button("tick", "Compute"), ui.output_text_verbatim("result"))
@@ -30,6 +45,7 @@ def server(input, output, session):
 
     @render.text
     def result():
+        started_ns = time.monotonic_ns()
         sequence = input.tick()
         cpu_ms = input.work_ms()
         end = time.process_time() + (cpu_ms / 1000 if sequence else 0)
@@ -37,7 +53,8 @@ def server(input, output, session):
             pass
         return json.dumps(dict(session=identity, tick=sequence, version=VERSION,
                                memory_bytes=len(memory), cpu_ms=cpu_ms, process_pid=os.getpid(),
-                               data_snapshot=DATA_SNAPSHOT))
+                               data_snapshot=DATA_SNAPSHOT, render_started_ns=str(started_ns),
+                               render_finished_ns=str(time.monotonic_ns())))
 
 
 app = App(app_ui, server)

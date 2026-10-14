@@ -9,6 +9,8 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { Session } from 'node:inspector';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const require = createRequire(join(root, 'package.json'));
@@ -17,24 +19,36 @@ const WebSocket = require('ws');
 const { chromium } = createRequire(join(root, 'loadtest/render/driver/package.json'))('playwright');
 const binary = resolve(process.env.LOAD_BINARY || '/tmp/shinyhub-linux-load');
 const profile = process.env.LOAD_PROFILE || 'pressure';
-assert.ok(['pressure', 'roomy'].includes(profile));
+assert.ok(['pressure', 'roomy', 'latency'].includes(profile));
+const replicas = Number(process.env.LOAD_REPLICAS || 1);
+const direct = process.env.LOAD_DIRECT === '1';
+const workerProfile = process.env.LOAD_WORKER_PROFILE === '1';
+assert.ok(Number.isInteger(replicas) && replicas >= 1 && replicas <= 4);
+assert.ok(!direct || (profile === 'latency' && replicas === 1), 'direct control needs one worker');
+assert.ok(profile === 'latency' || replicas === 1, 'lifecycle assertions expect one canonical worker');
 const sessions = Number(process.env.LOAD_SESSIONS || 1000);
-const cores = Number(process.env.LOAD_CORES || (profile === 'roomy' ? 4 : 1));
-const requestCores = Number(process.env.LOAD_CPU_REQUEST || (profile === 'roomy' ? 1 : 0.35));
-const reserveCores = Number(process.env.LOAD_CPU_RESERVE || (profile === 'roomy' ? 0.5 : 0.1));
+const cores = Number(process.env.LOAD_CORES || (profile === 'pressure' ? 1 : 4));
+const requestCores = Number(process.env.LOAD_CPU_REQUEST || (profile === 'pressure' ? 0.35 : 1));
+const reserveCores = Number(process.env.LOAD_CPU_RESERVE || (profile === 'pressure' ? 0.1 : 0.5));
 assert.ok(Number.isInteger(sessions) && sessions > 0 && sessions <= 1000);
 const work = await mkdtemp(join(root, 'loadtest/results/update-capacity-'));
 const container = `shinyhub-load-${randomBytes(6).toString('hex')}`;
 const password = randomBytes(24).toString('hex');
-const report = { status: 'failed', settings: { profile, sessions, cores, memory_mib: 2048,
+const report = { status: 'failed', settings: { profile, sessions, replicas, direct, workerProfile, cores, memory_mib: 2048,
   request_cores: requestCores, reserve_cores: reserveCores, active_cpu_ms_per_render: 50,
   background_cpu_ms_per_render: 5, active_sessions: 20, protocol_compression: false,
   session_kib: 128 }, phases: {}, events: [], samples: [] };
 let host, token, phase = 'setup', cadence = 120_000, sampling = false, probing = false;
+let sessionHost, sessionPath = '/app/load/';
+const loopDelay = monitorEventLoopDelay({ resolution: 10 });
+loopDelay.enable();
 let browser, browserPage, browserTask, browserDriving = false, browserPlanned = false;
 const browserSockets = [];
 let sampleTask, probeTask;
 let sampleFailure;
+let proxyProfileTask, generatorProfiler;
+const inspectorPost = (method) => new Promise((resolve, reject) => generatorProfiler.post(method,
+  (error, value) => error ? reject(error) : resolve(value)));
 const clients = [];
 const activeCommands = new Set();
 const timeout = setTimeout(() => {
@@ -73,6 +87,7 @@ const event = (name, data = {}) => {
   report.events.push({ name, phase, at: new Date().toISOString(), ...data });
 };
 const metrics = () => report.phases[phase] ||= { latencies_ms: [], page_latencies_ms: [],
+  input_to_render_ms: [], render_ms: [], output_delivery_ms: [], per_worker_acknowledgements: {},
   page_errors: [], socket_errors: [], unexpected_closes: 0, planned_closes: 0, acknowledgements: 0 };
 async function api(path = '', method = 'GET', body, expected = 200) {
   const res = await fetch(host + '/api/apps/load' + path, { method,
@@ -92,12 +107,12 @@ const running = state => state.replicas_status.filter(row => row.status === 'run
 class Client {
   constructor(index) { this.index = index; this.tick = 0; this.closed = false; this.planned = false; }
   async connect() {
-    const page = await fetch(host + '/app/load/', { signal: AbortSignal.timeout(30_000),
+    const page = await fetch(sessionHost + sessionPath, { signal: AbortSignal.timeout(30_000),
       headers: { 'User-Agent': 'shinyhub-load-test' } });
     assert.equal(page.status, 200, `client ${this.index} page`);
     await page.arrayBuffer();
     const cookie = page.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
-    this.socket = new WebSocket(host.replace('http:', 'ws:') + '/app/load/websocket/', {
+    this.socket = new WebSocket(sessionHost.replace('http:', 'ws:') + sessionPath + 'websocket/', {
       // Real users have separate browser decoders. A single Node process's
       // shared zlib pool otherwise queues pings behind 1,000 compressed streams.
       perMessageDeflate: false,
@@ -108,6 +123,7 @@ class Client {
       this.socket.on('error', error => { metrics().socket_errors.push(String(error)); reject(error); });
       this.socket.on('open', () => {
         this.sent = performance.now();
+        this.sentNS = process.hrtime.bigint();
         this.socket.send(JSON.stringify({ method: 'init', data: { tick: 0, work_ms: this.index < 20 ? 50 : 5,
           '.clientdata_output_result_hidden': false, '.clientdata_url_protocol': 'http:',
           '.clientdata_url_hostname': '127.0.0.1', '.clientdata_url_pathname': '/app/load/' } }));
@@ -128,6 +144,16 @@ class Client {
           this.dataSnapshot = result.data_snapshot;
           metrics().latencies_ms.push(performance.now() - this.sent);
           metrics().acknowledgements++;
+          metrics().per_worker_acknowledgements[result.process_pid] = (metrics().per_worker_acknowledgements[result.process_pid] || 0) + 1;
+          if (result.tick > 0) {
+            const started = BigInt(result.render_started_ns), finished = BigInt(result.render_finished_ns);
+            const received = process.hrtime.bigint();
+            // Containers share the same Linux CLOCK_MONOTONIC clock.
+            assert.ok(started >= this.sentNS && received >= finished, 'cross-container monotonic timing');
+            metrics().input_to_render_ms.push(Number(started - this.sentNS) / 1e6);
+            metrics().render_ms.push(Number(finished - started) / 1e6);
+            metrics().output_delivery_ms.push(Number(received - finished) / 1e6);
+          }
           this.acknowledgedTick = result.tick;
           this.pending = false;
           if (!this.established) {
@@ -137,6 +163,7 @@ class Client {
               if (this.closed || this.pending || Date.now() < this.next) return;
               const interval = this.index < 20 ? cadence : 120_000;
               this.tick++; this.pending = true; this.sent = performance.now(); this.next = Date.now() + interval;
+              this.sentNS = process.hrtime.bigint();
               this.socket.send(JSON.stringify({ method: 'update', data: { tick: this.tick } }));
             }, 50);
           }
@@ -165,10 +192,15 @@ try {
   report.binary_sha256 = createHash('sha256').update(await readFile(binary)).digest('hex');
   report.image = JSON.parse(await docker('image', 'inspect', 'shinyhub-update-load:local'))[0].Id;
   await cp(join(root, 'loadtest/update-capacity/app'), join(work, 'input'), { recursive: true });
+  if (workerProfile) await writeFile(join(work, 'input/profile.enabled'), 'diagnostic only\n');
+  await writeFile(join(work, 'input/shinyhub.toml'), `[app]\nreplicas = ${replicas}\nmin_warm_replicas = ${replicas}\nmax_sessions_per_replica = 0\n`);
   await writeFile(join(work, 'password'), password, { mode: 0o600 });
-  await writeFile(join(work, 'config.yaml'), `server:\n  host: 0.0.0.0\n  port: 8080\n  render_capacity_cores: ${cores}\n  drain_timeout: 12s\n  reload_drain_timeout: 2s\n  reload_sessions: preserve\n  reload_relay_limit: 4\n  pid_file: /state/hub.pid\n  shutdown_apps: stop\n  update_capacity:\n    worker_cpu_request_cores: ${requestCores}\n    reserved_cpu_cores: ${reserveCores}\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: /state/hub.db\nstorage:\n  apps_dir: /state/apps\n  app_data_dir: /state/app-data\nruntime:\n  default_max_sessions_per_replica: 2000\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
-  await docker('run', '-d', '--name', container, '--label', `shinyhub.load_run=${process.env.LOAD_NETWORK || container}`, ...(process.env.LOAD_NETWORK ? ['--network', process.env.LOAD_NETWORK] : []), '--cpus', String(cores), '--memory', '2g',
-    '--memory-swap', '2g', '-p', '127.0.0.1::8080', 'shinyhub-update-load:local', 'sleep', 'infinity');
+  await writeFile(join(work, 'config.yaml'), `server:\n  host: 0.0.0.0\n  port: 8080\n  render_capacity_cores: ${cores}\n  drain_timeout: 12s\n  reload_drain_timeout: 2s\n  reload_sessions: preserve\n  reload_relay_limit: 4\n  pid_file: /state/hub.pid\n  shutdown_apps: stop\n  update_capacity:\n    worker_cpu_request_cores: ${requestCores}\n    reserved_cpu_cores: ${reserveCores}\nauth:\n  secret: ${randomBytes(32).toString('hex')}\ndatabase:\n  dsn: /state/hub.db\nstorage:\n  apps_dir: /state/apps\n  app_data_dir: /state/app-data\nmetrics:\n  enabled: ${profile === 'latency'}\n  addr: 127.0.0.1:9090\nruntime:\n  default_max_sessions_per_replica: 2000\nlifecycle:\n  hibernate_timeout: 30m\n`, { mode: 0o600 });
+  const networkArgs = process.env.LOAD_NETWORK_OWNER ? ['--network', `container:${process.env.LOAD_NETWORK_OWNER}`]
+    : [...(process.env.LOAD_NETWORK ? ['--network', process.env.LOAD_NETWORK] : []), '-p', '127.0.0.1::8080'];
+  await docker('run', '-d', '--name', container, '--label', `shinyhub.load_run=${process.env.LOAD_NETWORK || container}`,
+    ...networkArgs, '--cpus', String(cores), '--memory', '2g', '--memory-swap', '2g',
+    'shinyhub-update-load:local', 'sleep', 'infinity');
   await docker('exec', container, 'mkdir', '-p', '/state');
   await docker('cp', binary, `${container}:/opt/shinyhub`);
   await docker('cp', join(work, 'config.yaml'), `${container}:/state/config.yaml`);
@@ -176,7 +208,8 @@ try {
   await docker('cp', join(work, 'input'), `${container}:/input`);
   report.linux_kernel = (await docker('exec', container, 'uname', '-r')).trim();
   report.cgroup_limits = (await docker('exec', container, 'sh', '-c', 'cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max')).trim();
-  host = process.env.LOAD_NETWORK ? `http://${container}:8080` : 'http://' + (await docker('port', container, '8080/tcp')).trim();
+  host = process.env.LOAD_NETWORK_OWNER ? 'http://127.0.0.1:8080'
+    : process.env.LOAD_NETWORK ? `http://${container}:8080` : 'http://' + (await docker('port', container, '8080/tcp')).trim();
   await command(['docker', 'exec', container, '/opt/shinyhub', 'init', '--config', '/state/config.yaml',
     '--admin-user', 'load-admin', '--admin-password-file', '/state/password'], 'init');
   await docker('exec', '-d', container, 'sh', '-c', 'exec /opt/shinyhub serve --config /state/config.yaml --no-browser > /state/server.log 2>&1');
@@ -186,12 +219,26 @@ try {
     body: JSON.stringify({ username: 'load-admin', password }) });
   assert.equal(login.status, 200); ({ token } = await login.json());
   await deploy('initial-deploy');
+  sessionHost = host;
+  if (direct) {
+    const state = await api();
+    assert.ok(process.env.LOAD_NETWORK_OWNER, 'direct control shares the worker network namespace');
+    sessionHost = `http://127.0.0.1:${running(state)[0].port}`;
+    sessionPath = '/';
+  }
+  report.process_clock_ticks = Number((await docker('exec', container, 'getconf', 'CLK_TCK')).trim());
   sampling = true;
   sampleTask = (async () => {
     while (sampling) {
       const began = Date.now();
       const raw = await docker('exec', container, 'sh', '-c', 'cat /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events');
-      report.samples.push({ phase, at_ms: began, raw, app: await api('/metrics') });
+      const diagnostics = profile === 'latency' ? await docker('exec', container, 'sh', '-c',
+        'for p in /proc/[0-9]*/stat; do cat "$p" 2>/dev/null || true; done') : undefined;
+      report.samples.push({ phase, at_ms: began, raw, app: await api('/metrics'), diagnostics,
+        host_cpu: await readFile('/proc/stat', 'utf8'), host_pressure: await readFile('/proc/pressure/cpu', 'utf8'),
+        generator_cpu: process.cpuUsage(), generator_cgroup: await readFile('/sys/fs/cgroup/cpu.stat', 'utf8'),
+        generator_event_loop_p99_ms: loopDelay.percentile(99) / 1e6 });
+      loopDelay.reset();
       await delay(Math.max(0, 1000 - (Date.now() - began)));
     }
   })();
@@ -232,7 +279,7 @@ try {
       else metrics().unexpected_closes++;
     });
   });
-  assert.equal((await browserPage.goto(host + '/app/load/')).status(), 200);
+  assert.equal((await browserPage.goto(sessionHost + sessionPath)).status(), 200);
   await browserPage.waitForFunction(() => document.querySelector('#result')?.textContent.includes('"session"'), undefined, { timeout: 60_000 });
   const browserIdentity = JSON.parse(await browserPage.locator('#result').textContent()).session;
   report.browser = { session: browserIdentity, acknowledged_inputs: 0, failures: [] };
@@ -268,8 +315,35 @@ try {
   assert.equal(report.established_sessions, sessions, 'every client has a live, initialized Shiny session');
   assert.equal(report.unique_sessions, sessions, 'each connection owns an independent reactive session');
   // The API counts in-flight HTTP requests alongside WebSockets.
-  assert.ok(report.observed_active_connections >= sessions, 'server accounts for every initialized session');
-  if (profile === 'roomy') {
+  if (!direct) assert.ok(report.observed_active_connections >= sessions, 'server accounts for every initialized session');
+  report.sessions_per_worker = Object.fromEntries([...new Set(clients.map(client => client.processPID))]
+    .map(pid => [pid, clients.filter(client => client.processPID === pid).length]));
+  assert.equal(Object.keys(report.sessions_per_worker).length, replicas, 'all configured workers serve initialized sessions');
+  if (profile === 'latency') {
+    phase = 'latency-pressure'; cadence = 1000;
+    clients.slice(0, 20).forEach(client => { client.next = Date.now() + client.index * 50; });
+    event('measure worker queue, transport, generator and host under identical computation');
+    const before = clients.slice(0, 20).map(client => client.acknowledgedTick);
+    generatorProfiler = new Session(); generatorProfiler.connect();
+    await inspectorPost('Profiler.enable'); await inspectorPost('Profiler.start');
+    proxyProfileTask = (async () => {
+      const response = await fetch('http://127.0.0.1:9090/debug/pprof/profile?seconds=30',
+        { signal: AbortSignal.timeout(45_000), headers: { 'User-Agent': 'shinyhub-load-test' } });
+      assert.equal(response.status, 200, 'loopback proxy CPU profile');
+      await writeFile(join(work, 'proxy.cpu.pprof'), Buffer.from(await response.arrayBuffer()));
+    })();
+    proxyProfileTask.catch(error => { sampleFailure = error; });
+    await delay(60_000);
+    const profileResult = await inspectorPost('Profiler.stop');
+    await writeFile(join(work, 'generator.cpuprofile'), JSON.stringify(profileResult.profile));
+    generatorProfiler.disconnect(); generatorProfiler = undefined;
+    await proxyProfileTask;
+    assert.ok(clients.slice(0, 20).every((client, i) => client.acknowledgedTick > before[i]), 'every frequent session makes progress');
+    assert.ok(clients.every(client => !client.closed), 'all measured sessions remain available');
+    browserDriving = false; await browserTask;
+    assert.deepEqual(report.browser.failures, []);
+    event('latency control completed', { sessions_per_worker: report.sessions_per_worker });
+  } else if (profile === 'roomy') {
     phase = 'roomy-update'; cadence = 1000;
     clients.slice(0, 20).forEach(client => { client.next = Date.now() + client.index * 50; });
     event('validate a complete replacement with one-core requests and a half-core reserve');
@@ -421,9 +495,18 @@ try {
   probing = sampling = false;
   await Promise.allSettled([sampleTask, probeTask]);
   await docker('cp', `${container}:/state/server.log`, join(work, 'server.log')).catch(() => {});
+  if (workerProfile) {
+    const profiles = await docker('exec', container, 'sh', '-c', 'ls /tmp/load-worker-*.pstats').catch(() => '');
+    for (const path of profiles.trim().split('\n')) {
+      if (/^\/tmp\/load-worker-\d+\.pstats$/.test(path))
+        await docker('cp', `${container}:${path}`, join(work, path.split('/').at(-1))).catch(() => {});
+    }
+  }
   await command(['docker', 'inspect', container], 'container-inspect').catch(() => {});
   await docker('rm', '-f', container).catch(() => {});
   clearTimeout(timeout);
+  loopDelay.disable();
+  generatorProfiler?.disconnect();
   for (const data of Object.values(report.phases)) {
     const summary = values => {
       values.sort((a, b) => a - b);
@@ -432,6 +515,7 @@ try {
     };
     data.reactive_latency_ms = summary(data.latencies_ms); delete data.latencies_ms;
     data.page_latency_ms = summary(data.page_latencies_ms); delete data.page_latencies_ms;
+    for (const key of ['input_to_render_ms', 'render_ms', 'output_delivery_ms']) data[key] = summary(data[key]);
   }
   for (const [name, data] of Object.entries(report.phases)) {
     const samples = report.samples.filter(sample => sample.phase === name);
