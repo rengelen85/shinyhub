@@ -6,7 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.20.8](https://github.com/rvben/shinyhub/compare/v0.20.6...v0.20.8) - 2026-10-14
+
 ### Fixed
+
+- **schedules**: restore the app's lifecycle state after all failed producers are repaired, and replace quarantined consumers across multiplex, grouped, and per-session worker isolation. Operator stops and deletion take precedence. Recovery intent survives hub restarts; failures recorded by older versions still need one manual `shinyhub apps start` after repair.
+- **diagnostics**: audit and log producer-driven app status changes with the run ID and reason, expose the failure in app details, and return an unavailable page with HTTP 503 while the app is failed.
+- **reload**: finish admitted producers before preserving handoff and require ready successor replicas before acknowledging reload success.
 
 - **capacity**: resolve nested and namespaced cgroup limits, account for shared ancestor CPU and memory usage, and honor v1 controllers on hybrid hosts. Parallel updates now account for live worker CPU requests independently of utilization, with configurable CPU requests, reserves and surge ceilings that include draining generations.
 
@@ -29,10 +35,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **diagnostics**: refresh producer failure reasons after additional failures and partial repairs so they identify an outstanding blocker instead of an already-repaired producer.
 - **schedules**: avoid a hub panic when producer-failure cleanup encounters empty replica slots, and restore repaired apps when the last queued publisher ends without writing data.
 - **diagnostics**: recognize failed apps in CLI readiness checks and the dashboard's Needs attention list, with immediate failure reporting instead of timeout and CLI upgrade advice.
-
-## [0.20.8](https://github.com/rvben/shinyhub/compare/v0.20.7...v0.20.8) - 2026-10-13
-
-### Fixed
 
 - **data**: prevent symlink races in file downloads ([3978864](https://github.com/rvben/shinyhub/commit/3978864924a3b5245baf8cce572204b4318098ac))
 
