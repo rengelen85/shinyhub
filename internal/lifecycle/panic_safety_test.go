@@ -88,6 +88,10 @@ func TestDriveWakingApp_FatalPanicPropagates(t *testing.T) {
 		done := w.driveWakingApp(context.Background(), "app", "reconcile")
 		select {
 		case <-done:
+			// done closes in a defer while the fatal panic is still unwinding.
+			// Keep the child alive so its test runner cannot exit successfully
+			// before the runtime reports the panic on the wake goroutine.
+			time.Sleep(5 * time.Second)
 		case <-time.After(5 * time.Second):
 		}
 		return // reaching here means the Fatal was absorbed
