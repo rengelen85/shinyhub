@@ -2,6 +2,7 @@
   "name": "demo-websocket-runtime-test",
   "main": "websocket-worker.ts",
   "compatibility_date": "2026-08-15",
+  "compatibility_flags": ["web_socket_manual_reply_to_close"],
   "durable_objects": {
     "bindings": [{ "name": "RELAY", "class_name": "Relay" }]
   },

@@ -36,12 +36,18 @@ apps. `/__demo/status` reads lifecycle state without waking the container or
 extending its idle deadline; use it when waiting for a natural sleep cycle.
 
 The WebSocket relay coordinates both close handshakes with
-`accept({ allowHalfOpen: true })`, forwards text and binary frames in order, and
+the Durable Object inbound WebSocket API and a half-open outbound socket,
+forwards text and binary frames in order, and
 renews activity for messages. Active sockets defer idle shutdown; after the last
 socket closes, the normal ten-minute idle window applies. A missing close
 acknowledgement has a five-second deadline and emits `demo_websocket_failed`.
 HTTP continues to use the container SDK. This is a focused workaround for the
 SDK relay; retain the runtime tests when changing the SDK or compatibility date.
+The inbound socket uses `ctx.acceptWebSocket` to avoid workerd's uncaught
+`Network connection lost` error on clean client disconnects (workerd issue 5290).
+`web_socket_manual_reply_to_close` preserves coordinated close handling for this
+API; the backend uses `accept({ allowHalfOpen: true })`. Accepted outbound sockets
+keep the object awake while their relay exists.
 The outer Worker passes upgrades through unchanged. A second terminating relay
 can turn a normal DO close into an abnormal cross-isolate disconnect.
 
@@ -51,7 +57,10 @@ tail before the suite, repeats marked passive status requests until registration
 has propagated, and requires normal close evidence from both proxy ends for all
 three apps. A
 correlated exception, error log, failed invocation, missing evidence, or lost tail
-fails verification even if the client reported success.
+fails verification even if the client reported success. The live tail does not
+reliably include Durable Object platform exceptions: after deployment, also check
+persisted Cloudflare Workers Logs for the deployed version and marked smoke URLs.
+A passing client or tail check alone is insufficient.
 Successful streamed HTTP responses may have a `canceled` invocation outcome;
 these require the client HTTP checks to pass and never substitute for WebSocket
 close evidence. Synthetic WebSocket clients send a correlation header because
@@ -272,7 +281,10 @@ environment):
 node scripts/demo-smoke-verified.mjs  # from the repository root
 ```
 
-No production change is needed for the local runtime regression test:
+The local runtime regression test checks text/binary forwarding, client/backend
+initiated closes, immediate and simultaneous closes, and both relay close codes.
+It also fails on uncaught workerd diagnostics even when client assertions pass.
+No production change is needed to run it:
 
 ```bash
 npm run test:runtime  # from deploy/cloudflare-demo

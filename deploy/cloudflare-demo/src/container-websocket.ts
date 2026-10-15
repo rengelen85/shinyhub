@@ -1,3 +1,5 @@
+import type { WebSocketControl } from "./durable-websocket-clients.ts";
+
 // A proxy must complete both close handshakes before acknowledging the client.
 // Otherwise the client can report a clean close while the backend is torn down.
 export function bridgeContainerWebSocket(
@@ -6,6 +8,7 @@ export function bridgeContainerWebSocket(
   activity: () => void,
   completed: (result: { clean: boolean; codes: number[] }) => void,
   closeTimeoutMS = 5_000,
+  clientControl: WebSocketControl = client,
 ): Promise<void> {
   let resolveCompletion!: () => void;
   const completion = new Promise<void>(resolve => { resolveCompletion = resolve; });
@@ -21,7 +24,10 @@ export function bridgeContainerWebSocket(
     if (finished) return;
     finished = true;
     if (timer !== undefined) clearTimeout(timer);
-    try { completed({ clean, codes }); } finally { resolveCompletion(); }
+    try { completed({ clean, codes }); } finally {
+      clientControl.dispose?.();
+      resolveCompletion();
+    }
   };
   const fail = () => {
     if (finished) return;
@@ -32,9 +38,10 @@ export function bridgeContainerWebSocket(
     finish();
   };
   sockets.forEach((socket, index) => {
+    const control = index === 0 ? clientControl : socket;
     const peer = sockets[1 - index];
     socket.binaryType = "arraybuffer";
-    socket.addEventListener("message", (event) => {
+    control.addEventListener("message", (event) => {
       if (finished || closed.some(Boolean)) return;
       activity();
       queues[index] = queues[index].then(async () => {
@@ -43,7 +50,7 @@ export function bridgeContainerWebSocket(
         peer.send(data);
       }).catch(fail);
     });
-    socket.addEventListener("close", (event) => {
+    control.addEventListener("close", (event) => {
       if (finished || closed[index]) return;
       closed[index] = true;
       codes[index] = event.code;
@@ -57,10 +64,10 @@ export function bridgeContainerWebSocket(
         else timer ??= setTimeout(fail, closeTimeoutMS);
       }).catch(fail);
     });
-    socket.addEventListener("error", fail);
+    control.addEventListener("error", fail);
   });
   try {
-    client.accept({ allowHalfOpen: true });
+    clientControl.accept({ allowHalfOpen: true });
     backend.accept({ allowHalfOpen: true });
   } catch (error) {
     fail();

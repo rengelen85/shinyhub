@@ -1,5 +1,6 @@
 import { Container, getContainer } from "@cloudflare/containers";
 import { bridgeContainerWebSocket } from "./container-websocket.ts";
+import { DurableWebSocketClients } from "./durable-websocket-clients.ts";
 import { SmokeWebSocketEvidence, validSmokeID } from "./websocket-evidence.ts";
 import demoEntrypoint from "../entrypoint.sh";
 import { createDemoWorker } from "./demo-worker.ts";
@@ -16,7 +17,16 @@ export class ShinyHubDemo extends Container {
   entrypoint = ["/bin/sh", "-c", demoEntrypoint];
 
   private activeWebSockets = 0;
+  private websocketClients = new DurableWebSocketClients(this.ctx);
   private smokeEvidence = new SmokeWebSocketEvidence();
+
+  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
+    this.websocketClients.message(socket, message);
+  }
+  webSocketClose(socket: WebSocket, code: number, reason: string, wasClean: boolean): void {
+    this.websocketClients.close(socket, code, reason, wasClean);
+  }
+  webSocketError(socket: WebSocket): void { this.websocketClients.error(socket); }
 
   getSmokeWebSocketResults(id: string) { return this.smokeEvidence.read(id); }
 
@@ -55,7 +65,7 @@ export class ShinyHubDemo extends Container {
       };
       if (result.clean) console.info(log);
       else console.error(log);
-    }));
+    }, 5_000, this.websocketClients.control(pair[1])));
     return new Response(null, { status: 101, webSocket: pair[0], headers: upstream.headers });
   }
 

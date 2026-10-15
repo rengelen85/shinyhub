@@ -1,3 +1,4 @@
+import { DurableWebSocketClients } from "../src/durable-websocket-clients.ts";
 import { DurableObject } from "cloudflare:workers";
 import { bridgeContainerWebSocket } from "../src/container-websocket.ts";
 
@@ -10,6 +11,18 @@ export default {
 };
 
 export class Relay extends DurableObject {
+  private clients = new DurableWebSocketClients(this.ctx);
+  webSocketMessage(ws: WebSocket, data: string | ArrayBuffer) { this.clients.message(ws, data); }
+  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    const mode = ws.deserializeAttachment();
+    // A client-initiated close must remain half open until the backend replies.
+    // Backend-initiated closes have already sent our client-side close frame.
+    if (mode !== "backend" && ws.readyState !== WebSocket.CLOSING) {
+      throw new Error("Inbound close was acknowledged before relay coordination");
+    }
+    this.clients.close(ws, code, reason, wasClean);
+  }
+  webSocketError(ws: WebSocket) { this.clients.error(ws); }
   private results = new Map<string, unknown>();
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -19,8 +32,9 @@ export class Relay extends DurableObject {
       headers: { upgrade: "websocket" },
     });
     const middle = new WebSocketPair();
+    middle[1].serializeAttachment(url.searchParams.get("mode"));
     this.ctx.waitUntil(bridgeContainerWebSocket(middle[1], upstream.webSocket!, () => {},
-      result => this.results.set(id, result)));
+      result => this.results.set(id, result), 5000, this.clients.control(middle[1])));
     return new Response(null, { status: 101, webSocket: middle[0], headers: upstream.headers });
   }
 }

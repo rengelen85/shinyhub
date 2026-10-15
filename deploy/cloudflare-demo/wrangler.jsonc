@@ -3,6 +3,7 @@
   "name": "shinyhub-demo",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
+  "compatibility_flags": ["web_socket_manual_reply_to_close"],
   "workers_dev": false,
   "rules": [
     {

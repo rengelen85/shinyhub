@@ -113,3 +113,32 @@ test("invocation lifetime remains pending until both close acknowledgements or t
   await missing.completion;
   assert.equal(missing.results[0].clean, false);
 });
+
+test("Durable Object event delivery releases its registration on close and failure", async () => {
+  for (const failure of [false, true]) {
+    const client = new Socket(), backend = new Socket(), delivery = new Socket();
+    let disposed = 0;
+    const control = {
+      accept: () => { delivery.accepted = true; },
+      addEventListener: delivery.addEventListener.bind(delivery),
+      dispose: () => { disposed++; },
+    };
+    const results: unknown[] = [];
+    const completion = bridgeContainerWebSocket(client as unknown as WebSocket, backend as unknown as WebSocket,
+      () => {}, result => results.push(result), 50, control as unknown as WebSocket);
+    delivery.message("message from DO handler");
+    await flush();
+    assert.deepEqual(backend.sent, ["message from DO handler"]);
+    assert.equal(client.accepted, undefined);
+    if (failure) delivery.dispatchEvent(new Event("error"));
+    else {
+      delivery.ended();
+      await flush();
+      assert.equal(disposed, 0);
+      backend.ended();
+    }
+    await completion;
+    assert.equal(disposed, 1);
+    assert.deepEqual(results, [{ clean: !failure, codes: failure ? [1006, 1006] : [1000, 1000] }]);
+  }
+});

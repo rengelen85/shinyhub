@@ -137,6 +137,12 @@ jobs:
       - name: Test (demo Worker)
         run: make test-worker
 
+      - name: Test WebSocket forwarding in the Workers runtime
+        working-directory: deploy/cloudflare-demo
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: npm run test:runtime
+
       - name: Test application startup readiness and error alerts
         working-directory: deploy/cloudflare-demo
         run: python3 -m unittest test_startup_readiness.py test_worker_errors_alert.py
