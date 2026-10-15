@@ -19,7 +19,11 @@ jobs:
       lock: true
       min-age: 7d
       max-bump: minor
-      prepare-command: python3 -m pip install uv
+      # The tracing tests require 3.14+gil. Install the regular build explicitly:
+      # uv can discover it with +gil but cannot download that variant request.
+      prepare-command: >-
+        python3 -m pip install uv &&
+        uv python install 3.14
       # make test is test-go, test-js and test-worker, so a target added there is
       # validated here without editing this list. The demo Worker is a separate
       # npm package with its own dependencies, so it is installed and type-checked
@@ -27,11 +31,11 @@ jobs:
       # reach the release deploy unvalidated.
       validation-command: >-
         npm ci &&
+        (cd deploy/cloudflare-demo && npm ci && npm run check) &&
         go vet ./... &&
         go vet -tags "integration e2e" ./... &&
         make test &&
         make vuln &&
-        (cd deploy/cloudflare-demo && npm ci && npm run check) &&
         go build -o /tmp/shinyhub ./cmd/shinyhub
       fail-on-blocked: false
       branch: deps/upd
