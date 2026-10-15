@@ -49,7 +49,7 @@ test("bad or denied storage cannot break sizing, and native hosting hides fallba
 
 // Loads the widget into a fresh page, opens a session and asks one question, so
 // each test starts with an answer in flight and drives the events that follow.
-function ask(t, { savedSize = null, blockStorage = false, notice, initialQuestion = true } = {}) {
+function ask(t, { savedSize = null, blockStorage = false, notice, starters, followups, initialQuestion = true } = {}) {
   const dom = new JSDOM("<!doctype html><body></body>", {
     runScripts: "outside-only", url: "https://apps.example.test/"
   });
@@ -86,7 +86,7 @@ function ask(t, { savedSize = null, blockStorage = false, notice, initialQuestio
   let session;
   function reconnect(next, nextNotice = notice) {
     session = next;
-    handlers.get("shinyhub-agent-chat-capabilities")({ version: 1, enabled: true, session, notice: nextNotice });
+    handlers.get("shinyhub-agent-chat-capabilities")({ version: 1, enabled: true, session, notice: nextNotice, starters, followups });
   }
   reconnect("s1");
   doc.querySelector(".sh-agent-launcher").click();
@@ -618,4 +618,108 @@ test("absent and blank notices preserve the existing empty state", (t) => {
     assert.equal(doc.querySelector('.sh-agent-empty h3').textContent, 'Start with this view');
     assert.equal(doc.querySelectorAll('.sh-agent-suggestion').length, 2);
   }
+});
+
+
+test("custom starters replace defaults, submit on click, and empty lists hide buttons", (t) => {
+  const { doc, inputs } = ask(t, { initialQuestion: false, starters: ["Which lines cost most?", "<b>Literal</b>"] });
+  const buttons = doc.querySelectorAll(".sh-agent-empty .sh-agent-suggestion");
+  assert.deepEqual(Array.from(buttons, b => b.textContent), ["Which lines cost most?", "<b>Literal</b>"]);
+  assert.equal(doc.querySelector(".sh-agent-empty b"), null);
+  buttons[0].click();
+  assert.equal(inputs.at(-1).value.message, "Which lines cost most?");
+  const empty = ask(t, { initialQuestion: false, starters: [] });
+  assert.equal(empty.doc.querySelectorAll(".sh-agent-suggestion").length, 0);
+});
+
+test("follow-ups wait for done, fill and focus without sending, and preserve a draft", (t) => {
+  const { doc, send, inputs, window } = ask(t, { followups: 2 });
+  send({ type: "delta", text: "Answer." });
+  send({ type: "suggestions", questions: [" Cost? ", "COST?", "<b>Trend?</b>", "Other?"] });
+  assert.equal(doc.querySelector(".sh-agent-followups"), null);
+  send({ type: "done" });
+  const group = doc.querySelector('[aria-label="Suggested follow-up questions"]');
+  assert.equal(group.getAttribute("role"), "group");
+  const buttons = group.querySelectorAll("button");
+  assert.deepEqual(Array.from(buttons, b => b.textContent), ["Cost?", "<b>Trend?</b>"]);
+  assert.equal(group.querySelector("b"), null);
+  assert.match(doc.querySelector(".sh-agent-sr-only").textContent, /Suggested follow-up questions available/);
+  const count = inputs.length;
+  buttons[0].focus();
+  assert.equal(doc.activeElement, buttons[0]);
+  buttons[0].click();
+  const input = doc.querySelector(".sh-agent-input");
+  assert.equal(input.value, "Cost?");
+  assert.equal(doc.activeElement, input);
+  assert.equal(inputs.length, count);
+  assert.equal(buttons[1].disabled, true);
+  assert.equal(buttons[1].getAttribute("aria-describedby"), group.querySelector(".sh-agent-followup-hint").id);
+  buttons[1].click();
+  assert.equal(input.value, "Cost?");
+  assert.equal(group.querySelector(".sh-agent-followup-hint").hidden, false);
+  input.value = "";
+  input.dispatchEvent(new window.Event("input"));
+  assert.equal(buttons[1].disabled, false);
+  assert.equal(buttons[1].hasAttribute("aria-describedby"), false);
+});
+
+test("follow-ups are opt-in and never attached to an empty answer", (t) => {
+  for (const options of [{}, { followups: 2 }]) {
+    const { doc, send } = ask(t, options);
+    if (!options.followups) send({ type: "delta", text: "Answer." });
+    send({ type: "suggestions", questions: ["Cost?"] });
+    send({ type: "done" });
+    assert.equal(doc.querySelector(".sh-agent-followups"), null);
+  }
+});
+
+for (const interruption of ["error", "stop", "expired", "reconnect", "reset", "next"]) {
+  test(`follow-ups cannot survive ${interruption} or be revived by stale events`, (t) => {
+    const { doc, send, submit, reconnect } = ask(t, { followups: 2 });
+    send({ type: "delta", text: "Answer." });
+    send({ type: "suggestions", questions: ["Cost?"] });
+    if (interruption === "error") send({ type: "error", message: "Failed" });
+    else if (interruption === "stop") Array.from(doc.querySelectorAll("button")).find(b => b.textContent === "Stop").click();
+    else if (interruption === "expired") {
+      requestApproval(send);
+      send({ type: "approval_expired", approvalId: "a1" });
+    } else {
+      send({ type: "done" });
+      assert.ok(doc.querySelector(".sh-agent-followups"));
+      if (interruption === "reconnect") reconnect("s2");
+      if (interruption === "reset") { doc.querySelector(".sh-agent-reset").click(); send({ type: "reset" }); }
+      if (interruption === "next") submit("Another question");
+    }
+    send({ type: "suggestions", requestId: "stale_request", questions: ["Stale?"] });
+    if (["stop", "expired"].includes(interruption)) {
+      send({ type: "suggestions", questions: ["Too late?"] });
+      send({ type: "done" });
+    }
+    assert.equal(doc.querySelector(".sh-agent-followups"), null);
+  });
+}
+
+test("successful Undo removes suggestions for the previous view", (t) => {
+  const { doc, send, inputs } = ask(t, { followups: 2 });
+  send({ type: "action_applied", name: "set_year", actionId: "action1", receipt: "Showing year" });
+  send({ type: "delta", text: "Showing year." });
+  send({ type: "suggestions", questions: ["What happened this year?"] });
+  send({ type: "done" });
+  assert.ok(doc.querySelector(".sh-agent-followups"));
+  doc.querySelector(".sh-agent-undo").click();
+  const undo = inputs.at(-1).value;
+  send({ type: "undo_result", requestId: undo.requestId, actionId: "action1", ok: true, detail: "Previous view restored" });
+  assert.equal(doc.querySelector(".sh-agent-followups"), null);
+});
+
+test("question limits count Unicode characters consistently with the server", (t) => {
+  const starter = "💸".repeat(119) + "?";
+  const { doc, send, submit } = ask(t, { initialQuestion: false, starters: [starter], followups: 1 });
+  assert.equal(doc.querySelector(".sh-agent-empty .sh-agent-suggestion")?.textContent, starter);
+  submit("Cost?");
+  send({ type: "delta", text: "Answer." });
+  const question = "💸".repeat(99) + "?";
+  send({ type: "suggestions", questions: [question] });
+  send({ type: "done" });
+  assert.equal(doc.querySelector(".sh-agent-followups button")?.textContent, question);
 });

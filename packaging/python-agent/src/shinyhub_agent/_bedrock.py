@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ._core import ToolError, ToolRegistry
@@ -17,6 +17,11 @@ from ._runtime import (
     bounded_int,
     check_calls,
     validate_limits,
+)
+from ._suggestions import (
+    FOLLOWUP_TOOL,
+    followup_spec,
+    terminal_followups,
 )
 from ._usage import ModelCall, UsageCallback
 
@@ -37,7 +42,14 @@ class BedrockChat:
     max_tool_calls_per_turn: int = 8
     on_usage: UsageCallback | None = field(default=None, repr=False, compare=False)
 
+    followups: int = field(default=0, kw_only=True)
+
+    def with_followups(self, maximum: int) -> BedrockChat:
+        """Return a session-specific copy; never mutate a shared app adapter."""
+        return replace(self, followups=maximum)
+
     def __post_init__(self) -> None:
+        bounded_int("followups", self.followups, 0, 3)
         if (
             not self.model_id.strip()
             or not self.instructions.strip()
@@ -133,7 +145,8 @@ class BedrockChat:
                 record.tool_names += (name,)
                 blocks[index] = {"toolUse": {"toolUseId": tool_id, "name": name}}
                 argument_chunks[index] = ""
-                yield {"type": "status", "text": "Using app tools"}
+                if not (self.followups and name == FOLLOWUP_TOOL):
+                    yield {"type": "status", "text": "Using app tools"}
             elif "contentBlockDelta" in event:
                 part = event["contentBlockDelta"]
                 index = part.get("contentBlockIndex")
@@ -182,9 +195,12 @@ class BedrockChat:
             try:
                 arguments = json.loads(raw or "{}")
             except ValueError as error:
-                raise ToolError(
-                    "model_failed", "The assistant sent invalid tool arguments."
-                ) from error
+                if self.followups and blocks[index]["toolUse"]["name"] == FOLLOWUP_TOOL:
+                    arguments = None
+                else:
+                    raise ToolError(
+                        "model_failed", "The assistant sent invalid tool arguments."
+                    ) from error
             blocks[index]["toolUse"]["input"] = arguments
         content = [blocks[index] for index in sorted(blocks)]
         calls = [part["toolUse"] for part in content if "toolUse" in part]
@@ -220,6 +236,13 @@ class BedrockChat:
             for item in bounded_history(history)
         ]
         messages.append({"role": "user", "content": [{"text": message.strip()}]})
+        specs = tools.public_spec()["tools"]
+        if self.followups:
+            if tools.get(FOLLOWUP_TOOL) is not None:
+                raise ValueError(
+                    "suggest_followups is reserved when followups are enabled"
+                )
+            specs = [*specs, followup_spec(self.followups)]
         tool_specs = [
             {
                 "toolSpec": {
@@ -228,13 +251,15 @@ class BedrockChat:
                     "inputSchema": {"json": spec["inputSchema"]},
                 }
             }
-            for spec in tools.public_spec()["tools"]
+            for spec in specs
         ]
         client = self._runtime()
         turn = Turn(self.max_tool_calls_per_step, self.max_tool_calls_per_turn)
         for round_index in range(self.max_tool_rounds + 1):
             final = round_index == self.max_tool_rounds or turn.exhausted
-            instructions = panel_instructions(self.instructions)
+            instructions = panel_instructions(
+                self.instructions, followups=bool(self.followups and not final)
+            )
             request = {
                 "modelId": self.model_id,
                 "system": [{"text": instructions}],
@@ -299,6 +324,30 @@ class BedrockChat:
                 return
             if not response["calls"]:
                 return
+            if self.followups:
+                questions = terminal_followups(
+                    response["calls"],
+                    any(part.get("text", "").strip() for part in response["content"]),
+                    self.followups,
+                )
+                response["calls"] = [
+                    call for call in response["calls"] if call.name != FOLLOWUP_TOOL
+                ]
+                response["content"] = [
+                    part
+                    for part in response["content"]
+                    if part.get("toolUse", {}).get("name") != FOLLOWUP_TOOL
+                ]
+                if not response["calls"]:
+                    if not any(
+                        part.get("text", "").strip() for part in response["content"]
+                    ):
+                        raise ToolError(
+                            "empty_answer", "The assistant returned no answer."
+                        )
+                    if questions:
+                        yield {"type": "suggestions", "questions": questions}
+                    return
             messages.append({"role": "assistant", "content": response["content"]})
             results = []
             async for event in turn.execute(response["calls"], tools, approve):

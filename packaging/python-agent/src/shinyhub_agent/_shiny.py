@@ -7,7 +7,9 @@ from typing import Any
 
 from ._chat import ChatAgent, ChatSession
 from ._core import AgentTool, ToolRegistry
+from ._runtime import bounded_int
 from ._session import SessionTools
+from ._suggestions import validate_starters
 
 REQUEST_INPUT = ".shinyhub_agent_request"
 DISCOVER_INPUT = ".shinyhub_agent_discover"
@@ -53,6 +55,8 @@ def register(
     tools: Sequence[AgentTool],
     chat: ChatAgent | None = None,
     notice: str | None = None,
+    starters: Sequence[str] | None = None,
+    followups: int = 0,
     approval_timeout: float = 30,
     history_exchanges: int = 6,
     max_answer_chars: int = 8_000,
@@ -64,10 +68,15 @@ def register(
     Chat writes retain server-side approval regardless of this setting.
     An optional plain-text notice stays visible in the chat panel and is never
     sent to the model. Blank notices are treated as absent; the limit is 1,000
-    characters.
+    characters. Optional starters replace the built-in empty-state questions
+    (None preserves defaults; an empty sequence hides them). followups enables
+    up to three experimental, editable, never auto-submitted suggestions on supporting
+    chat agents. Both settings leave existing apps unchanged by default.
     """
     from shiny import reactive
     from shiny.session import session_context
+
+    starters = validate_starters(starters)
 
     if notice is not None:
         if not isinstance(notice, str):
@@ -92,6 +101,9 @@ def register(
                 finally:
                     await reactive.flush()
 
+    bounded_int("followups", followups, 0, 3)
+    if followups and chat is None:
+        raise ValueError("followups requires a chat agent")
     registry = ToolRegistry(tools, executor=execute)
     dispatcher = SessionTools(registry, allow_browser_writes=allow_browser_writes)
     chat_session = (
@@ -102,6 +114,7 @@ def register(
             approval_timeout=approval_timeout,
             history_exchanges=history_exchanges,
             max_answer_chars=max_answer_chars,
+            followups=followups,
             usage_metadata={
                 "app": os.environ.get("SHINYHUB_APP_SLUG"),
                 **(usage_metadata or {}),
@@ -135,6 +148,10 @@ def register(
         )
         if chat_session is not None:
             capabilities = chat_session.capabilities()
+            if starters is not None:
+                capabilities["starters"] = starters
+            if followups:
+                capabilities["followups"] = followups
             if notice is not None:
                 capabilities["notice"] = notice
             await session.send_custom_message(CHAT_CAPABILITIES_MESSAGE, capabilities)

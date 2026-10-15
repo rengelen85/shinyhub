@@ -416,16 +416,72 @@
   empty.append(emptyIcon, make("h3", "", "Start with this view"),
     make("p", "", "Ask about what you see, or find out which changes this app can make."));
   var suggestions = make("div", "sh-agent-suggestions");
-  ["What can you tell me about this view?", "What can I change here?"].forEach(function (question) {
-    var suggestion = make("button", "sh-agent-suggestion", question);
-    suggestion.type = "button";
-    suggestion.addEventListener("click", function () {
-      input.value = question;
-      updateSend();
-      composer.requestSubmit();
+  var defaultStarters = ["What can you tell me about this view?", "What can I change here?"];
+  suggestions.setAttribute("role", "group");
+  suggestions.setAttribute("aria-label", "Starter questions");
+  function updateStarters(questions) {
+    suggestions.replaceChildren();
+    (Array.isArray(questions) ? questions.slice(0, 4) : defaultStarters).forEach(function (question) {
+      if (typeof question !== "string" || !question.trim() || Array.from(question).length > 120) return;
+      var suggestion = make("button", "sh-agent-suggestion", question);
+      suggestion.type = "button";
+      suggestion.addEventListener("click", function () {
+        input.value = question;
+        updateSend();
+        composer.requestSubmit();
+      });
+      suggestions.append(suggestion);
     });
-    suggestions.append(suggestion);
-  });
+    suggestions.hidden = !suggestions.childElementCount;
+  }
+  updateStarters();
+  var followupLimit = 0, pendingSuggestions = [], followupGroup = null;
+  var followupHint = null, suggestionsSuppressed = false;
+
+  function clearSuggestions() {
+    pendingSuggestions = [];
+    if (followupGroup) followupGroup.remove();
+    followupGroup = null;
+    followupHint = null;
+  }
+
+  function updateSuggestionDraft() {
+    if (!followupGroup) return;
+    var hasDraft = !!input.value.trim();
+    followupGroup.querySelectorAll("button").forEach(function (button) {
+      button.disabled = hasDraft;
+      if (hasDraft) button.setAttribute("aria-describedby", followupHint.id);
+      else button.removeAttribute("aria-describedby");
+    });
+    followupHint.hidden = !hasDraft;
+  }
+
+  function showSuggestions() {
+    if (!activeAnswer || !answerSource.trim() || suggestionsSuppressed || !followupLimit) return;
+    var questions = pendingSuggestions;
+    clearSuggestions();
+    if (!questions.length) return;
+    followupGroup = make("div", "sh-agent-suggestions sh-agent-followups");
+    followupGroup.setAttribute("role", "group");
+    followupGroup.setAttribute("aria-label", "Suggested follow-up questions");
+    questions.forEach(function (question) {
+      var button = make("button", "sh-agent-suggestion", question);
+      button.type = "button";
+      button.addEventListener("click", function () {
+        if (input.value.trim() || activeRequest) return;
+        input.value = question;
+        updateSend();
+        input.focus();
+      });
+      followupGroup.append(button);
+    });
+    followupHint = make("p", "sh-agent-followup-hint", "Clear your draft to choose a follow-up question.");
+    followupHint.id = "shinyhub-agent-followup-hint";
+    followupGroup.append(followupHint);
+    activeAnswer.parentNode.append(followupGroup);
+    updateSuggestionDraft();
+    announcer.textContent += " Suggested follow-up questions available.";
+  }
   empty.append(suggestions);
   log.append(empty);
   var jump = make("button", "sh-agent-jump", "Latest messages");
@@ -514,6 +570,7 @@
   }
 
   function updateSend() {
+    updateSuggestionDraft();
     send.disabled = !chatSession || !!activeRequest || !input.value.trim();
   }
 
@@ -599,6 +656,8 @@
       });
       activeAnswer.parentNode.append(copy);
     }
+    if (message) clearSuggestions();
+    else showSuggestions();
     if (message && activeAnswer) activeAnswer.parentNode.append(make("p", "sh-agent-error", message));
     activeRequest = null;
     activeAnswer = null;
@@ -652,6 +711,8 @@
     clearInterval(approvalTimer);
     approvalTimer = null;
     if (!approval) return;
+    suggestionsSuppressed = true;
+    clearSuggestions();
     var actions = approval.querySelector(".sh-agent-approval-actions");
     if (actions) actions.remove();
     approval.dataset.result = "expired";
@@ -970,6 +1031,8 @@
   composer.addEventListener("submit", function (event) {
     event.preventDefault();
     if (!chatSession || activeRequest || !input.value.trim()) return;
+    clearSuggestions();
+    suggestionsSuppressed = false;
     var question = input.value.trim();
     input.value = "";
     announcer.textContent = "";
@@ -984,6 +1047,8 @@
   stop.addEventListener("click", function () {
     if (activeRequest) {
       stop.disabled = true;
+      suggestionsSuppressed = true;
+      clearSuggestions();
       setStatus("Stopping the answer");
       emit({ version: VERSION, session: chatSession,
         requestId: crypto.randomUUID(), action: "cancel" });
@@ -991,6 +1056,7 @@
   });
   reset.addEventListener("click", function () {
     if (!chatSession || activeRequest) return;
+    clearSuggestions();
     emit({ version: VERSION, session: chatSession,
       requestId: crypto.randomUUID(), action: "reset" });
   });
@@ -1002,11 +1068,15 @@
       if (!message || message.version !== VERSION || !message.enabled ||
           typeof message.session !== "string") return;
       if (chatSession && chatSession !== message.session) {
+        clearSuggestions();
         log.replaceChildren(empty);
         finish("App session reconnected. Start a new question.");
       }
       chatSession = message.session;
       updateNotice(message.notice);
+      updateStarters(message.starters);
+      followupLimit = Number.isInteger(message.followups) && message.followups >= 1 && message.followups <= 3 ? message.followups : 0;
+      if (!followupLimit) clearSuggestions();
       launcher.hidden = toolbarAvailable || toolbarSuspended;
       announceChat("capabilities", { enabled: true, panel: panel, title: "Ask this app" });
       updateSend();
@@ -1015,10 +1085,15 @@
       if (!event || event.version !== VERSION || event.session !== chatSession) return;
       if (event.type === "approval_required") { if (activeRequest) showApproval(event); return; }
       if (event.type === "approval_expired") {
-        if (approval && approval.dataset.approvalId === event.approvalId) expireApproval();
+        if (approval && approval.dataset.approvalId === event.approvalId) {
+          suggestionsSuppressed = true;
+          clearSuggestions();
+          expireApproval();
+        }
         return;
       }
       if (event.type === "reset") {
+        clearSuggestions();
         cancelAnswerFrame();
         activeAnswer = null;
         activeRequest = null;
@@ -1039,6 +1114,7 @@
         undoRequests.delete(event.requestId);
         pendingUndo.button.remove();
         if (event.ok) {
+          clearSuggestions();
           pendingUndo.receipt.dataset.result = "undone";
           pendingUndo.title.textContent = "Change undone";
           pendingUndo.detail.textContent = (event.detail || "Previous view restored") +
@@ -1064,6 +1140,17 @@
       } else if (event.type === "action_applied") {
         showReceipt(event);
         setStatus("Writing answer");
+      } else if (event.type === "suggestions") {
+        if (suggestionsSuppressed || !Array.isArray(event.questions)) return;
+        var seen = new Set();
+        pendingSuggestions = event.questions.slice(0, 64).filter(function (question) {
+          if (typeof question !== "string" || !question.trim() || Array.from(question.trim()).length > 100 ||
+              /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(question)) return false;
+          var key = question.trim().toLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        }).slice(0, followupLimit).map(function (question) { return question.trim(); });
       } else if (event.type === "done") finish("");
       else if (event.type === "error") {
         finish(event.message || "The assistant could not finish.");

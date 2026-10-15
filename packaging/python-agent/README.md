@@ -192,6 +192,78 @@ Upgrading from a release that exposed browser writes automatically requires
 this explicit opt-in to retain that behavior. Chat-only integrations need no
 change.
 
+## Starter questions and follow-ups
+
+Both settings are optional and belong to `register()`:
+
+```python
+register(
+    session=session,
+    input=input,
+    tools=tools,
+    chat=chat,
+    starters=[
+        "How did spend change versus the previous period?",
+        "Which business lines cost the most?",
+        "What will this month cost at the current run rate?",
+    ],
+    followups=2,
+)
+```
+
+`starters=None` preserves the two built-in questions; `starters=[]` hides them.
+Supply a sequence of at most four strings, each 1–120 characters after trimming.
+Blank entries, line breaks, control characters, HTML tags, and duplicates
+(case-insensitive after trimming) raise at registration. Starters are rendered
+as literal text and keep the existing submit-on-click behaviour. They are panel
+configuration, not model instructions.
+
+Follow-ups are **experimental** until verified with your intended model and gateway.
+`followups=0` (the default) disables them. Integers 1–3 enable optional suggestions in `BedrockChat` and `OpenAIChat` / `ResponsesChat`. The setting uses
+a session-specific adapter copy, so sharing a chat adapter between viewers is
+safe. `AGUIChat` does not currently support this setting; enabling it with an
+unsupported agent raises at registration rather than silently doing nothing.
+
+The adapters expose `suggest_followups` as a metadata tool and instruct the model
+to offer follow-ups only through that channel. A successfully completed model
+response with nonblank answer text and exactly one suggestion call ends the turn
+without a tool result or another model request. Suggestion calls do not consume
+app-tool budgets; their model tokens and request still appear in usage records.
+Suggestions are best-effort: a model may return none. No additional model request
+is made to obtain them, and the budget-ending response keeps all tools disabled.
+There is no guaranteed latency or token saving. Answer text and suggestion arguments
+share `max_output_tokens` (500 by default). Leave headroom for both: reaching the
+output-token limit fails the turn even if answer text has already streamed, and
+no suggestions are shown. Incomplete provider responses are never promoted to
+successful answers.
+
+If suggestions appear beside app tools, they are discarded from both execution
+and the replayed tool transcript. Repeated suggestion calls are also discarded.
+Malformed suggestion JSON or invalid questions are dropped without losing a valid
+answer, within the existing stream and payload safety limits. The server trims
+questions, rejects blank, multiline, control-character, HTML-tag, and overlong
+entries (100 characters), removes case-insensitive duplicates, and keeps at most
+the configured count. None of this validates factual accuracy or relevance.
+
+Buttons appear only when an answer completes. A click fills and focuses the
+composer **without sending**. Edit the question before sending; existing write
+approvals still apply. While the composer contains a draft, the buttons are
+disabled with an explanation to prevent overwriting it. Suggestions clear on the
+next submission, reset, reconnect, error, cancellation, or successful Undo. An
+expired approval suppresses suggestions for the rest of that turn, even when the
+assistant finishes an explanation. Suggestions are never stored in conversation
+history; sending one creates an ordinary user message.
+
+Custom agents can opt in by implementing `with_followups(maximum: int)`, returning
+a session-specific agent configured for that limit. Its existing `run()` signature
+does not change. Yield `{"type": "suggestions", "questions": [...]}` as metadata;
+`ChatSession` holds and validates it, then emits it immediately before `done` only
+after a successful, nonempty answer. An agent's `error` event is forwarded with its
+original message and terminates the turn without suggestions or a completed reply
+in history. Applied actions are still recorded when a reply is interrupted. Agents must not execute suggestions as app
+tools or make extra model requests solely to generate them. The name
+`suggest_followups` is reserved among registered app tools while enabled.
+
 ## Backend protocols and routing
 
 Choose an adapter by the protocol exposed by your endpoint:
@@ -516,3 +588,28 @@ provider requests.
 The package is a reusable app integration. A platform-owned chat service,
 central cost policy, admin configuration, and R Shiny helper remain separate
 work before this becomes a platform-wide production feature.
+
+### Real-model follow-up compatibility checks
+
+The deterministic adapter tests verify protocol handling and request counts.
+Before enabling follow-ups with a new model or gateway, run the opt-in, billable
+probes against that deployment. They use synthetic dashboard facts and the default
+500-token output limit. They check ordinary instructions (suggestions optional),
+a forced text-plus-suggestion response, and a read-tool round followed by an answer
+and suggestion. Suggestions must not add a request or repeat in the answer/history:
+
+```sh
+# Configure only the backend being tested; normal AWS credentials apply to Bedrock.
+export SHINYHUB_AGENT_BEDROCK_MODEL="your-model-id"
+export AWS_REGION="your-region"
+# Or configure OPENAI_API_KEY and SHINYHUB_AGENT_OPENAI_MODEL.
+# Gateways can also set SHINYHUB_AGENT_OPENAI_BASE_URL and
+# SHINYHUB_AGENT_OPENAI_PROVIDER (for example, "litellm").
+SHINYHUB_AGENT_LIVE_FOLLOWUPS=1 uv run --extra test --extra bedrock \
+  pytest tests/test_suggestions_live.py -q
+```
+
+Run this for each intended model. A passing probe establishes basic compatibility,
+not suggestion quality or a latency improvement. Application evaluations should
+also check relevance, self-contained wording, injected-data handling, and latency
+against the same prompts with follow-ups disabled.

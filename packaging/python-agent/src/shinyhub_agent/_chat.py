@@ -15,6 +15,7 @@ from ._core import ToolError, ToolRegistry
 from ._errors import ProviderError
 from ._runtime import bounded_int
 from ._session import REQUEST_ID, VERSION
+from ._suggestions import FOLLOWUP_TOOL, clean_followups
 from ._usage import usage_context
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class ChatSession:
         send: Send,
         *,
         approval_timeout: float = 30,
+        followups: int = 0,
         history_exchanges: int = 6,
         max_answer_chars: int = 8_000,
         usage_metadata: dict[str, str | None] | None = None,
@@ -55,6 +57,22 @@ class ChatSession:
             raise ValueError("approval_timeout must be between 1 and 300 seconds")
         bounded_int("history_exchanges", history_exchanges, 1, 32)
         bounded_int("max_answer_chars", max_answer_chars, 1_000, 32_768)
+        bounded_int("followups", followups, 0, 3)
+        if followups:
+            configure = getattr(agent, "with_followups", None)
+            if not callable(configure):
+                raise ValueError(
+                    "This chat agent does not support followups (with_followups is required)"
+                )
+            if tools.get(FOLLOWUP_TOOL) is not None:
+                raise ValueError(
+                    "suggest_followups is reserved when followups are enabled"
+                )
+            agent = configure(followups)
+            if not callable(getattr(agent, "run", None)):
+                raise TypeError("with_followups must return a chat agent with run()")
+        self.followups = followups
+        self.suggestions_suppressed = False
         self.agent = agent
         self.tools = tools
         self.send = send
@@ -224,6 +242,7 @@ class ChatSession:
         self.total_calls += 1
         self.seen_requests.append(request_id)
         answer = ""
+        suggestions: list[str] = []
         applied_actions: list[str] = []
 
         def remember_applied_actions() -> None:
@@ -244,6 +263,7 @@ class ChatSession:
 
         async with self.lock:
             self.task = asyncio.current_task()
+            self.suggestions_suppressed = False
             usage_token = usage_context.set(
                 {**self.usage_metadata, "turn_id": secrets.token_urlsafe(16)}
             )
@@ -256,6 +276,17 @@ class ChatSession:
                     self.approve,
                     thread_id=self.thread_id,
                 ):
+                    if event.get("type") == "suggestions":
+                        suggestions = clean_followups(
+                            event.get("questions"), self.followups
+                        )
+                        continue
+                    if event.get("type") == "error":
+                        # Custom agents own their error text, as before. An error
+                        # is terminal: never forward suggestions or commit a reply.
+                        remember_applied_actions()
+                        await emit(event)
+                        return
                     if event.get("type") == "delta":
                         answer += event.get("text", "")
                         if len(answer) > self.max_answer_chars:
@@ -288,6 +319,8 @@ class ChatSession:
                     ]
                 )
                 self.history = self.history[-2 * self.history_exchanges :]
+                if suggestions and not self.suggestions_suppressed:
+                    await emit({"type": "suggestions", "questions": suggestions})
                 await emit({"type": "done"})
                 logger.info("Agent chat completed")
             except asyncio.CancelledError:
@@ -355,7 +388,8 @@ class ChatSession:
         )
         try:
             allowed = await asyncio.wait_for(future, self.approval_timeout)
-        except asyncio.TimeoutError as error:
+        except asyncio.TimeoutError as error:  # noqa: UP041 - Python 3.10 support
+            self.suggestions_suppressed = True
             await self.send(
                 {
                     "version": VERSION,

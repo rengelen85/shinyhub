@@ -108,6 +108,61 @@ try {
   });
   const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] });
   context.setDefaultTimeout(5000);
+  for (const native of [false, true]) {
+    for (const width of [1280, 375]) {
+      const tab = await context.newPage();
+      await tab.setViewportSize({ width, height: 800 });
+      await tab.goto(`${origin}/${native ? 'native' : 'fallback'}`);
+      if (native) await tab.evaluate(() => navRoot.querySelector('.chat-trigger').click());
+      else await tab.locator('.sh-agent-launcher').click();
+      await tab.evaluate(() => {
+        handlers.get('shinyhub-agent-chat-capabilities')({ version: 1, enabled: true,
+          session: 'browser-session', starters: ['Which business lines cost most?'], followups: 2 });
+        window.sentQuestions = [];
+        const original = Shiny.setInputValue;
+        Shiny.setInputValue = (name, value) => {
+          if (value.message) sentQuestions.push(value.message);
+          original(name, value);
+        };
+      });
+      await tab.locator('.sh-agent-empty .sh-agent-suggestion').click();
+      assert.deepEqual(await tab.evaluate(() => sentQuestions), ['Which business lines cost most?']);
+      await delta(tab, 'Spend rose 12% compared with the previous period.');
+      await tab.evaluate(() => chatEvent({ type: 'suggestions', questions: [
+        'Which business lines drove the increase?', 'Q'.repeat(99) + '?'
+      ] }));
+      assert.equal(await tab.locator('.sh-agent-followups').count(), 0);
+      await done(tab);
+      const group = tab.getByRole('group', { name: 'Suggested follow-up questions' });
+      assert.equal(await group.getByRole('button').count(), 2);
+      await group.getByRole('button').first().focus();
+      await tab.keyboard.press('Enter');
+      assert.equal(await tab.locator('.sh-agent-input').inputValue(), 'Which business lines drove the increase?');
+      assert.equal(await tab.evaluate(() => document.activeElement === document.querySelector('.sh-agent-input')), true);
+      assert.equal(await tab.evaluate(() => sentQuestions.length), 1, 'a suggestion click does not send');
+      assert.equal(await group.getByRole('button').last().isDisabled(), true, 'drafts are preserved');
+      await tab.locator('.sh-agent-input').fill('');
+      assert.equal(await group.getByRole('button').last().isEnabled(), true);
+      const bounds = await group.evaluate(el => {
+        const rect = el.getBoundingClientRect();
+        return { left: rect.left, right: rect.right, width: el.clientWidth, scroll: el.scrollWidth };
+      });
+      assert.ok(bounds.left >= 0 && bounds.right <= width, 'suggestions fit the panel');
+      assert.ok(bounds.scroll <= bounds.width + 1, 'long questions wrap without horizontal overflow');
+      await tab.addScriptTag({ content: axe.source });
+      const a11y = await tab.evaluate(() => axe.run(document.querySelector('.sh-agent-panel'), {
+        rules: { region: { enabled: false } }
+      }));
+      assert.deepEqual(a11y.violations.map(v => v.id), []);
+      if (screenshots) await tab.screenshot({ path: resolve(screenshots, `suggestions-${native ? 'native' : 'fallback'}-${width}.png`) });
+      await tab.locator('.sh-agent-input').fill('Break the increase down by model');
+      await tab.locator('.sh-agent-send').click();
+      assert.equal(await group.count(), 0);
+      assert.deepEqual(await tab.evaluate(() => sentQuestions), ['Which business lines cost most?', 'Break the increase down by model']);
+      console.log(`PASS suggestions ${native ? 'native' : 'fallback'} at ${width}px: starters, keyboard, editable drafts, wrapping, accessibility`);
+      await tab.close();
+    }
+  }
   // The public hook must work against the actual closed shadow root, with no
   // attachShadow wrapper. The later layout tests capture it only to inspect chrome.
   for (const width of [1280, 375]) {

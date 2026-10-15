@@ -105,6 +105,11 @@ def model_reply(backend, reply):
             }
             for i, (name, args) in enumerate(calls)
         ]
+        if text:
+            output.append({
+                "type": "message", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            })
         events.append(
             {
                 "type": "response.failed"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -21,6 +21,11 @@ from ._runtime import (
     bounded_int,
     check_calls,
     validate_limits,
+)
+from ._suggestions import (
+    FOLLOWUP_TOOL,
+    followup_spec,
+    terminal_followups,
 )
 from ._usage import ModelCall, UsageCallback, usage_context
 
@@ -160,7 +165,14 @@ class OpenAIChat:
     send_end_user: bool = field(default=False, kw_only=True)
     provider: str = field(default="openai", kw_only=True)
 
+    followups: int = field(default=0, kw_only=True)
+
+    def with_followups(self, maximum: int) -> OpenAIChat:
+        """Return a session-specific copy; never mutate a shared app adapter."""
+        return replace(self, followups=maximum)
+
     def __post_init__(self) -> None:
+        bounded_int("followups", self.followups, 0, 3)
         if not self.api_key.strip():
             raise ValueError("An API key is required")
         if not self.instructions.strip():
@@ -192,6 +204,7 @@ class OpenAIChat:
     ) -> AsyncIterator[dict[str, Any]]:
         output = None
         text_seen = False
+        nonblank_text_seen = False
         async with client.stream(
             "POST", self.base_url + "/responses", headers=headers, json=request
         ) as response:
@@ -217,6 +230,7 @@ class OpenAIChat:
                     delta = event.get("delta")
                     if isinstance(delta, str) and delta:
                         text_seen = True
+                        nonblank_text_seen = nonblank_text_seen or bool(delta.strip())
                         yield {"type": "delta", "text": delta}
                 elif (
                     kind == "response.output_item.added"
@@ -226,7 +240,8 @@ class OpenAIChat:
                     name = event["item"].get("name")
                     if isinstance(name, str):
                         usage.tool_names += (name,)
-                    yield {"type": "status", "text": "Using app tools"}
+                    if not (self.followups and name == FOLLOWUP_TOOL):
+                        yield {"type": "status", "text": "Using app tools"}
                 elif kind in (
                     "response.completed",
                     "response.incomplete",
@@ -272,6 +287,12 @@ class OpenAIChat:
             if item.get("type") != "function_call":
                 continue
             raw = item.get("arguments", "")
+            if (
+                self.followups
+                and item.get("name") == FOLLOWUP_TOOL
+                and not isinstance(raw, str)
+            ):
+                raw = ""
             if not isinstance(raw, str) or len(raw.encode()) > 8_192:
                 raise ToolError(
                     "model_too_large", "The assistant sent too much tool data."
@@ -279,25 +300,42 @@ class OpenAIChat:
             try:
                 arguments = json.loads(raw)
             except ValueError as error:
-                raise ToolError(
-                    "model_failed", "The assistant sent invalid tool arguments."
-                ) from error
+                if self.followups and item.get("name") == FOLLOWUP_TOOL:
+                    arguments = None
+                else:
+                    raise ToolError(
+                        "model_failed", "The assistant sent invalid tool arguments."
+                    ) from error
             calls.append(ToolCall(item.get("call_id"), item.get("name"), arguments))
         check_calls(calls)
         usage.tool_names = tuple(call.name for call in calls)
-        if not calls and not text_seen:
-            answer = "\n".join(
+        # Optional metadata must not tighten parsing for existing gateway users.
+        output_text = ""
+        if self.followups or (not calls and not text_seen):
+            output_text = "\n".join(
                 part["text"]
                 for item in output
                 if item.get("type") == "message"
-                for part in item.get("content", [])
-                if part.get("type") == "output_text"
+                and isinstance(item.get("content"), list)
+                for part in item["content"]
+                if isinstance(part, dict)
+                and part.get("type") == "output_text"
                 and isinstance(part.get("text"), str)
             ).strip()
-            if not answer:
+        if not text_seen and (
+            not calls
+            or (self.followups and all(call.name == FOLLOWUP_TOOL for call in calls))
+        ):
+            if not output_text:
                 raise ToolError("model_failed", "The assistant returned no answer.")
-            yield {"type": "delta", "text": answer}
-        yield {"type": "model_response", "output": output, "calls": calls}
+            yield {"type": "delta", "text": output_text}
+        has_text = bool(self.followups and (nonblank_text_seen or output_text))
+        yield {
+            "type": "model_response",
+            "output": output,
+            "calls": calls,
+            "has_text": has_text,
+        }
 
     async def run(
         self,
@@ -336,6 +374,21 @@ class OpenAIChat:
             )
             if item is not None
         ]
+        if self.followups:
+            if tools.get(FOLLOWUP_TOOL) is not None:
+                raise ValueError(
+                    "suggest_followups is reserved when followups are enabled"
+                )
+            spec = followup_spec(self.followups)
+            model_tools.append(
+                {
+                    "type": "function",
+                    "name": spec["name"],
+                    "description": spec["description"],
+                    "parameters": spec["inputSchema"],
+                    "strict": False,
+                }
+            )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -344,7 +397,9 @@ class OpenAIChat:
         async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=5)) as client:
             for round_index in range(self.max_tool_rounds + 1):
                 final = round_index == self.max_tool_rounds or turn.exhausted
-                instructions = panel_instructions(self.instructions)
+                instructions = panel_instructions(
+                    self.instructions, followups=bool(self.followups and not final)
+                )
                 if final:
                     instructions += "\n\n" + FINAL_INSTRUCTIONS
                 request = {
@@ -398,6 +453,30 @@ class OpenAIChat:
                     return
                 if not response["calls"]:
                     return
+                if self.followups:
+                    has_text = response["has_text"]
+                    questions = terminal_followups(
+                        response["calls"], has_text, self.followups
+                    )
+                    response["calls"] = [
+                        call for call in response["calls"] if call.name != FOLLOWUP_TOOL
+                    ]
+                    response["output"] = [
+                        item
+                        for item in response["output"]
+                        if not (
+                            item.get("type") == "function_call"
+                            and item.get("name") == FOLLOWUP_TOOL
+                        )
+                    ]
+                    if not response["calls"]:
+                        if not has_text:
+                            raise ToolError(
+                                "empty_answer", "The assistant returned no answer."
+                            )
+                        if questions:
+                            yield {"type": "suggestions", "questions": questions}
+                        return
                 inputs.extend(response["output"])
                 async for event in turn.execute(response["calls"], tools, approve):
                     if event["type"] == "tool_result":
