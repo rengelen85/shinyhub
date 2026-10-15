@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/rvben/shinyhub/compare/v0.20.9...v0.21.0) - 2026-10-15
+
+### Added
+
+- **fleet**: add host-bound overlays and retry transient capacity refusals ([0dad6d7](https://github.com/rvben/shinyhub/commit/0dad6d72327c04f9466b6f54dfbff0e616f6f1cf))
+- **agent**: add app starters and editable follow-up suggestions ([b8bc3e8](https://github.com/rvben/shinyhub/commit/b8bc3e8cf4846fbdee2be533f93509e1f30ff97a))
+- **agent**: add persistent configurable chat notice ([c6357e1](https://github.com/rvben/shinyhub/commit/c6357e1a90752fc3fc38f9abc32bf0a12b937b2f))
+- **agent**: support Responses-compatible gateways ([7f93c2c](https://github.com/rvben/shinyhub/commit/7f93c2c9ec35a369ac50ebce63ca7982ce9531e2))
+
+### Fixed
+
+- **fleet**: record bundle env convergence through content digest ([91f19d9](https://github.com/rvben/shinyhub/commit/91f19d99252789c3448955d4e1f271efff74115a))
+- **ci**: provision dependency validation runtimes ([6e6a2a2](https://github.com/rvben/shinyhub/commit/6e6a2a288494b612890e8f3ba7586d1363052c5b))
+- **demo**: avoid uncaught websocket disconnect errors ([7c42a18](https://github.com/rvben/shinyhub/commit/7c42a185140403882163892ff0997c97240e8441))
+- **demo**: preserve upgrades and verify container websocket closes ([4252cf5](https://github.com/rvben/shinyhub/commit/4252cf54c01f5c5095439181f0b25d6eccd951bc))
+- **demo**: coordinate outer websocket closes and tail verification ([57e75af](https://github.com/rvben/shinyhub/commit/57e75af4fe3894ea701d598ee6261d01fc6d1903))
+- **deploy**: keep schedule writers out of deployment repair fences ([502f03a](https://github.com/rvben/shinyhub/commit/502f03ad60a6da5e8697272c77e9b7837d183c75))
+- **demo**: recover container interruptions and verify server transports ([eda93af](https://github.com/rvben/shinyhub/commit/eda93af999e04f2a434f62ef98c24f3eb34995e0))
+
 ## [0.20.9](https://github.com/rvben/shinyhub/compare/v0.20.8...v0.20.9) - 2026-10-14
 
 ### Upgrade notice
