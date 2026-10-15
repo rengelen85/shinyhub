@@ -424,7 +424,13 @@ func AutoscaleDisplay(enabled bool, min, max int, target float64) string {
 // compact, version-tolerant drift baseline.
 func DeclaredState(app AppEntry) []ConfigDriftItem {
 	d := []ConfigDriftItem{{Key: "visibility", Server: "(unset)", Desired: app.Visibility}}
-	d = append(d, configDrift(app, ObservedApp{})...)
+	for _, item := range configDrift(app, ObservedApp{}) {
+		// Bundle env is governed by the desired content digest. Its redacted
+		// display tokens are not comparable mutable settings or stored values.
+		if !strings.HasPrefix(item.Key, "env.") {
+			d = append(d, item)
+		}
+	}
 	return d
 }
 

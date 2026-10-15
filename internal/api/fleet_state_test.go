@@ -8,9 +8,42 @@ import (
 	"testing"
 
 	"github.com/rvben/shinyhub/internal/db"
+	"github.com/rvben/shinyhub/internal/fleet"
 )
 
 const fleetStateRunID = "0123456789abcdef0123456789abcdef"
+
+func TestFleetStateBundleEnvUsesContentDigest(t *testing.T) {
+	srv, store := newTestServer(t)
+	token := seedAppWithPromotedDeploy(t, store, "fleet-detail", "sha256:live")
+	marker := "fleet:prod"
+	if err := store.SetAppManagedBy("fleet-detail", &marker); err != nil {
+		t.Fatal(err)
+	}
+	router := srv.Router()
+	registerFleetStateRun(t, router, token)
+	entry := fleet.AppEntry{Visibility: "private", Config: fleet.Config{Env: map[string]string{"MODE": "production"}}}
+	declaration := []db.FleetDeclaredValue{}
+	for _, item := range fleet.DeclaredState(entry) {
+		declaration = append(declaration, db.FleetDeclaredValue{Key: item.Key, Desired: item.Desired})
+	}
+	for _, digest := range []string{"sha256:other", "sha256:live"} {
+		body, err := json.Marshal(map[string]any{"status": "in_sync", "desired_content_digest": digest, "declaration": declaration})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := http.StatusNoContent
+		if digest != "sha256:live" {
+			want = http.StatusConflict
+		}
+		if rec := putFleetState(t, router, token, "in_sync", string(body)); rec.Code != want {
+			t.Fatalf("record env bundle %s = %d: %s", digest, rec.Code, rec.Body.String())
+		}
+	}
+	if state := getFleetState(t, router, token); state["status"] != "in_sync" {
+		t.Fatalf("bundle env convergence = %#v", state)
+	}
+}
 
 func registerFleetStateRun(t *testing.T, srv http.Handler, token string) {
 	registerFleetStateRunWithID(t, srv, token, fleetStateRunID)
