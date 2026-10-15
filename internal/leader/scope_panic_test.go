@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rvben/shinyhub/internal/safego"
 )
@@ -32,11 +33,19 @@ func TestOwnerScope_FatalPanicPropagates(t *testing.T) {
 		})
 		s.Acquire(1)
 		s.Lose()
-		return // reaching here means the Fatal was absorbed
+		// Lose observes close(done) during panic unwinding, before the runtime
+		// necessarily terminates the process. Keep the test process alive so
+		// returning from this test cannot race with that termination.
+		select {}
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestOwnerScope_FatalPanicPropagates$", "-test.count=1")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOwnerScope_FatalPanicPropagates$", "-test.count=1")
 	cmd.Env = append(os.Environ(), "FATAL_PANIC_TEST_CHILD=1")
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("child process did not terminate after a safego.Fatal: %v; output:\n%s", ctx.Err(), out)
+	}
 	if err == nil {
 		t.Fatalf("child process survived a safego.Fatal raised in owner work; output:\n%s", out)
 	}
