@@ -311,6 +311,8 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 			SET status = 'superseded', finished_at = ?, updated_at = CURRENT_TIMESTAMP
 			WHERE app_id = ? AND target_generation <> ? AND schedule_run_id IS NOT NULL
 			  AND status IN ('pending', 'deferred_interval', 'deferred_capacity')
+ AND NOT EXISTS (SELECT 1 FROM deployment_replicas gr
+   WHERE gr.app_id = schedule_activations.app_id AND gr.deployment_id = schedule_activations.activation_deployment_id)
  AND NOT EXISTS (SELECT 1 FROM replicas r WHERE r.app_id = schedule_activations.app_id AND r.activation_id = schedule_activations.id
   AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> ''))`,
 			p.FinishedAt, appID, generation); err != nil {
@@ -398,7 +400,11 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 		UPDATE schedule_activations
 		SET status = 'superseded', superseded_by_id = ?, finished_at = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE app_id = ? AND id <> ? AND schedule_run_id IS NOT NULL
-		  AND status IN ('pending', 'deferred_interval', 'deferred_capacity')`,
+		  AND status IN ('pending', 'deferred_interval', 'deferred_capacity')
+          AND NOT EXISTS (SELECT 1 FROM deployment_replicas r
+            WHERE r.app_id = schedule_activations.app_id AND r.deployment_id = schedule_activations.activation_deployment_id)
+          AND NOT EXISTS (SELECT 1 FROM replicas r WHERE r.app_id = schedule_activations.app_id AND r.activation_id = schedule_activations.id
+            AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> ''))`,
 		activationID, p.FinishedAt, appID, activationID,
 	); err != nil {
 		return nil, fmt.Errorf("complete schedule run: coalesce queue: %w", err)
@@ -562,7 +568,8 @@ func (s *Store) claimNextScheduleActivation(now time.Time, repairOnly bool) (*Sc
 	if repairOnly {
 		runtimeFilter = ` AND (a.status IN ('running','repairing') OR EXISTS (
    SELECT 1 FROM replicas r WHERE r.app_id=a.app_id AND r.activation_id=a.id
-   AND (r.pid IS NOT NULL OR r.worker_id<>'' OR r.endpoint_url<>''))) `
+   AND (r.pid IS NOT NULL OR r.worker_id<>'' OR r.endpoint_url<>'')) OR EXISTS (
+   SELECT 1 FROM deployment_replicas r WHERE r.app_id=a.app_id AND r.deployment_id=a.activation_deployment_id)) `
 	}
 	ctx := context.Background()
 	tx, err := s.d.beginWrite(ctx, s.rawDB(), scheduleActivationLockKey)
@@ -685,7 +692,11 @@ func (s *Store) DeferScheduleActivation(id int64, status, reason string, dueAt, 
 	var ownsRuntime bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
   SELECT 1 FROM replicas r JOIN schedule_activations a ON a.app_id = r.app_id AND a.id = r.activation_id
-  WHERE a.id = ? AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> ''))`, id).Scan(&ownsRuntime); err != nil {
+  WHERE a.id = ? AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> '')
+  UNION ALL
+  SELECT 1 FROM deployment_replicas r JOIN schedule_activations a
+    ON a.app_id = r.app_id AND a.activation_deployment_id = r.deployment_id
+  WHERE a.id = ?)`, id, id).Scan(&ownsRuntime); err != nil {
 		return err
 	}
 	persistedStatus := status
@@ -739,7 +750,9 @@ func (s *Store) DeferScheduleActivation(id int64, status, reason string, dueAt, 
        AND schedule_run_id IS NOT NULL AND status IN ('pending', 'deferred_interval', 'deferred_capacity')),
       finished_at = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ? AND status = 'deferred_capacity'
-      AND NOT EXISTS (SELECT 1 FROM replicas r WHERE r.app_id = schedule_activations.app_id AND r.activation_id = schedule_activations.id
+      AND NOT EXISTS (SELECT 1 FROM deployment_replicas gr
+   WHERE gr.app_id = schedule_activations.app_id AND gr.deployment_id = schedule_activations.activation_deployment_id)
+ AND NOT EXISTS (SELECT 1 FROM replicas r WHERE r.app_id = schedule_activations.app_id AND r.activation_id = schedule_activations.id
        AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> ''))
       AND EXISTS (SELECT 1 FROM schedule_activations WHERE app_id = ? AND id > ?
        AND schedule_run_id IS NOT NULL AND status IN ('pending', 'deferred_interval', 'deferred_capacity'))`,
@@ -903,7 +916,10 @@ func (s *Store) ScheduleActivationInFlight(appID int64) (bool, error) {
 				SELECT 1 FROM replicas r
 				WHERE r.app_id = a.app_id AND r.activation_id = a.id
 				  AND (r.pid IS NOT NULL OR r.worker_id <> '' OR r.endpoint_url <> '')
-			)
+            ) OR EXISTS (
+                SELECT 1 FROM deployment_replicas r
+                WHERE r.app_id = a.app_id AND r.deployment_id = a.activation_deployment_id
+            )
 		  )`, appID).Scan(&n)
 	return n > 0, err
 }

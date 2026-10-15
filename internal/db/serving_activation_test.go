@@ -269,3 +269,61 @@ func TestServingActivationPreservesProducerConvergenceAdmission(t *testing.T) {
 		t.Fatalf("convergence missed serving authority: %+v %v", claimed, err)
 	}
 }
+
+func TestGroupedCandidateRetainsRuntimeOwnership(t *testing.T) {
+	for _, action := range []string{"roll", "none"} {
+		t.Run(action, func(t *testing.T) {
+			store := newScheduleStore(t)
+			appID := newScheduleAppFixture(t, store, "retained-grouped")
+			dep := promoteConvergenceDeployment(t, store, appID, "v1", "digest-v1")
+			scheduleID := createConvergenceSchedule(t, store, appID, `["true"]`, "bundle_change")
+			now := time.Now().UTC().Truncate(time.Second)
+			run := insertActivationRun(t, store, scheduleID, now.Add(-time.Minute), "roll", 0)
+			a, err := store.CompleteScheduleRunAndEnqueueActivation(db.CompleteScheduleRunParams{RunID: run, Status: "succeeded", ExitCode: intPtr(0), FinishedAt: now})
+			if err != nil || a == nil {
+				t.Fatalf("activation=%+v %v", a, err)
+			}
+			candidate, err := store.ActivationDeployment(a.ID, dep)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpsertDeploymentReplica(db.UpsertDeploymentReplicaParams{AppID: appID, DeploymentID: candidate.ID, Index: 0, Status: "starting"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.ClaimNextScheduleActivation(now); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpdateScheduleActivationProgress(a.ID, "recovering", -1, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DeferScheduleActivation(a.ID, "deferred_capacity", "tight host", now, now); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := store.GetScheduleActivation(a.ID)
+			if err != nil || stored.Status != "repairing" || stored.Phase != "recovering" || stored.Attempts != 0 {
+				t.Fatalf("runtime owner lost on capacity defer: %+v %v", stored, err)
+			}
+			// Also protect a durable worker if an older server left the owner
+			// pending: in-flight checks, coalescing and repair-only claims must
+			// all recognize grouped runtime without a canonical replicas row.
+			if _, err := store.DB().Exec("UPDATE schedule_activations SET status='pending' WHERE id=?", a.ID); err != nil {
+				t.Fatal(err)
+			}
+			if inFlight, err := store.ScheduleActivationInFlight(appID); err != nil || !inFlight {
+				t.Fatalf("runtime lost lifecycle fence: %t %v", inFlight, err)
+			}
+			run = insertActivationRun(t, store, scheduleID, now, action, 0)
+			if _, err := store.CompleteScheduleRunAndEnqueueActivation(db.CompleteScheduleRunParams{RunID: run, Status: "succeeded", ExitCode: intPtr(0), FinishedAt: now.Add(time.Second)}); err != nil {
+				t.Fatal(err)
+			}
+			stored, err = store.GetScheduleActivation(a.ID)
+			if err != nil || stored.Status != "pending" {
+				t.Fatalf("runtime owner coalesced away: %+v %v", stored, err)
+			}
+			claimed, err := store.ClaimNextScheduleActivationRepair(now.Add(time.Minute))
+			if err != nil || claimed.ID != a.ID {
+				t.Fatalf("grouped runtime not reclaimed for repair: %+v %v", claimed, err)
+			}
+		})
+	}
+}

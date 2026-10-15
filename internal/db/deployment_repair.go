@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -109,4 +110,54 @@ func (s *Store) AppDeploymentRepairBlocker(appID int64) (*DeploymentSummary, err
 		return nil, fmt.Errorf("load deployment repair blocker: %w", err)
 	}
 	return &dep, nil
+}
+
+// CompatibilityState is one statement snapshot of all consumer-start fences.
+// Separate quarantine and cause queries can straddle a producer completion and
+// otherwise report a quarantine with no cause (or omit a newly failed writer).
+type CompatibilityState struct {
+	AppProducerCompatibility
+	DeploymentRepair *DeploymentSummary
+}
+
+func (s CompatibilityState) Quarantined() bool {
+	return s.DeploymentRepair != nil || len(s.RepairProducers) > 0 || len(s.RunningProducers) > 0
+}
+
+func (s *Store) AppCompatibilityState(appID int64) (CompatibilityState, error) {
+	state := CompatibilityState{AppProducerCompatibility: AppProducerCompatibility{RepairProducers: []string{}, RunningProducers: []string{}}}
+	rows, err := s.db.Query(`SELECT 'deployment', failed.id, failed.version, failed.status,
+ COALESCE(failed.failure_reason, ''), failed.created_at FROM deployments failed
+ WHERE failed.app_id = ? AND `+deploymentRepairConditionSQL+`
+ UNION ALL
+ SELECT 'repair', sc.id, sc.name, '', '', NULL FROM app_schedules sc
+ WHERE sc.app_id = ? AND EXISTS (SELECT 1 FROM schedule_data_uncertainty u WHERE u.schedule_id = sc.id)
+ UNION ALL
+ SELECT 'running', sc.id, sc.name, '', '', NULL FROM app_schedules sc
+ WHERE sc.app_id = ? AND EXISTS (SELECT 1 FROM schedule_runs r WHERE r.schedule_id = sc.id AND r.publishes_data = 1 AND r.status = 'running')`, appID, appID, appID)
+	if err != nil {
+		return state, fmt.Errorf("load compatibility snapshot: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, name, status, reason string
+		var id int64
+		var createdAt sql.NullTime
+		if err := rows.Scan(&kind, &id, &name, &status, &reason, &createdAt); err != nil {
+			return state, fmt.Errorf("scan compatibility snapshot: %w", err)
+		}
+		switch kind {
+		case "deployment":
+			if state.DeploymentRepair == nil || id < state.DeploymentRepair.ID {
+				state.DeploymentRepair = &DeploymentSummary{ID: id, Version: name, Status: status, FailureReason: reason, CreatedAt: createdAt.Time}
+			}
+		case "repair":
+			state.RepairProducers = append(state.RepairProducers, name)
+		case "running":
+			state.RunningProducers = append(state.RunningProducers, name)
+		}
+	}
+	sort.Strings(state.RepairProducers)
+	sort.Strings(state.RunningProducers)
+	return state, rows.Err()
 }

@@ -613,24 +613,20 @@ func (s *Server) handleGetApp(w http.ResponseWriter, r *http.Request) {
 			"convergence_error":        fr.ConvergenceError,
 		})
 	}
-	compatibilityQuarantined, compatibilityErr := s.store.AppCompatibilityQuarantined(app.ID)
+	compatibility, compatibilityErr := s.store.AppCompatibilityState(app.ID)
 	if compatibilityErr != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load app compatibility state")
 		return
 	}
-	deploymentRepairBlocker, repairErr := s.store.AppDeploymentRepairBlocker(app.ID)
+	compatibilityQuarantined := compatibility.Quarantined()
+	deploymentRepairBlocker := compatibility.DeploymentRepair
 	deploymentRepairRequired := deploymentRepairBlocker != nil
-	if repairErr != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load deployment repair state")
-		return
-	}
 	app.DeploymentRepairRequired = &deploymentRepairRequired
-	producerByApp, producerErr := s.store.ProducerCompatibilityForApps([]int64{app.ID})
-	if producerErr != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load producer compatibility state")
-		return
+	producer := compatibility.AppProducerCompatibility
+	producerRepairRequired = len(producer.RepairProducers) > 0
+	if producerRepairRequired {
+		scheduleConvergenceSatisfied = false
 	}
-	producer := producerByApp[app.ID]
 	app.CompatibilityQuarantined = compatibilityQuarantined
 	app.ProducerRepairRequired = producerRepairRequired
 	app.ProducerRepairSchedules = producer.RepairProducers

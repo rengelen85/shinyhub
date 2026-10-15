@@ -10,6 +10,7 @@ import (
 )
 
 var errScheduleActivationInFlight = errors.New("scheduled data activation owns serving runtime state")
+var errProducerInProgress = errors.New("producer_in_progress")
 var errCompatibilityQuarantined = errors.New("app is compatibility-quarantined")
 var errGenerationDraining = errors.New("previous generation is still draining")
 var errRetiringProxy = errors.New("previous ShinyHub process still proxies sessions; retry after its reload drain completes")
@@ -48,34 +49,26 @@ func (s *Server) guardActivationLifecycleWithDrain(appID int64, operation string
 }
 
 func (s *Server) guardCompatibilityQuarantine(appID int64, operation string) error {
-	quarantined, err := s.store.AppCompatibilityQuarantined(appID)
+	state, err := s.store.AppCompatibilityState(appID)
 	if err != nil {
 		return fmt.Errorf("%s: check compatibility quarantine: %w", operation, err)
 	}
-	if quarantined {
-		blocker, err := s.store.AppDeploymentRepairBlocker(appID)
-		if err != nil {
-			return fmt.Errorf("%s: inspect deployment repair state: %w", operation, err)
-		}
-		if blocker != nil {
-			return fmt.Errorf("%s: %w; %s", operation, errCompatibilityQuarantined, deploymentRepairGuidance(blocker))
-		}
-		producers, err := s.store.ProducerCompatibilityForApps([]int64{appID})
-		if err != nil {
-			return fmt.Errorf("%s: inspect producer repair state: %w", operation, err)
-		}
+	if blocker := state.DeploymentRepair; blocker != nil {
+		return fmt.Errorf("%s: %w; %s", operation, errCompatibilityQuarantined, deploymentRepairGuidance(blocker))
+	}
+	if len(state.RepairProducers) > 0 {
 		app, err := s.store.GetAppByID(appID)
 		if err != nil {
 			return err
 		}
 		var commands []string
-		for _, name := range producers[appID].RepairProducers {
+		for _, name := range state.RepairProducers {
 			commands = append(commands, fmt.Sprintf("shinyhub schedule run %s %s --follow", app.Slug, name))
 		}
-		if len(commands) > 0 {
-			return fmt.Errorf("%s: %w; repair producers with %s before starting consumers", operation, errCompatibilityQuarantined, strings.Join(commands, "; "))
-		}
-		return fmt.Errorf("%s: %w; wait for running data producers to finish before starting consumers", operation, errCompatibilityQuarantined)
+		return fmt.Errorf("%s: %w; repair producers with %s before starting consumers", operation, errCompatibilityQuarantined, strings.Join(commands, "; "))
+	}
+	if names := state.RunningProducers; len(names) > 0 {
+		return fmt.Errorf("%s: %w: %w; waiting for running data producers %s to finish successfully before starting consumers", operation, errCompatibilityQuarantined, errProducerInProgress, strings.Join(names, ", "))
 	}
 	return nil
 }
@@ -92,6 +85,15 @@ func (s *Server) acquireConsumerBootGate(appID int64) (func(), error) {
 		return func() {}, nil
 	}
 	return s.jobs.AcquireCompatibleConsumerBootGate(appID)
+}
+
+// Background activation must yield to admitted writers instead of stalling the
+// single coordinator while a producer owns the publication fence.
+func (s *Server) tryAcquireActivationBootGate(appID int64) (func(), error) {
+	if s.jobs == nil {
+		return s.acquireConsumerBootGate(appID)
+	}
+	return s.jobs.TryAcquireCompatibleConsumerBootGate(appID)
 }
 
 // acquireRawConsumerBootGate is reserved for candidate convergence, which

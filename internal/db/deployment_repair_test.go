@@ -167,3 +167,40 @@ func TestDeploymentRepairBlockerTracksOriginalUntilSuccess(t *testing.T) {
 		t.Fatalf("repaired blocker=%+v err=%v", blocker, err)
 	}
 }
+
+func TestCompatibilitySnapshotKeepsCausesTogether(t *testing.T) {
+	store := mustOpenDB(t)
+	owner := mustCreateUser(t, store, "snapshot-owner", "developer")
+	app := mustCreateApp(t, store, "snapshot", owner.ID)
+	dep := promoteConvergenceDeployment(t, store, app.ID, "v1", "sha256:v1")
+	schedule := createConvergenceSchedule(t, store, app.ID, `["producer"]`, schedulespec.DeployTriggerBundleChange)
+	run := insertProducerRun(t, store, schedule, dep, `["producer"]`)
+	check := func(running, repair, deployment bool) {
+		t.Helper()
+		state, err := store.AppCompatibilityState(app.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (len(state.RunningProducers) > 0) != running || (len(state.RepairProducers) > 0) != repair || (state.DeploymentRepair != nil) != deployment || state.Quarantined() != (running || repair || deployment) {
+			t.Fatalf("snapshot=%+v", state)
+		}
+		if deployment && (state.DeploymentRepair.Version != "broken" || state.DeploymentRepair.CreatedAt.IsZero()) {
+			t.Fatalf("deployment=%+v", state.DeploymentRepair)
+		}
+	}
+	check(true, false, false)
+	finishProducerRun(t, store, run, "failed")
+	check(false, true, false)
+	repair := insertProducerRun(t, store, schedule, dep, `["producer"]`)
+	check(true, true, false)
+	finishProducerRun(t, store, repair, "succeeded")
+	check(false, false, false)
+	broken, err := store.BeginDeployment(app.ID, "broken", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDeploymentProducerBarrierEntered(broken.ID); err != nil {
+		t.Fatal(err)
+	}
+	check(false, false, true)
+}

@@ -55,6 +55,7 @@ type scheduleFailureLog struct {
 }
 
 const (
+	failureProducerInProgress   = "producer_in_progress"
 	failureWarmWaitTimeout      = "warm_wait_timeout"
 	failureWarmStateUnavailable = "warm_state_unavailable"
 	failureWarmDeployRunFailed  = "warm_deploy_run_failed"
@@ -291,11 +292,30 @@ func verifyExistingWarmGate(cfg *cliConfig, slug, bundleDir string, res *applyRe
 // with work that is already repairing the condition, without dispatching a
 // duplicate query or accepting "running" as proof of delivered data.
 func verifyExistingWarmGateWithWait(cfg *cliConfig, slug, bundleDir string, res *applyResult, timeout time.Duration, out io.Writer) error {
-	if err := requestScheduleConvergence(cfg, slug); err != nil {
+	return verifyExistingWarmGateContext(context.Background(), cfg, slug, bundleDir, res, timeout, out)
+}
+
+func verifyExistingWarmGateContext(parent context.Context, cfg *cliConfig, slug, bundleDir string, res *applyResult, timeout time.Duration, out io.Writer) (resultErr error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx := parent
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, timeout)
+		defer cancel()
+	}
+	deadline, _ := ctx.Deadline()
+	defer func() {
+		if errors.Is(resultErr, context.DeadlineExceeded) {
+			res.failureKind = failureWarmWaitTimeout
+		}
+	}()
+	if err := requestScheduleConvergenceContext(ctx, cfg, slug); err != nil {
 		res.failureKind = failureWarmStateUnavailable
 		return fmt.Errorf("reconcile deploy-triggered schedules: %w", err)
 	}
-	remote, err := listSchedules(cfg, slug)
+	remote, err := listSchedulesContext(ctx, cfg, slug)
 	if err != nil {
 		res.failureKind = failureWarmStateUnavailable
 		return fmt.Errorf("verify deploy-triggered schedules: %w", err)
@@ -308,23 +328,7 @@ func verifyExistingWarmGateWithWait(cfg *cliConfig, slug, bundleDir string, res 
 			declared = append(declared, schedule.Name)
 		}
 	}
-	if len(declared) == 0 {
-		if err := requireAppCompatibilityClear(cfg, slug); err != nil {
-			classifyAppCompatibilityFailure(res, err)
-			return err
-		}
-		return nil
-	}
-
 	var failures []string
-	var ctx context.Context
-	var cancel context.CancelFunc
-	var deadline time.Time
-	if timeout > 0 {
-		ctx, cancel = context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		deadline = time.Now().Add(timeout)
-	}
 	origin := warmGateOrigin(res.action)
 	for _, name := range declared {
 		schedule, ok := byName[name]
@@ -369,25 +373,32 @@ func verifyExistingWarmGateWithWait(cfg *cliConfig, slug, bundleDir string, res 
 			if remaining <= 0 {
 				res.warmGate = append(res.warmGate, outcome)
 				res.failureKind = failureWarmWaitTimeout
-				appendScheduleLog(cfg, slug, schedule.ID, outcome.ActiveRunID, name, res)
+				appendScheduleLogContext(ctx, cfg, slug, schedule.ID, outcome.ActiveRunID, name, res)
 				return fmt.Errorf("schedule %q active warm-up not confirmed within --warm-timeout %s: %w", name, timeout, errDeployRunTimeout)
 			}
 			poll := func() (string, error) {
 				return pollScheduleRunStatusContext(ctx, cfg, slug, schedule.ID, outcome.ActiveRunID)
 			}
 			status, waitErr := waitForDeployRunLoop(poll, remaining, 2*time.Second, fleetHealthProgressInterval,
-				time.Now, time.Sleep, out, fleetDeployRunLabel(slug, name)+" (active)", runWaitPresentation{phase: "Waiting for warm-up", detail: fmt.Sprintf("%s · run #%d (active)", name, outcome.ActiveRunID)})
+				time.Now, func(d time.Duration) {
+					timer := time.NewTimer(d)
+					defer timer.Stop()
+					select {
+					case <-ctx.Done():
+					case <-timer.C:
+					}
+				}, out, fleetDeployRunLabel(slug, name)+" (active)", runWaitPresentation{phase: "Waiting for warm-up", detail: fmt.Sprintf("%s · run #%d (active)", name, outcome.ActiveRunID)})
 			if waitErr != nil {
 				res.warmGate = append(res.warmGate, outcome)
 				res.failureKind = failureWarmStateUnavailable
 				if errors.Is(waitErr, errDeployRunTimeout) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					res.failureKind = failureWarmWaitTimeout
 				}
-				appendScheduleLog(cfg, slug, schedule.ID, outcome.ActiveRunID, name, res)
+				appendScheduleLogContext(ctx, cfg, slug, schedule.ID, outcome.ActiveRunID, name, res)
 				return fmt.Errorf("schedule %q active warm-up not confirmed within --warm-timeout %s: %w", name, timeout, waitErr)
 			}
 			if deployRunStatusOK(status) {
-				latest, refreshErr := listSchedules(cfg, slug)
+				latest, refreshErr := listSchedulesContext(ctx, cfg, slug)
 				if refreshErr != nil {
 					res.failureKind = failureWarmStateUnavailable
 					return fmt.Errorf("refresh schedule %q convergence: %w", name, refreshErr)
@@ -405,11 +416,11 @@ func verifyExistingWarmGateWithWait(cfg *cliConfig, slug, bundleDir string, res 
 			outcome.LastRunStatus = status
 			outcome.Refreshing = false
 			if scheduleStatusHasFailureLog(status) {
-				appendScheduleLog(cfg, slug, schedule.ID, outcome.ActiveRunID, name, res)
+				appendScheduleLogContext(ctx, cfg, slug, schedule.ID, outcome.ActiveRunID, name, res)
 			}
 		}
 		if outcome.LastRunID > 0 && scheduleStatusHasFailureLog(outcome.LastRunStatus) && len(res.scheduleLogs) == logCount {
-			appendScheduleLog(cfg, slug, schedule.ID, outcome.LastRunID, name, res)
+			appendScheduleLogContext(ctx, cfg, slug, schedule.ID, outcome.LastRunID, name, res)
 		}
 		res.warmGate = append(res.warmGate, outcome)
 		failures = append(failures, describeDeployTriggerUnsatisfied(outcome, schedule, repairRequired, time.Now()))
@@ -421,7 +432,7 @@ func verifyExistingWarmGateWithWait(cfg *cliConfig, slug, bundleDir string, res 
 		// one final authoritative whole-set snapshot. If that snapshot moved, loop
 		// within the original remaining budget until the complete current set is a
 		// fixed point; never combine successes from different deployments.
-		latest, refreshErr := listSchedules(cfg, slug)
+		latest, refreshErr := listSchedulesContext(ctx, cfg, slug)
 		if refreshErr != nil {
 			res.failureKind = failureWarmStateUnavailable
 			return fmt.Errorf("final schedule convergence check: %w", refreshErr)
@@ -440,11 +451,15 @@ func verifyExistingWarmGateWithWait(cfg *cliConfig, slug, bundleDir string, res 
 			}
 		}
 		if len(moved) == 0 {
-			if err := requireAppCompatibilityClear(cfg, slug); err != nil {
-				classifyAppCompatibilityFailure(res, err)
+			waited, err := waitForAppCompatibilityClearObserved(ctx, cfg, slug, res, out)
+			if err != nil {
 				return err
 			}
-			return nil
+			if !waited {
+				return nil
+			}
+			// Re-read convergence after a compatibility wait: schedules or the
+			// deployed bundle may have changed while producers were running.
 		}
 		if timeout <= 0 {
 			res.failureKind = failureWarmNeverSucceeded
@@ -453,9 +468,12 @@ func verifyExistingWarmGateWithWait(cfg *cliConfig, slug, bundleDir string, res 
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			res.failureKind = failureWarmWaitTimeout
+			if len(moved) == 0 {
+				return fmt.Errorf("final schedule convergence recheck was not completed by --warm-timeout deadline %s: %w", deadline.Format(time.RFC3339), context.DeadlineExceeded)
+			}
 			return fmt.Errorf("schedule convergence changed during verification and was not restored within --warm-timeout %s: %w", timeout, errDeployRunTimeout)
 		}
-		return verifyExistingWarmGateWithWait(cfg, slug, bundleDir, res, remaining, out)
+		return verifyExistingWarmGateContext(ctx, cfg, slug, bundleDir, res, remaining, out)
 	}
 	res.failureKind = failureWarmNeverSucceeded
 	prefix := "warm gate already unsatisfied before this apply"
@@ -466,9 +484,11 @@ func verifyExistingWarmGateWithWait(cfg *cliConfig, slug, bundleDir string, res 
 }
 
 type appCompatibilityQuarantineError struct {
-	detail        string
-	repairCommand string
-	repairAdvice  string
+	detail               string
+	repairCommand        string
+	repairAdvice         string
+	producerInProgress   bool
+	recheckCompatibility bool
 }
 
 func (e *appCompatibilityQuarantineError) Error() string { return e.detail }
@@ -477,6 +497,9 @@ func classifyAppCompatibilityFailure(res *applyResult, err error) {
 	var quarantine *appCompatibilityQuarantineError
 	if errors.As(err, &quarantine) {
 		res.failureKind = failureWarmNeverSucceeded
+		if quarantine.producerInProgress {
+			res.failureKind = failureProducerInProgress
+		}
 		return
 	}
 	res.failureKind = failureWarmStateUnavailable
@@ -506,8 +529,10 @@ func requireAppCompatibilityClearContext(ctx context.Context, cfg *cliConfig, sl
 		return fmt.Errorf("verify app compatibility: %w", &deployHTTPError{statusCode: resp.StatusCode, body: string(body)})
 	}
 	var state struct {
-		CompatibilityQuarantined *bool `json:"compatibility_quarantined"`
-		ProducerRepairRequired   *bool `json:"producer_repair_required"`
+		CompatibilityQuarantined *bool    `json:"compatibility_quarantined"`
+		ProducerRepairRequired   *bool    `json:"producer_repair_required"`
+		RunningDataProducers     []string `json:"running_data_producers"`
+		ProducerRepairSchedules  []string `json:"producer_repair_schedules"`
 		DeploymentRepair         *struct {
 			ID            int64      `json:"id"`
 			Version       string     `json:"version"`
@@ -525,7 +550,7 @@ func requireAppCompatibilityClearContext(ctx context.Context, cfg *cliConfig, sl
 		} `json:"app"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
-		return fmt.Errorf("verify app compatibility: decode response: %w", err)
+		return &protocolError{op: "verify app compatibility: decode response", err: err}
 	}
 	if state.CompatibilityQuarantined == nil || state.ProducerRepairRequired == nil {
 		return fmt.Errorf("verify app compatibility: server response omitted authoritative compatibility state")
@@ -539,7 +564,11 @@ func requireAppCompatibilityClearContext(ctx context.Context, cfg *cliConfig, sl
 	}
 	switch {
 	case *state.ProducerRepairRequired && (state.App.DeploymentRepairRequired == nil || !*state.App.DeploymentRepairRequired):
-		return &appCompatibilityQuarantineError{detail: "app compatibility quarantine requires a successful producer repair before consumers can start"}
+		detail := "app compatibility quarantine requires a successful producer repair before consumers can start"
+		for _, name := range state.ProducerRepairSchedules {
+			detail += "; run shinyhub schedule run " + shellQuote(slug) + " " + shellQuote(name) + " --follow"
+		}
+		return &appCompatibilityQuarantineError{detail: detail}
 	case *state.CompatibilityQuarantined && state.App.DeploymentRepairRequired != nil && *state.App.DeploymentRepairRequired:
 		if state.App.LastDeploymentStatus == "pending" {
 			return &appCompatibilityQuarantineError{detail: fmt.Sprintf("app compatibility is quarantined while deployment %q is pending; wait for it to finish, or investigate an interrupted deployment before retrying", state.App.CurrentVersion)}
@@ -559,6 +588,13 @@ func requireAppCompatibilityClearContext(ctx context.Context, cfg *cliConfig, sl
 		}
 		detail += "; successful producers alone do not clear the deployment barrier. Redeploy the desired bundle with " + command + " " + instruction + ", including its required data producers; if stopping the working version is acceptable and required, add --allow-downtime"
 		return &appCompatibilityQuarantineError{detail: detail, repairCommand: command}
+	case *state.CompatibilityQuarantined && state.App.DeploymentRepairRequired != nil && !*state.App.DeploymentRepairRequired && len(state.RunningDataProducers) > 0:
+		return &appCompatibilityQuarantineError{
+			detail:             "waiting for running data producers: " + strings.Join(state.RunningDataProducers, ", ") + "; consumers can start after successful completion",
+			producerInProgress: true,
+		}
+	case *state.CompatibilityQuarantined && state.App.DeploymentRepairRequired != nil && !*state.App.DeploymentRepairRequired:
+		return &appCompatibilityQuarantineError{detail: "compatibility state changed during observation; rechecking active data producers", recheckCompatibility: true}
 	case *state.CompatibilityQuarantined:
 		detail := "app compatibility is quarantined; consumers cannot start. Check active data producers and deployment history to identify the unresolved compatibility fence"
 		advice := ""
@@ -594,8 +630,12 @@ func observedScheduleConvergenceWork(res applyResult) bool {
 }
 
 func requestScheduleConvergence(cfg *cliConfig, slug string) error {
+	return requestScheduleConvergenceContext(context.Background(), cfg, slug)
+}
+
+func requestScheduleConvergenceContext(ctx context.Context, cfg *cliConfig, slug string) error {
 	url := fmt.Sprintf("%s/api/apps/%s/schedules/reconcile", cfg.Host, slug)
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return err
 	}

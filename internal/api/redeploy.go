@@ -963,3 +963,34 @@ func (s *Server) unlockForServingReadiness(slug string, release *func()) func() 
 		fleetRelease()
 	}
 }
+
+var errActivationReadinessRelock = errors.New("activation readiness lifecycle fence is busy")
+
+// Retain the fleet readiness accounting while yielding the app lock, then try
+// to reacquire it without blocking the global activation coordinator.
+func (s *Server) unlockForActivationReadiness(slug string, release *func()) func() error {
+	fleetRelease, err := s.acquireFleetMutationFence(unix.LOCK_SH)
+	if err != nil {
+		panic(fmt.Sprintf("retain activation readiness fence: %v", err))
+	}
+	s.deployLocksMu.Lock()
+	s.unlockedReadinessOperations++
+	s.deployLocksMu.Unlock()
+	(*release)()
+	*release = func() {}
+	return func() error {
+		next, err := s.acquireAppOperation(slug, true)
+		s.deployLocksMu.Lock()
+		s.unlockedReadinessOperations--
+		s.deployLocksMu.Unlock()
+		fleetRelease()
+		if err != nil {
+			return fmt.Errorf("%w: %v", errActivationReadinessRelock, err)
+		}
+		if next == nil {
+			return errActivationReadinessRelock
+		}
+		*release = next
+		return nil
+	}
+}

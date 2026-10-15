@@ -1138,6 +1138,14 @@ func (g *publicationGate) RLock() {
 	g.admission.Unlock()
 }
 
+func (g *publicationGate) TryRLock() bool {
+	if !g.admission.TryLock() {
+		return false
+	}
+	defer g.admission.Unlock()
+	return g.RWMutex.TryRLock()
+}
+
 func (g *publicationGate) lockContext(ctx context.Context) error {
 	if err := waitAdmission(ctx, g.admission.TryLock); err != nil {
 		return err
@@ -1173,6 +1181,46 @@ func (m *Manager) AcquireConsumerBootGate(appID int64) (func(), error) {
 		releaseFile()
 		gate.RUnlock()
 	}, nil
+}
+
+// ErrConsumerBootBusy means publication ownership is held or queued elsewhere.
+var ErrConsumerBootBusy = errors.New("data publication is in progress")
+
+// TryAcquireCompatibleConsumerBootGate is the nonblocking background-activation
+// counterpart. Preserve writer priority at both local admission and flock, and
+// check compatibility only after acquiring both publication fences.
+func (m *Manager) TryAcquireCompatibleConsumerBootGate(appID int64) (func(), error) {
+	m.mu.Lock()
+	gate := m.publicationGateFor(appID)
+	m.mu.Unlock()
+	if !gate.TryRLock() {
+		return nil, ErrConsumerBootBusy
+	}
+	path := filepath.Join(m.publicationLockDir, fmt.Sprintf("app-%d.publication.lock", appID))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o640)
+	if err != nil {
+		gate.RUnlock()
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+		_ = f.Close()
+		gate.RUnlock()
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return nil, ErrConsumerBootBusy
+		}
+		return nil, err
+	}
+	release := func() { _ = f.Close(); gate.RUnlock() }
+	quarantined, err := m.store.AppCompatibilityQuarantined(appID)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	if quarantined {
+		release()
+		return nil, ErrAppCompatibilityQuarantined
+	}
+	return release, nil
 }
 
 // AcquireCompatibleConsumerBootGate atomically couples publication exclusion

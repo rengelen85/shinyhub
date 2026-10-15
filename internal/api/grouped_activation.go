@@ -18,22 +18,6 @@ import (
 // held by Roll at publication; readiness releases the operation lock while the
 // durable running activation fences lifecycle writers.
 func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current *db.Deployment, a *db.ScheduleActivation, unlockReadiness func() func() error) error {
-	if app.Status == "waking" {
-		return &activation.RetryableError{Reason: "app wake is in progress", RetryAfter: 5 * time.Second}
-	}
-	restarting := a.Phase == "grouped_restart"
-	if app.Status != "running" && app.Status != "degraded" && !restarting {
-		// A later wake starts fresh workers; discard snapshots without resurrecting
-		// an intentionally stopped or hibernated application.
-		for _, worker := range s.manager.AllForSlug(app.Slug) {
-			if worker != nil && worker.Status == process.StatusSuspended {
-				if err := s.manager.StopReplicaConfirmed(app.Slug, worker.Index); err != nil {
-					return s.activationRepairError(err)
-				}
-			}
-		}
-		return activation.ErrNotNeeded
-	}
 	linked, err := s.store.ActivationDeploymentID(a.ID)
 	if err != nil {
 		return err
@@ -77,6 +61,42 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 		}
 		return s.activationRepairError(errors.New("published grouped activation has no verified ready worker"))
 	}
+	// Reclaimed candidates still consume surge and memory. Prove their runtime
+	// absent before any admission or lifecycle check can defer this owner.
+	if linked != 0 {
+		candidate, err := s.store.GetDeploymentByID(linked)
+		if err != nil {
+			return s.activationRepairError(err)
+		}
+		if candidate.Status == db.DeploymentPending || candidate.Status == db.DeploymentFailed {
+			if !s.stopAndForgetCandidate(app.Slug, candidate.ID) {
+				return s.activationRepairError(errors.New("interrupted grouped candidate cleanup is unconfirmed"))
+			}
+			if err := s.store.FailDeploymentWithReason(candidate.ID, "interrupted grouped activation reclaimed"); err != nil {
+				return s.activationRepairError(err)
+			}
+			if err := s.store.ResetFailedActivationDeployment(a.ID, candidate.ID); err != nil {
+				return s.activationRepairError(err)
+			}
+			linked = 0
+		}
+	}
+	if app.Status == "waking" {
+		return &activation.RetryableError{Reason: "app wake is in progress", RetryAfter: 5 * time.Second}
+	}
+	restarting := a.Phase == "grouped_restart"
+	if app.Status != "running" && app.Status != "degraded" && !restarting {
+		// A later wake starts fresh workers; discard snapshots without resurrecting
+		// an intentionally stopped or hibernated application.
+		for _, worker := range s.manager.AllForSlug(app.Slug) {
+			if worker != nil && worker.Status == process.StatusSuspended {
+				if err := s.manager.StopReplicaConfirmed(app.Slug, worker.Index); err != nil {
+					return s.activationRepairError(err)
+				}
+			}
+		}
+		return activation.ErrNotNeeded
+	}
 	rows, err := s.store.ListDeploymentReplicas(app.ID)
 	if err != nil {
 		return s.activationRepairError(err)
@@ -112,25 +132,6 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 	candidate, err := s.store.ActivationDeployment(a.ID, current)
 	if err != nil {
 		return s.activationRepairError(err)
-	}
-	// An interrupted pending candidate must be proven absent before retrying
-	// its execution identity. Keep its durable activation linkage.
-	if candidate.Status == db.DeploymentPending {
-		if !s.stopAndForgetCandidate(app.Slug, candidate.ID) {
-			return s.activationRepairError(errors.New("interrupted grouped candidate cleanup is unconfirmed"))
-		}
-	}
-	if candidate.Status == db.DeploymentFailed {
-		if !s.stopAndForgetCandidate(app.Slug, candidate.ID) {
-			return s.activationRepairError(errors.New("failed grouped candidate cleanup is unconfirmed"))
-		}
-		if err := s.store.ResetFailedActivationDeployment(a.ID, candidate.ID); err != nil {
-			return s.activationRepairError(err)
-		}
-		candidate, err = s.store.ActivationDeployment(a.ID, current)
-		if err != nil {
-			return s.activationRepairError(err)
-		}
 	}
 	if !candidate.Prepared {
 		return fmt.Errorf("%w: rolling activation requires a prepared deployment", activation.ErrUnsupported)
@@ -198,6 +199,14 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 		_, err = s.activateDeployManagerGeneration(app, candidate.ID, current.ID, result, true)
 	}
 	if err != nil {
+		if errors.Is(err, errActivationReadinessRelock) {
+			// Without the lifecycle lock we cannot safely clean up the candidate.
+			// Keep it fenced for a later owner, without charging a failed attempt.
+			if checkpointErr := s.store.UpdateScheduleActivationProgress(a.ID, "recovering", -1, 0); checkpointErr != nil {
+				return s.activationRepairError(errors.Join(err, checkpointErr))
+			}
+			return &activation.WaitingError{Reason: err.Error(), RetryAfter: 5 * time.Second}
+		}
 		cleaned := s.stopAndForgetCandidate(app.Slug, candidate.ID)
 		if cleaned {
 			_ = s.store.FailDeploymentWithReason(candidate.ID, err.Error())
@@ -205,8 +214,12 @@ func (s *Server) rollGroupedActivation(ctx context.Context, app *db.App, current
 		if restarting || !cleaned {
 			return s.activationRepairError(err)
 		}
-		if errors.Is(err, activation.ErrSuperseded) {
+		if errors.Is(err, activation.ErrSuperseded) || errors.Is(err, activation.ErrUnsupported) {
 			return err
+		}
+		var waiting *activation.WaitingError
+		if errors.As(err, &waiting) {
+			return waiting
 		}
 		return s.activationRetryError(a, err)
 	}

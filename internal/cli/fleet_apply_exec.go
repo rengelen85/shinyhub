@@ -582,7 +582,7 @@ func convergeAppFromSpec(cfg *cliConfig, d fleet.AppDiff, entry fleet.AppEntry, 
 				res.failureKind = failureWarmWaitTimeout
 				return fail(fmt.Errorf("warm gate not confirmed within --warm-timeout %s: %w", warmBudget, errDeployRunTimeout), attempts)
 			}
-			if err := verifyExistingWarmGateWithWait(cfg, d.Slug, spec.Dir, &res, remaining, out); err != nil {
+			if err := verifyExistingWarmGateContext(opt.context, cfg, d.Slug, spec.Dir, &res, remaining, out); err != nil {
 				return fail(err, attempts)
 			}
 		}
@@ -602,16 +602,24 @@ func convergeAppFromSpec(cfg *cliConfig, d fleet.AppDiff, entry fleet.AppEntry, 
 			}
 			err := verifyEnabledScheduleFreshnessContext(ctx, cfg, d.Slug, &res)
 			if err == nil && opt.refreshStale {
-				err = requireAppCompatibilityClearContext(ctx, cfg, d.Slug)
+				var waited bool
+				waited, err = waitForAppCompatibilityClearObserved(ctx, cfg, d.Slug, &res, out)
+				if err == nil && waited {
+					// A concurrent bundle or schedule edit can invalidate the
+					// freshness snapshot taken before the compatibility wait.
+					err = verifyEnabledScheduleFreshnessContext(ctx, cfg, d.Slug, &res)
+				}
 				if err != nil {
 					var quarantine *appCompatibilityQuarantineError
-					res.failureKind = failureScheduleStateMissing
+					if res.failureKind == "" || res.failureKind == failureWarmStateUnavailable || res.failureKind == failureWarmWaitTimeout {
+						res.failureKind = failureScheduleStateMissing
+					}
 					if errors.As(err, &quarantine) {
 						res.failureKind = failureScheduleProducer
 					}
 				}
 			}
-			if opt.refreshStale && ctx.Err() != nil {
+			if opt.refreshStale && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				res.failureKind = failureScheduleRefreshTimeout
 			}
 			cancel()

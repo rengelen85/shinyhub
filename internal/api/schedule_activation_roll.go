@@ -12,6 +12,7 @@ import (
 	"github.com/rvben/shinyhub/internal/admission"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/deploy"
+	"github.com/rvben/shinyhub/internal/jobs"
 	"github.com/rvben/shinyhub/internal/process"
 	"github.com/rvben/shinyhub/internal/schedulespec"
 )
@@ -27,7 +28,13 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 	if s.proxy != nil && s.proxy.RetiringParentAlive() {
 		return &activation.WaitingError{Reason: errRetiringProxy.Error(), RetryAfter: 5 * time.Second}
 	}
-	release := s.acquireDeployLock(a.AppSlug)
+	release, lockErr := s.acquireAppOperation(a.AppSlug, true)
+	if lockErr != nil {
+		return fmt.Errorf("acquire activation lifecycle fence: %w", lockErr)
+	}
+	if release == nil {
+		return &activation.WaitingError{Reason: "app lifecycle operation is in progress", RetryAfter: 5 * time.Second}
+	}
 	defer func() { release() }()
 
 	// Terminal outcomes must not abandon a durable pending execution.
@@ -81,11 +88,11 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 		return activation.ErrNotNeeded
 	}
 	if err := s.guardCompatibilityQuarantine(app.ID, "scheduled data activation"); err != nil {
-		return fmt.Errorf("%w: %v", activation.ErrUnsupported, err)
+		return activationCompatibilityError(err)
 	}
-	releaseConsumerBoot, gateErr := s.acquireConsumerBootGate(app.ID)
+	releaseConsumerBoot, gateErr := s.tryAcquireActivationBootGate(app.ID)
 	if gateErr != nil {
-		return fmt.Errorf("acquire activation publication fence: %w", gateErr)
+		return s.activationPublicationFenceError(app.ID, gateErr)
 	}
 	defer func() { releaseConsumerBoot() }()
 	if a.ScheduleRunID == nil {
@@ -190,7 +197,7 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 			return err
 		}
 		return s.rollGroupedActivation(ctx, app, current, a, func() func() error {
-			relock := s.unlockForServingReadiness(a.AppSlug, &release)
+			relock := s.unlockForActivationReadiness(a.AppSlug, &release)
 			return func() error {
 				// A queued writer makes RWMutex block new readers. A demand spawn can
 				// hold the app mutex waiting for that reader gate, so release the old
@@ -198,10 +205,12 @@ func (s *Server) Roll(ctx context.Context, a *db.ScheduleActivation) (runErr err
 				// publication the candidate read before allowing cutover.
 				releaseConsumerBoot()
 				releaseConsumerBoot = func() {}
-				relock()
-				bootRelease, err := s.acquireConsumerBootGate(app.ID)
-				if err != nil {
+				if err := relock(); err != nil {
 					return err
+				}
+				bootRelease, err := s.tryAcquireActivationBootGate(app.ID)
+				if err != nil {
+					return s.activationPublicationFenceError(app.ID, err)
 				}
 				releaseConsumerBoot = bootRelease
 				after, err := s.store.GetAppDataPublication(app.ID)
@@ -1038,4 +1047,29 @@ func derefActivationRunID(id *int64) int64 {
 		return 0
 	}
 	return *id
+}
+
+// Classify a fresh compatibility snapshot identically before and after the
+// publication gate, so a newly admitted writer cannot consume a rollout attempt.
+func activationCompatibilityError(err error) error {
+	if errors.Is(err, errProducerInProgress) {
+		return &activation.WaitingError{Reason: err.Error(), RetryAfter: 5 * time.Second}
+	}
+	if errors.Is(err, errCompatibilityQuarantined) {
+		return fmt.Errorf("%w: %v", activation.ErrUnsupported, err)
+	}
+	return err
+}
+
+func (s *Server) activationPublicationFenceError(appID int64, gateErr error) error {
+	if errors.Is(gateErr, jobs.ErrConsumerBootBusy) {
+		return &activation.WaitingError{Reason: gateErr.Error(), RetryAfter: 5 * time.Second}
+	}
+	if errors.Is(gateErr, jobs.ErrAppCompatibilityQuarantined) || errors.Is(gateErr, errCompatibilityQuarantined) {
+		if err := s.guardCompatibilityQuarantine(appID, "scheduled data activation"); err != nil {
+			return activationCompatibilityError(err)
+		}
+		return &activation.WaitingError{Reason: "compatibility changed while acquiring the publication fence; rechecking", RetryAfter: 5 * time.Second}
+	}
+	return fmt.Errorf("acquire activation publication fence: %w", gateErr)
 }
