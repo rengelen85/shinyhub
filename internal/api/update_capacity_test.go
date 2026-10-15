@@ -241,8 +241,27 @@ func TestScheduledRollCPUBlockDefersWithoutLosingWorkersAndRetries(t *testing.T)
 	cfg.Server.DrainTimeout = 5 * time.Millisecond
 	srv, app := newScaleTestServer(t, "cpu-roll", 1, cfg)
 	defer srv.Close()
+	t.Cleanup(func() { _ = srv.manager.StopAll() })
 	srv.SetHostCapacity(1, "config", 65536, "config")
 	srv.deployReplica = successfulActivationTestDeployer(t, srv, app, 21700)
+	// A stop/retry lifecycle requires a worker owned by this manager, not the
+	// generic scale fixture's PID 1000, which may belong to a CI host process.
+	current, err := srv.store.GetServingDeployment(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.proxy.SetPoolSize(app.Slug, app.Replicas)
+	initial, err := srv.deployReplica(deploy.Params{DeploymentID: current.ID, AppVersion: current.Version, DefaultTier: process.DefaultTier}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.UpsertReplica(db.UpsertReplicaParams{
+		AppID: app.ID, Index: 0, PID: &initial.PID, Port: &initial.Port, Status: "running", DesiredState: "running",
+		Provider: initial.Provider, Tier: initial.Tier, EndpointURL: initial.EndpointURL, WorkerID: initial.WorkerID,
+		AppVersion: current.Version, DeploymentID: &current.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	a := seedClaimedActivation(t, srv.store, app)
 	if _, err := srv.store.RequeueRunningScheduleActivations(time.Now().UTC()); err != nil {
 		t.Fatal(err)
