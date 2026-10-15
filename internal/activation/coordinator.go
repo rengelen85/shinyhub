@@ -21,6 +21,7 @@ var (
 )
 
 type CapacityError struct {
+	Transient  bool // measured pressure may clear without changing the worker budget
 	Resource   string
 	Available  *float64
 	Required   *float64
@@ -53,6 +54,9 @@ type RepairRequiredError struct {
 
 func (e *RetryableError) Error() string      { return e.Reason }
 func (e *RepairRequiredError) Error() string { return e.Reason }
+
+// DeployFailureKind lets the shared classifier recognize wrapped capacity errors.
+func (e *CapacityError) DeployFailureKind() string { return "capacity" }
 
 func (e *CapacityError) Error() string {
 	if e.Reason == "" {

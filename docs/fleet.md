@@ -44,6 +44,84 @@ source     = "git+https://github.com/acme/status.git@v1.4#deploy/status"
 visibility = "public"
 ```
 
+## Environment overlays
+
+Bind each environment to a host and declare sparse sizing overrides per app:
+
+```toml
+fleet_id = "dashboards"
+
+[environments.dev]
+host = "https://shiny-dev.example.com"
+
+[environments.prd]
+host = "https://shiny-prd.example.com"
+
+[[app]]
+slug = "token-finops"
+source = "./token_finops"
+
+[app.config]
+min_warm_replicas = 1
+autoscale = { enabled = true, min_replicas = 1, max_replicas = 4, target = 0.6 }
+env = { APP_MODE = "development" }
+
+[app.environments.prd.config]
+min_warm_replicas = 16
+autoscale = { enabled = true, min_replicas = 16, max_replicas = 16, target = 0.6 }
+env = { APP_MODE = "production" }
+```
+
+`fleet plan` and `fleet apply` select the environment by matching the connected
+host URL. Trailing slashes, hostname case and default ports are normalized.
+Environment names use `[a-z0-9-]`, 1–64 characters. Duplicate host bindings are
+rejected. An unlisted target requires `--environment <name>`; an explicit name
+cannot override a host bound to another environment. Manifests without
+`environments` keep their existing behavior.
+
+The selected overlay wins over `[app.config]`, which wins over the source
+bundle's `[app]` settings. Overlays accept only `replicas`, `min_warm_replicas`,
+`max_sessions_per_replica`, `autoscale`, `hibernate_timeout_minutes`,
+`render_seconds`, and `env`. `autoscale` is replaced as a complete policy;
+`env` merges by variable name. An explicit zero, false or empty string is a
+value, while omitted keys inherit the baseline. Removing an env override falls
+back to the source bundle, then to server-managed env; it does not delete the
+stored server value.
+
+Plans name the resolved environment and annotate drift supplied by an overlay,
+for example `min_warm_replicas 1 -> 16 (prd)`. JSON includes the environment on
+the plan and on each annotated change. Environment sizing is materialized into
+the uploaded `shinyhub.toml` without editing the source tree, so its digest,
+server rehearsal and startup settings agree. Identical effective declarations
+retain the original manifest bytes and bundle digest. Sources without a manifest
+use sparse declarations, preserving omitted live identity, privacy and access
+policies. Ignored source manifests contribute no hooks, schedules or policy.
+A generated sparse control file still carries selected sizing and env overrides.
+`replicas` uses the existing online resize path after deployment, avoiding a
+stop-first deployment merely to change replica count.
+Changing environment sizing can
+therefore require a deployment. Plaintext env values are embedded in that same
+bundle and available to dependency builds, hooks, deploy-triggered producers,
+and app workers before they run. They require a server advertising `bundle_env`;
+older servers are rejected during preflight, before changes are made.
+
+Each deployment retains its own bundle env. A failed candidate leaves the
+serving deployment's env intact; draining workers, wake-ups, scheduled jobs,
+and rollbacks use their deployment's bundle. Fleet does not mutate shared env
+settings or perform a second restart. Bundle values override server-managed
+values with the same name; other server-managed keys and secrets remain
+available. The env API reports effective serving values with `source: "bundle"`
+and rejects overwrites of bundle-owned keys: edit the manifest and redeploy
+instead. Deleting a shadowed stored fallback remains possible; it does not
+remove the serving bundle value.
+Keep secrets in `shinyhub env set --secret`, outside plaintext manifests.
+
+`fleet validate` checks every overlay offline, including merged manifests for
+local sources. Git sources are syntax-checked without cloning. `plan` validates
+the selected merged manifest against the host's runtime replica ceiling, so
+small hosts can keep a smaller runtime maximum than production. Local `dev`
+continues using `[dev]`; it does not select deployment environments.
+
 ## Fields
 
 ### Top level
@@ -53,6 +131,7 @@ visibility = "public"
 | `fleet_id` | yes | Ownership scope. Must match `[a-z0-9-]`, 1-64 chars. Stamped onto every app this manifest manages as `managed_by = fleet:<fleet_id>`. |
 | `[[app]]` | yes (>=1) | One block per app the fleet should own. |
 | `[[project]]` | no | One block per project the fleet should name. Optional: an app can declare a `project` without a matching block, and the project is then created unnamed. |
+| `[environments.<name>]` | no | Bind a named environment to its target host; see [Environment overlays](#environment-overlays). |
 | `[[bundle_file]]` | no | Copy one canonical local file into the bundles of explicitly named consumers. |
 
 ### `[[app]]`
@@ -74,6 +153,9 @@ visibility = "public"
 | `hibernate_timeout_minutes` | int | Idle minutes before hibernation. `-1` resets to the server default, `0` disables hibernation, and a positive value sets the timeout. |
 | `replicas` | int `>= 1` | Number of replica processes. See [scaling](scaling.md). |
 | `max_sessions_per_replica` | int `>= 1` | Per-replica admission cap for new cookieless sessions. |
+| `min_warm_replicas` | int `0..1000` | Minimum warm-worker floor. |
+| `render_seconds` | number `0..600` | Render pacing interval; `0` disables pacing. |
+| `env` | table of strings | Versioned plaintext environment variables, merged into the deployment bundle before build and activation. Values are redacted in plans; use `shinyhub env set --secret` for secrets. Other stored keys remain available. |
 | `autoscale` | inline table | Session-saturation autoscale policy. Reconciled atomically and drift-protected as one unit. See [autoscale](#appconfig-autoscale) below. |
 
 Only the keys you declare here are owned by the fleet manifest. An omitted key
@@ -449,9 +531,11 @@ inputs as well as the app source.
 | `--adopt` | Take ownership of in-scope apps that exist but are not yet fleet-managed. Without it, an un-owned app in scope is reported, not modified. |
 | `--prune` | Delete fleet-owned apps that are absent from the manifest. **This also removes their persistent data directory and all bundles.** |
 | `-y/--yes` | Skip the interactive destructive-action confirmation. `--prune` in a non-interactive shell requires `--yes`. |
+| `--environment NAME` | Select a declared environment for an unbound host; a conflicting bound host is rejected. Also available on `fleet plan`. |
+| `--capacity-wait DURATION` | Wait up to this duration per app after the first transient CPU-pressure refusal. Default `5m`; `0` disables waiting. Retries use the server retry delay independently of `--retries`. Accounting refusals fail immediately. |
 | `--retries N` | Retry attempts *after* the first for deploys and transient config PATCH failures. Default 1 (so two attempts total). |
 | `--wait-for-warm` | Ask the server to reconcile every persisted enabled deploy-triggered schedule, including on unchanged apps; wait for each exact durable obligation and require the authoritative producer state to match the current digest and command. |
-| `--warm-timeout DURATION` | Per-app deadline shared by deploy-run waits, bundle-convergence checks, and stale-schedule recovery. Default 15 minutes. |
+| `--warm-timeout DURATION` | Per-app deadline shared by deploy-run waits, bundle-convergence checks, running-producer compatibility waits, and stale-schedule recovery. Default 15 minutes. |
 | `--verify-schedules` | Read-only: require cron freshness and authoritative producer convergence for every enabled schedule, and reject unresolved producer-write uncertainty even if its schedule was later disabled; never dispatches work. |
 | `--refresh-stale` | Refresh persisted enabled schedules whose cron freshness is overdue, including on unchanged apps, then verify schedules. Joins an existing run or starts one when still stale. Requires server support; implies `--verify-schedules`. |
 | `--verify-health` | Require every app, unchanged as well as changed, to be in a state it serves from without operator action: `running`, `idle`, or parked (`hibernated` after its idle timeout, `suspended`). A parked app wakes on its first request and passes in one poll; the gate never wakes it, so a broken bundle in a hibernated app surfaces on wake, not here. Intentionally stopped apps remain excluded. The post-deploy wait for changed apps is stricter and still requires a serving replica. |
@@ -460,6 +544,22 @@ inputs as well as the app source.
 | `--json` | Emit the machine-readable result envelope. |
 | `-q/--quiet` | Collapse to the summary plus result line. |
 | `--provenance auto\|none` | Detect CI attribution (default) or intentionally omit it. |
+
+With `--wait-for-warm`, a compatibility quarantine caused only by running data
+producers waits within the same `--warm-timeout`, including for unchanged apps.
+Progress names the producers and the wait deadline. Successful completion clears
+the gate; a producer failure or deployment repair fence fails with repair guidance,
+and an expired deadline reports `warm_wait_timeout`. No duplicate producer is
+started by this wait. Scheduled serving-data activation also waits for running
+producers instead of recording an unsupported topology.
+
+A measured CPU-pressure refusal is reported as `blocked [capacity]`. The working
+version and its sessions stay protected while the CLI waits and retries. A
+worker-accounting refusal ("allocated to live workers") also reports capacity,
+but fails immediately because waiting does not change the configured budget.
+Pressure recovery asks for a retry rather than `--allow-downtime`. The server's
+existing launch gate serializes admitted candidate starts; this does not add a
+persistent server-side deployment queue or change CPU sampling windows.
 
 To recover overdue data during apply:
 

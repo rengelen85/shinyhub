@@ -62,7 +62,11 @@ func convergeDeclaredConfig(cfg *cliConfig, slug string, entry fleet.AppEntry, i
 		return 0, fmt.Errorf("read settings after deploy: %w", err)
 	}
 	servedBefore := redeployStateOf(app).Served
-	drift := fleet.ConfigDrift(entry, observedFromApp(*app))
+	observed, err := observeFleetEnv(cfg, slug, fleet.EffectiveConfig(entry), observedFromApp(*app))
+	if err != nil {
+		return 0, err
+	}
+	drift := fleet.ConfigDrift(entry, observed)
 	attempts := 0
 	if len(drift) > 0 {
 		attempts, err = applyConfigDriftWithRetry(cfg, slug, drift, fleet.EffectiveConfig(entry), ifD, ifMB, opt.runID, opt.retries)
@@ -81,7 +85,11 @@ func convergeDeclaredConfig(cfg *cliConfig, slug string, entry fleet.AppEntry, i
 	if err := preconditionsHeld(slug, app, ifD, ifMB); err != nil {
 		return attempts, err
 	}
-	if left := fleet.ConfigDrift(entry, observedFromApp(*app)); len(left) > 0 {
+	observed, err = observeFleetEnv(cfg, slug, fleet.EffectiveConfig(entry), observedFromApp(*app))
+	if err != nil {
+		return attempts, err
+	}
+	if left := fleet.ConfigDrift(entry, observed); len(left) > 0 {
 		return attempts, fmt.Errorf("declared config did not converge: %s", describeDrift(left))
 	}
 	return attempts, nil
@@ -347,7 +355,11 @@ func settleConfigPatch(cfg *cliConfig, slug string, entry fleet.AppEntry, served
 	if err != nil {
 		return err
 	}
-	if left := fleet.ConfigDrift(entry, observedFromApp(*app)); len(left) > 0 {
+	observed, err := observeFleetEnv(cfg, slug, fleet.EffectiveConfig(entry), observedFromApp(*app))
+	if err != nil {
+		return err
+	}
+	if left := fleet.ConfigDrift(entry, observed); len(left) > 0 {
 		return fmt.Errorf("stored config no longer matches the declaration after apply (another writer changed it, or the server adjusted the value): %s", describeDrift(left))
 	}
 	return nil

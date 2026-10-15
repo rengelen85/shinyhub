@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -746,5 +748,80 @@ func TestDeleteAppEnv_RestartTrue_RestartsRunningApp(t *testing.T) {
 	reps, _ := store.ListReplicas(app.ID)
 	if len(reps) == 0 || reps[0].PID == nil || *reps[0].PID != 5678 {
 		t.Errorf("replica PID not updated to 5678 after restart: %+v", reps)
+	}
+}
+
+func TestEnvMutationsHonorFleetPreconditions(t *testing.T) {
+	f, err := setupEnvApp(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := putEnv(t, f, "MODE", "original", false); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	for _, tc := range []struct{ method, path, body string }{
+		{"PUT", "/api/apps/demo/env/MODE", `{"value":"changed"}`},
+		{"DELETE", "/api/apps/demo/env/MODE", ""},
+		{"POST", "/api/apps/demo/env/apply", ""},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			req := authedRequest(t, tc.method, tc.path, []byte(tc.body), f.ownerToken)
+			req.Header.Set("X-ShinyHub-If-Managed-By", "fleet:someone-else")
+			rec := httptest.NewRecorder()
+			f.srv.Router().ServeHTTP(rec, req)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			stored, err := f.store.GetAppEnvVar(f.app.ID, "MODE")
+			if err != nil || string(stored.Value) != "original" {
+				t.Fatal("stale mutation changed env", err)
+			}
+		})
+	}
+}
+
+func TestBundleEnvUsesServingDeploymentAndRejectsShadowedEdits(t *testing.T) {
+	srv, store := newTestServer(t)
+	hash, _ := testHashPassword("pass")
+	if err := store.CreateUser(db.CreateUserParams{Username: "owner", PasswordHash: hash, Role: "developer"}); err != nil {
+		t.Fatal(err)
+	}
+	owner, _ := store.GetUserByUsername("owner")
+	token, _ := auth.IssueJWT(owner.ID, "owner", "developer", "test-secret")
+	if _, err := store.CreateApp(db.CreateAppParams{Slug: "demo", Name: "Demo", OwnerID: owner.ID}); err != nil {
+		t.Fatal(err)
+	}
+	app, _ := store.GetApp("demo")
+	if err := store.UpsertAppEnvVar(app.ID, "MODE", []byte("stored"), false); err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{"serving", "candidate"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "shinyhub.toml"), []byte("[app.env]\nMODE='"+version+"'\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		status := db.DeploymentSucceeded
+		if version == "candidate" {
+			status = db.DeploymentPending
+		}
+		if _, err := store.CreateDeployment(db.CreateDeploymentParams{AppID: app.ID, Version: version, BundleDir: dir, Status: status}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rec, authedRequest(t, "GET", "/api/apps/demo/env", nil, token))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"value":"serving"`) || !strings.Contains(rec.Body.String(), `"source":"bundle"`) || strings.Contains(rec.Body.String(), "candidate") {
+		t.Fatalf("serving env: %d %s", rec.Code, rec.Body)
+	}
+	for _, method := range []string{"PUT"} {
+		rec = httptest.NewRecorder()
+		srv.Router().ServeHTTP(rec, authedRequest(t, method, "/api/apps/demo/env/MODE", []byte(`{"value":"oops"}`), token))
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s: %d %s", method, rec.Code, rec.Body)
+		}
+	}
+	stored, err := store.GetAppEnvVar(app.ID, "MODE")
+	if err != nil || string(stored.Value) != "stored" {
+		t.Fatalf("stored fallback changed: %+v %v", stored, err)
 	}
 }

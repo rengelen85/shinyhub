@@ -44,10 +44,11 @@ type planValue struct {
 }
 
 type planChange struct {
-	Field   string     `json:"field"`
-	Action  planAction `json:"action"`
-	Current *planValue `json:"current,omitempty"`
-	Planned *planValue `json:"planned,omitempty"`
+	Environment string     `json:"environment,omitempty"`
+	Field       string     `json:"field"`
+	Action      planAction `json:"action"`
+	Current     *planValue `json:"current,omitempty"`
+	Planned     *planValue `json:"planned,omitempty"`
 }
 
 type planImpactKind string
@@ -133,6 +134,7 @@ type planNextAction struct {
 // fleet plans. Command-specific envelopes embed it under "plan" while retaining
 // their existing fields for backwards compatibility.
 type planDocument struct {
+	Environment   string           `json:"environment,omitempty"`
 	SchemaVersion int              `json:"schema_version"`
 	Scope         string           `json:"scope"`
 	Command       string           `json:"command"`
@@ -339,7 +341,8 @@ func fleetAppPlanResource(app fleet.AppDiff, fleetID string) planResource {
 	if app.Action == fleet.ActionUpdateConfig || app.Action == fleet.ActionUpdateSourceConfig {
 		for _, drift := range app.ConfigDrift {
 			resource.Changes = append(resource.Changes, planChange{
-				Field: drift.Key, Action: planActionUpdate,
+				Environment: drift.Environment,
+				Field:       drift.Key, Action: planActionUpdate,
 				Current: value(planValueString, drift.Server), Planned: value(planValueString, drift.Desired),
 			})
 		}
@@ -404,6 +407,7 @@ func fleetPlanDocument(command, file string, manifest *fleet.Manifest, host stri
 		}
 	}
 	doc := newPlanDocument("fleet", command, host, "", resources, impacts, warnings, nil)
+	doc.Environment = manifest.ResolvedEnvironment
 	doc.Outcome = fleetPlanOutcome(doc.Counts)
 	if doc.Counts.pending() {
 		applyCommand, description := applySuggestion(file, doc.Counts)

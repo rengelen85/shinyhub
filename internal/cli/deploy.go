@@ -282,9 +282,18 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 		}
 		return err
 	}
-	manifest, err := deploypkg.LoadManifest(abs)
+	manifest, err := loadFleetSourceManifest(abs)
 	if err != nil {
 		return err
+	}
+	if manifest != nil && (len(manifest.App.Env) > 0 || manifest.Sparse) {
+		info, err := probeServer(cfg)
+		if err != nil {
+			return fmt.Errorf("verify bundle env support: %w", err)
+		}
+		if !info.Capabilities.BundleEnv {
+			return validationErr("server does not support versioned bundle env; no deployment was requested", "Upgrade to a server advertising bundle_env.")
+		}
 	}
 	if manifestUsesProducerInputs(manifest) {
 		info, err := probeServer(cfg)
@@ -1289,8 +1298,9 @@ type bundleSkippedPaths struct {
 }
 
 type bundleBuildSpec struct {
-	Dir    string
-	Inputs []bundle.FileInputSnapshot
+	Manifest []byte // optional resolved fleet environment manifest
+	Dir      string
+	Inputs   []bundle.FileInputSnapshot
 }
 
 func zipDir(dir string) (*bytes.Buffer, string, error) {
@@ -1341,6 +1351,9 @@ func buildBundlePreviewFromSpec(spec bundleBuildSpec) (*bundlePreview, error) {
 			return nil
 		}
 		relSlash := filepath.ToSlash(rel)
+		if spec.Manifest != nil && relSlash == deploypkg.ManifestFilename {
+			return nil
+		}
 
 		// Per-tree ignore filter runs before bundle.Rules so that ignore-file
 		// rejections never show up in summarizeRejections (intentional excludes
@@ -1439,6 +1452,9 @@ func buildBundlePreviewFromSpec(spec bundleBuildSpec) (*bundlePreview, error) {
 	if err != nil {
 		_ = w.Close()
 		return nil, err
+	}
+	if spec.Manifest != nil {
+		inputs = append(inputs, bundle.FileInputSnapshot{To: deploypkg.ManifestFilename, Data: spec.Manifest, Mode: 0644})
 	}
 	for _, input := range inputs {
 		h := &zip.FileHeader{

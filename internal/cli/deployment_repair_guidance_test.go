@@ -63,3 +63,27 @@ func TestCompatibilityQuarantineReportsDeploymentCause(t *testing.T) {
 		})
 	}
 }
+
+func TestFleetRepairGuidancePreservesResolvedBundle(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"compatibility_quarantined":true,"producer_repair_required":false,"app":{"managed_by":"fleet:test","deployment_repair_required":true,"last_deployment_status":"failed"}}`)
+	}))
+	defer srv.Close()
+	err := requireAppCompatibilityClear(&cliConfig{Host: srv.URL}, "demo")
+	var quarantine *appCompatibilityQuarantineError
+	if !errors.As(err, &quarantine) || !strings.Contains(quarantine.repairCommand, "shinyhub fleet apply") || strings.Contains(err.Error(), "<source-dir>") {
+		t.Fatalf("recovery bypasses resolved fleet bundle: %v", err)
+	}
+	cmd := newFleetApplyCmd()
+	args := strings.Fields(strings.TrimPrefix(quarantine.repairCommand, "shinyhub fleet apply "))
+	if err := cmd.ParseFlags(args); err != nil {
+		t.Fatalf("suggested fleet command uses an invalid flag: %s: %v", quarantine.repairCommand, err)
+	}
+	if err := cmd.ValidateArgs(cmd.Flags().Args()); err != nil {
+		t.Fatalf("suggested fleet command has invalid args: %v", err)
+	}
+	recovery := applyRecoveryFor(recoveryCtx(), []applyResult{{slug: "demo", status: statusFailed, failureKind: failureWarmNeverSucceeded, err: err}})
+	if strings.Contains(recovery.Summary, "<source-dir>") || !strings.Contains(recovery.Summary, "<fleet.toml>") {
+		t.Fatalf("fleet recovery summary contradicts command: %+v", recovery)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"github.com/rvben/shinyhub/internal/admission"
 	"github.com/rvben/shinyhub/internal/config"
 	"github.com/rvben/shinyhub/internal/db"
+	"github.com/rvben/shinyhub/internal/deployfail"
 	"github.com/rvben/shinyhub/internal/process"
 )
 
@@ -20,17 +21,7 @@ import (
 // pressure. Callers hold the launch gate through the candidate readiness boundary.
 func (s *Server) checkUpdateCPU(app *db.App, replicas int) error {
 	cores, source, err := s.effectiveUpdateCPUCores()
-	var available float64
-	if err == nil && s.availableCPUCores != nil {
-		available, err = s.availableCPUCores()
-	} else if err == nil {
-		ctx := s.generationCtx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		available, err = admission.AvailableCPUCores(ctx, cores, source)
-	}
-	if cores <= 0 || math.IsNaN(cores) || math.IsInf(cores, 0) || err != nil || available < 0 || math.IsNaN(available) || math.IsInf(available, 0) {
+	if cores <= 0 || math.IsNaN(cores) || math.IsInf(cores, 0) || err != nil {
 		return &activation.CapacityError{Resource: "cpu", Units: "cores", Reason: "CPU headroom could not be measured; current sessions are preserved", RetryAfter: time.Minute}
 	}
 	perWorker := s.cfg.Server.UpdateCapacity.CPURequest()
@@ -45,9 +36,22 @@ func (s *Server) checkUpdateCPU(app *db.App, replicas int) error {
 		remaining, required := math.Max(0, cores-reserved-floor), needed
 		return &activation.CapacityError{Resource: "cpu", Units: "cores", Available: &remaining, Required: &required, Reason: fmt.Sprintf("CPU budget: %.2f cores allocated to live workers; %.2f requested for candidates plus %.2f reserved on a %.2f-core node; current sessions are preserved", reserved, needed, floor, cores), RetryAfter: time.Minute}
 	}
+	var available float64
+	if err == nil && s.availableCPUCores != nil {
+		available, err = s.availableCPUCores()
+	} else if err == nil {
+		ctx := s.generationCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		available, err = admission.AvailableCPUCores(ctx, cores, source)
+	}
+	if cores <= 0 || math.IsNaN(cores) || math.IsInf(cores, 0) || err != nil || available < 0 || math.IsNaN(available) || math.IsInf(available, 0) {
+		return &activation.CapacityError{Resource: "cpu", Units: "cores", Reason: "CPU headroom could not be measured; current sessions are preserved", RetryAfter: time.Minute}
+	}
 	if !config.FitsCPUBudget(needed+floor, available) {
 		required := needed + floor
-		return &activation.CapacityError{Resource: "cpu", Units: "cores", Available: &available, Required: &required, Reason: fmt.Sprintf("CPU: %.2f cores available; need %.2f for %d startup workers plus %.2f cores of node headroom; current sessions are preserved", available, needed, max(1, replicas), floor), RetryAfter: time.Minute}
+		return &activation.CapacityError{Transient: true, Resource: "cpu", Units: "cores", Available: &available, Required: &required, Reason: fmt.Sprintf("CPU: %.2f cores available; need %.2f for %d startup workers plus %.2f cores of node headroom; current sessions are preserved", available, needed, max(1, replicas), floor), RetryAfter: time.Minute}
 	}
 	return nil
 }
@@ -85,6 +89,9 @@ func capacityFailureReason(block *activation.CapacityError) string {
 }
 
 func capacityConflictMessage(block *activation.CapacityError) string {
+	if block.Transient {
+		return "working version preserved: " + block.Reason + "; transient CPU pressure; retry after the indicated delay"
+	}
 	if block.Resource == "surge" {
 		return "working version preserved: " + block.Reason + "; retry after previous generations retire or increase server.update_capacity.max_surge_replicas; use --allow-downtime for an explicit stop-first deployment"
 	}
@@ -94,8 +101,9 @@ func capacityConflictMessage(block *activation.CapacityError) string {
 func writeCapacityConflict(w http.ResponseWriter, block *activation.CapacityError) {
 	retry := max(1, int(block.RetryAfter.Seconds()))
 	w.Header().Set("Retry-After", strconv.Itoa(retry))
+	w.Header().Set("X-ShinyHub-Conflict", "generation-handoff-deferred")
 	writeJSON(w, http.StatusConflict, map[string]any{
-		"error":        capacityConflictMessage(block),
+		"error": capacityConflictMessage(block), "failure_kind": deployfail.Capacity, "capacity_retryable": block.Transient,
 		"update_state": "blocked_capacity", "resource": block.Resource,
 		"available": block.Available, "required": block.Required, "units": block.Units,
 		"retry_after_seconds": retry, "automatic_retry": false, "working_version_preserved": true,
@@ -118,11 +126,15 @@ func (s *Server) blockedUpdateStatus(slug string) map[string]any {
 	if !ok {
 		return nil
 	}
+	transient := resource == "cpu" && strings.HasPrefix(reason, "CPU: ")
 	nextAction := "free or add capacity and retry the deployment; use --allow-downtime only for an intentional stop-first update"
+	if transient {
+		nextAction = "transient CPU pressure; retry the deployment after pressure clears; current sessions are preserved"
+	}
 	if resource == "surge" {
 		nextAction = "retry after previous generations retire or increase server.update_capacity.max_surge_replicas; use --allow-downtime only for an intentional stop-first update"
 	}
-	return map[string]any{"state": "blocked_capacity", "resource": resource, "reason": reason,
+	return map[string]any{"state": "blocked_capacity", "capacity_retryable": transient, "resource": resource, "reason": reason,
 		"deployment_id": latest.ID, "requested_at": latest.CreatedAt, "automatic_retry": false,
 		"next_action": nextAction}
 }

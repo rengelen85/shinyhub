@@ -7,6 +7,8 @@ package fleet
 
 import (
 	"fmt"
+	"github.com/rvben/shinyhub/internal/appenv"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -44,6 +46,7 @@ func (p Problem) Error() string {
 // Config mirrors the reconcilable subset of shinyhub.toml [app]. Pointers
 // distinguish "declared" (drift-protected) from "absent" (server/bundle wins).
 type Config struct {
+	Env map[string]string `toml:"env"`
 	// Name and Description are the app's display metadata. Declaring either
 	// makes the fleet manifest its owner: a rename in the dashboard then shows
 	// up as drift on the next plan and is reverted by apply. Leaving the key out
@@ -64,15 +67,13 @@ type Config struct {
 	MaxSessionsPerReplica   *int             `toml:"max_sessions_per_replica"`
 	Autoscale               *AutoscaleConfig `toml:"autoscale"`
 
-	// The fields below are populated from the source bundle's shinyhub.toml by
-	// fleet preflight. They are deliberately not TOML-decodable here: the fleet
-	// manifest keeps its existing public schema, while bundle-declared durable
-	// app settings become part of the observed-vs-desired reconcile set.
+	// The remaining durable settings are populated from the source bundle.
+	// RenderSeconds and MinWarmReplicas can also be overridden by fleet config.
 	Icon                         *string  `toml:"-"`
-	RenderSeconds                *float64 `toml:"-"`
+	RenderSeconds                *float64 `toml:"render_seconds"`
 	IdentityHeaders              *bool    `toml:"-"`
 	UsageIdentityMode            *string  `toml:"-"`
-	MinWarmReplicas              *int     `toml:"-"`
+	MinWarmReplicas              *int     `toml:"min_warm_replicas"`
 	MemoryLimitMB                *int     `toml:"-"`
 	CPUQuotaPercent              *int     `toml:"-"`
 	WorkerIsolation              *string  `toml:"-"`
@@ -97,10 +98,12 @@ type AutoscaleConfig struct {
 // AppEntry is one [[app]] block after validation. Visibility defaults to
 // "private" when omitted.
 type AppEntry struct {
-	Slug       string `toml:"slug"`
-	Source     string `toml:"source"`
-	Visibility string `toml:"visibility"`
-	Config     Config `toml:"config"`
+	ResolvedEnvironment string                    `toml:"-"`
+	Environments        map[string]AppEnvironment `toml:"environments"`
+	Slug                string                    `toml:"slug"`
+	Source              string                    `toml:"source"`
+	Visibility          string                    `toml:"visibility"`
+	Config              Config                    `toml:"config"`
 	// Bundle is the durable [app] state declared by source/shinyhub.toml. It is
 	// filled after source resolution and never decoded from fleet.toml.
 	Bundle Config `toml:"-"`
@@ -111,6 +114,22 @@ type AppEntry struct {
 // layers can declare; bundle-only durable fields remain managed by the bundle.
 func EffectiveConfig(app AppEntry) Config {
 	c := app.Bundle
+	if len(app.Config.Env) > 0 {
+		env := make(map[string]string, len(c.Env)+len(app.Config.Env))
+		for k, v := range c.Env {
+			env[k] = v
+		}
+		for k, v := range app.Config.Env {
+			env[k] = v
+		}
+		c.Env = env
+	}
+	if app.Config.MinWarmReplicas != nil {
+		c.MinWarmReplicas = app.Config.MinWarmReplicas
+	}
+	if app.Config.RenderSeconds != nil {
+		c.RenderSeconds = app.Config.RenderSeconds
+	}
 	if app.Config.Name != nil {
 		c.Name = app.Config.Name
 	}
@@ -158,11 +177,13 @@ type BundleFileEntry struct {
 
 // Manifest is a validated fleet.toml.
 type Manifest struct {
-	Dev         DevSettings       `toml:"dev"`
-	FleetID     string            `toml:"fleet_id"`
-	Projects    []ProjectEntry    `toml:"project"`
-	BundleFiles []BundleFileEntry `toml:"bundle_file"`
-	Apps        []AppEntry        `toml:"app"`
+	Environments        map[string]Environment `toml:"environments"`
+	ResolvedEnvironment string                 `toml:"-"`
+	Dev                 DevSettings            `toml:"dev"`
+	FleetID             string                 `toml:"fleet_id"`
+	Projects            []ProjectEntry         `toml:"project"`
+	BundleFiles         []BundleFileEntry      `toml:"bundle_file"`
+	Apps                []AppEntry             `toml:"app"`
 }
 
 var fleetIDRe = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
@@ -177,7 +198,7 @@ var validVisibility = map[string]bool{"private": true, "shared": true, "public":
 // knownKeys is the set of accepted manifest keys, used for "did you mean"
 // suggestions on unknown-key rejection.
 var knownKeys = []string{
-	"dev", "env", "env_allow", "seed", "fleet_id", "app", "project", "bundle_file", "from", "to", "consumers",
+	"environments", "host", "min_warm_replicas", "render_seconds", "dev", "env", "env_allow", "seed", "fleet_id", "app", "project", "bundle_file", "from", "to", "consumers",
 	"slug", "source", "visibility", "config",
 	"name", "description", "icon",
 	"hibernate_timeout_minutes", "replicas", "max_sessions_per_replica",
@@ -203,6 +224,9 @@ func ParseManifest(data []byte, file string) (*Manifest, []Problem) {
 		return nil, []Problem{{File: file, Msg: fmt.Sprintf("TOML parse error: %v", err)}}
 	}
 
+	if meta.IsDefined("environments") && len(m.Environments) == 0 {
+		probs = append(probs, Problem{File: file, Msg: "environments must declare at least one named host"})
+	}
 	if und := meta.Undecoded(); len(und) > 0 {
 		keys := make([]string, len(und))
 		for i, k := range und {
@@ -271,6 +295,7 @@ func ParseManifest(data []byte, file string) (*Manifest, []Problem) {
 	probs = append(probs, validateBundleFiles(file, &m, seen)...)
 
 	probs = append(probs, validateProjects(file, &m)...)
+	probs = append(probs, validateEnvironments(file, &m)...)
 
 	if len(probs) > 0 {
 		// Return the partially-decoded manifest alongside the problems so
@@ -380,6 +405,15 @@ func bundleDestinationConflict(a, b string) bool {
 // every plan.
 func validateConfig(file, who string, c *Config) []Problem {
 	var probs []Problem
+	if c.MinWarmReplicas != nil && (*c.MinWarmReplicas < 0 || *c.MinWarmReplicas > 1000) {
+		probs = append(probs, Problem{File: file, Msg: who + ": min_warm_replicas must be between 0 and 1000"})
+	}
+	if c.RenderSeconds != nil && (math.IsNaN(*c.RenderSeconds) || math.IsInf(*c.RenderSeconds, 0) || *c.RenderSeconds < 0 || *c.RenderSeconds > 600) {
+		probs = append(probs, Problem{File: file, Msg: who + ": render_seconds must be finite and between 0 and 600"})
+	}
+	if err := appenv.ValidateBundle(c.Env); err != nil {
+		probs = append(probs, Problem{File: file, Msg: fmt.Sprintf("%s: %v", who, err)})
+	}
 	if c.Name != nil {
 		v, err := appmetaspec.NormalizeName(*c.Name)
 		if err != nil {

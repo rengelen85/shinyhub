@@ -1726,6 +1726,12 @@ func (m *Manager) execute(ctx context.Context, sched *db.Schedule, app *db.App, 
 		m.finishRun(sched, runID, "failed", nil, trigger, userID, false)
 		return
 	}
+	env, secretEnv, err = appenv.WithBundle(env, secretEnv, deployment.BundleDir)
+	if err != nil {
+		fmt.Fprintf(logFile, "shinyhub: resolve bundle env: %v\n", err)
+		m.finishRun(sched, runID, "failed", nil, trigger, userID, false)
+		return
+	}
 	if v, ok := m.runSpans.Load(runID); ok {
 		// Platform OTEL_* defaults go first so per-app values win under
 		// last-occurrence-wins.

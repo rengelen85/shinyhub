@@ -37,6 +37,7 @@ type manifestFakeRuntime struct {
 	nextPID          int
 	stops            map[int]chan struct{}
 	events           []string
+	starts           []process.StartParams
 	producerCommands [][]string
 	producerEntered  chan struct{}
 	producerBlock    chan struct{}
@@ -64,6 +65,7 @@ func (f *manifestFakeRuntime) Start(_ context.Context, p process.StartParams, _ 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.events = append(f.events, "start:"+p.ContentDigest)
+	f.starts = append(f.starts, p)
 	pid := f.nextPID
 	f.nextPID++
 	f.stops[pid] = make(chan struct{})

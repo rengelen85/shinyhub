@@ -359,3 +359,73 @@ func TestRecoveredFleetCPUWarningUsesAdmissionWorkerCount(t *testing.T) {
 		t.Fatalf("override bypassed quota warning: %s", warning)
 	}
 }
+
+func TestCapacityConflictDistinguishesTransientPressure(t *testing.T) {
+	for _, transient := range []bool{false, true} {
+		block := &activation.CapacityError{Resource: "cpu", Reason: "CPU pressure", Transient: transient, RetryAfter: time.Minute}
+		rec := httptest.NewRecorder()
+		writeCapacityConflict(rec, block)
+		var body struct {
+			Kind      string `json:"failure_kind"`
+			Retryable bool   `json:"capacity_retryable"`
+			Delay     int    `json:"retry_after_seconds"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Header().Get("X-ShinyHub-Conflict") != "generation-handoff-deferred" {
+			t.Fatal("capacity refusal lost backward-compatible conflict header")
+		}
+		if body.Kind != "capacity" || body.Retryable != transient || body.Delay != 60 || rec.Header().Get("Retry-After") != "60" {
+			t.Fatalf("response=%s", rec.Body.String())
+		}
+		if transient && strings.Contains(rec.Body.String(), "allow-downtime") {
+			t.Fatal("pressure refusal suggests dropping sessions")
+		}
+		stream := httptest.NewRecorder()
+		responder := newDeployResponder(stream, httptest.NewRequest("POST", "/", nil))
+		responder.stream = true
+		responder.capacityFailure(block)
+		var event struct {
+			Kind      string `json:"failure_kind"`
+			Retryable bool   `json:"capacity_retryable"`
+			Delay     int    `json:"retry_after_seconds"`
+		}
+		if err := json.Unmarshal(stream.Body.Bytes(), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Kind != body.Kind || event.Retryable != body.Retryable || event.Delay != body.Delay {
+			t.Fatalf("stream lost retry hints: %s", stream.Body.String())
+		}
+	}
+}
+
+func TestCapacityAfterProducerBarrierIsNotPreservedRefusal(t *testing.T) {
+	srv, store, token, _ := newManifestE2EServerWithJobs(t)
+	defer srv.Close()
+	app := createGenerationTestApp(t, store, "capacity-after-writer", 1, 16)
+	srv.SetDeployRunForTest(func(p deploy.Params) (*deploy.PoolResult, error) {
+		if !p.PrepareOnly {
+			return nil, &activation.CapacityError{Resource: "cpu", Reason: "CPU: busy", Transient: true, RetryAfter: time.Minute}
+		}
+		return deploy.Run(p)
+	})
+	body, ct := buildMultiFileBundleUpload(t, map[string]string{"app.py": "print('consumer')", "shinyhub.toml": "[[schedule]]\nname='refresh'\ncron='0 5 * * *'\ncmd='true'\ndeploy_trigger='bundle_change'\n"})
+	req := httptest.NewRequest(http.MethodPost, "/api/apps/"+app.Slug+"/deploy", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rec, req)
+	if rec.Code != 500 || !strings.Contains(rec.Body.String(), `"failure_kind":"server_error"`) || strings.Contains(rec.Body.String(), `"update_state":"blocked_capacity"`) {
+		t.Fatalf("mutating capacity outcome: %d %s", rec.Code, rec.Body)
+	}
+	latest, _ := store.ListDeploymentsBySlug(app.Slug)
+	var barrier int
+	if err := store.DB().QueryRow("SELECT producer_barrier_entered FROM deployments WHERE id=?", latest[0].ID).Scan(&barrier); err != nil || barrier != 1 {
+		t.Fatalf("test did not enter physical producer barrier: %d %v", barrier, err)
+	}
+	live, _ := store.GetAppByID(app.ID)
+	if live.Status == "running" {
+		t.Fatal("unsafe consumer restored after writer failure")
+	}
+}

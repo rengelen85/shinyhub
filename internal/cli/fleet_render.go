@@ -219,9 +219,10 @@ func planExit(f *fleetPlanFlags, diff []fleet.AppDiff, projects []fleet.ProjectD
 // JSON envelope types for the --json output.
 
 type jsonDriftItem struct {
-	Key     string `json:"key"`
-	Server  string `json:"server"`
-	Desired string `json:"desired"`
+	Environment string `json:"environment,omitempty"`
+	Key         string `json:"key"`
+	Server      string `json:"server"`
+	Desired     string `json:"desired"`
 }
 
 type jsonUnmanagedItem struct {
@@ -320,7 +321,7 @@ func jsonProjectsFromDiff(projects []fleet.ProjectDiff) []jsonProject {
 	for _, p := range sorted {
 		drift := make([]jsonDriftItem, 0, len(p.Drift))
 		for _, c := range p.Drift {
-			drift = append(drift, jsonDriftItem{Key: c.Key, Server: c.Server, Desired: c.Desired})
+			drift = append(drift, jsonDriftItem{Key: c.Key, Server: c.Server, Desired: c.Desired, Environment: c.Environment})
 		}
 		out = append(out, jsonProject{Slug: p.Slug, Action: string(p.Action), Drift: drift})
 	}
@@ -339,7 +340,7 @@ func writeFleetPlanJSONWithFile(out interface{ Write([]byte) (int, error) }, m *
 	for _, d := range sorted {
 		drift := make([]jsonDriftItem, 0, len(d.ConfigDrift))
 		for _, c := range d.ConfigDrift {
-			drift = append(drift, jsonDriftItem{Key: c.Key, Server: c.Server, Desired: c.Desired})
+			drift = append(drift, jsonDriftItem{Key: c.Key, Server: c.Server, Desired: c.Desired, Environment: c.Environment})
 		}
 		unmanaged := make([]jsonUnmanagedItem, 0, len(d.Unmanaged))
 		for _, u := range d.Unmanaged {

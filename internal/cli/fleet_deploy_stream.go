@@ -83,6 +83,12 @@ func consumeFleetDeployEvents(resp *http.Response, slug string, out io.Writer) (
 				code = http.StatusInternalServerError
 			}
 			kind := deployfail.Kind(event.FailureKind)
+			if code == http.StatusConflict && event.Phase == "capacity" {
+				kind = deployfail.Capacity
+			}
+			if kind == deployfail.Capacity && code != http.StatusConflict {
+				kind = deployfail.ServerError
+			}
 			if !kind.Valid() {
 				kind = deployfail.Unknown
 				if code >= 500 {
@@ -107,6 +113,9 @@ func consumeFleetDeployEvents(resp *http.Response, slug string, out io.Writer) (
 			}
 			message += "; run: " + command
 			var failure error = &httpStatusError{Status: code, msg: message}
+			if kind == deployfail.Capacity && !uncertain {
+				failure = &fleetCapacityError{msg: message, retryable: event.CapacityRetryable || legacyPressureRefusal(event.Message), retryAfter: time.Duration(event.RetryAfterSeconds) * time.Second}
+			}
 			if uncertain {
 				failure = outcomeError(failure)
 			}

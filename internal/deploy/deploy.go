@@ -788,7 +788,7 @@ func buildEnvironment(p Params, appType string, buildTimeout time.Duration) (err
 	// fails the build closed: building without the app's variables would
 	// surface as a misleading downstream error (missing index credentials
 	// read as "package not found").
-	appEnv, err := p.Manager.ResolveAppEnv(p.Slug)
+	appEnv, err := p.Manager.ResolveBundleAppEnv(p.Slug, p.BundleDir)
 	if err != nil {
 		return fmt.Errorf("resolve app env: %w", err)
 	}
@@ -1517,7 +1517,7 @@ func runManifestPostDeployHooks(p Params, hostDeps bool) (declared, run, skipped
 	// sanitized server base and the sandbox vars). Merge the caller-supplied
 	// Env (localrun --env) with the app's stored env; a resolver failure fails
 	// the hook phase closed, matching buildEnvironment.
-	appEnv, err := p.Manager.ResolveAppEnv(p.Slug)
+	appEnv, err := p.Manager.ResolveBundleAppEnv(p.Slug, p.BundleDir)
 	if err != nil {
 		return declared, 0, 0, fmt.Errorf("resolve app env: %w", err)
 	}

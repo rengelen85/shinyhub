@@ -11,6 +11,7 @@ import (
 )
 
 type fleetApplyFlags struct {
+	environment              string
 	file                     string
 	prune                    bool
 	adopt                    bool
@@ -21,6 +22,7 @@ type fleetApplyFlags struct {
 	jsonOutput               bool
 	retries                  int
 	healthTimeout            int
+	capacityWait             time.Duration
 	warmTimeout              time.Duration
 	waitForWarm              bool
 	verifySchedules          bool
@@ -68,6 +70,7 @@ func newFleetApplyCmd() *cobra.Command {
 			return runFleetApply(cmd, f)
 		},
 	}
+	cmd.Flags().StringVar(&f.environment, "environment", "", "Select a declared environment for an unbound host")
 	cmd.Flags().StringVarP(&f.file, "file", "f", defaultFleetManifest, "Path to the fleet manifest")
 	cmd.Flags().BoolVar(&f.prune, "prune", false, "Delete fleet-owned apps absent from the manifest (removes data dir)")
 	cmd.Flags().BoolVar(&f.adopt, "adopt", false, "Take ownership of in-scope apps not yet fleet-managed")
@@ -78,6 +81,7 @@ func newFleetApplyCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.allowDowntime, "allow-downtime", false,
 		"Permit stop-first deploys when safe version handoff is unavailable (disconnects active sessions for affected apps)")
 	cmd.Flags().BoolVar(&f.jsonOutput, "json", false, "Emit the machine-readable JSON envelope")
+	cmd.Flags().DurationVar(&f.capacityWait, "capacity-wait", 5*time.Minute, "Maximum time per app to retry transient CPU pressure (0 disables waiting)")
 	cmd.Flags().IntVar(&f.retries, "retries", 1, "Retry attempts after the first for transient deploy and config failures (deterministic deploy failures are never retried)")
 	cmd.Flags().IntVar(&f.healthTimeout, "health-timeout", 120, "Seconds to wait per app after deploy for a healthy status: running, or idle for an elastic (grouped/per_session) pool that boots workers on demand")
 	cmd.Flags().DurationVar(&f.warmTimeout, "warm-timeout", fleetWarmTimeout, "Maximum total time per app for bundle convergence and stale schedule refreshes")
@@ -137,7 +141,10 @@ func runFleetApply(cmd *cobra.Command, f *fleetApplyFlags) error {
 	errOut := cmd.ErrOrStderr()
 
 	f.file = resolveFleetManifest(cmd, f.file, errOut)
-	pf, err := fleetPreflight(f.file, errOut, "apply", f.waitForServer)
+	if f.capacityWait < 0 {
+		return &ExitCodeError{Code: 1, Kind: KindValidation, Err: fmt.Errorf("capacity-wait must be nonnegative")}
+	}
+	pf, err := fleetPreflight(f.file, errOut, "apply", f.waitForServer, f.environment)
 	if err != nil {
 		return err
 	}
@@ -151,6 +158,9 @@ func runFleetApply(cmd *cobra.Command, f *fleetApplyFlags) error {
 		return renderFleetPlan(cmd, synthetic, "shinyhub fleet apply --dry-run", pf.manifest, pf.host, pf.caps, pf.diff, pf.projectDiff)
 	}
 
+	if pf.manifest.ResolvedEnvironment != "" && !quietFlag {
+		fmt.Fprintf(errOut, "Environment: %s\n", pf.manifest.ResolvedEnvironment)
+	}
 	if pf.caps.EnvironmentLabel != "" && !quietFlag {
 		fmt.Fprintf(errOut, "Target: %s (%s)\n", pf.caps.EnvironmentLabel, pf.host)
 	}
@@ -242,6 +252,7 @@ func runFleetApply(cmd *cobra.Command, f *fleetApplyFlags) error {
 		allowDowntime:            f.allowDowntime,
 		preconditions:            pf.caps.FleetPreconditions,
 		retries:                  f.retries,
+		capacityWait:             f.capacityWait,
 		healthTimeout:            healthTimeoutDuration(f.healthTimeout),
 		warmTimeout:              warmTimeoutDuration(f.warmTimeout),
 		waitForWarm:              f.waitForWarm,
@@ -370,6 +381,12 @@ func fleetApplyRecoveryCommand(f *fleetApplyFlags) string {
 	}
 	if f.allowUnsafeDegradedPrune {
 		parts = append(parts, "--allow-unsafe-degraded-prune")
+	}
+	if f.environment != "" {
+		parts = append(parts, "--environment", shellQuote(f.environment))
+	}
+	if f.capacityWait != 5*time.Minute {
+		parts = append(parts, "--capacity-wait", f.capacityWait.String())
 	}
 	if f.retries != 1 {
 		parts = append(parts, "--retries", fmt.Sprintf("%d", f.retries))

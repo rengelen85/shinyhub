@@ -43,6 +43,7 @@ type serverInfoResponse struct {
 // rely on precondition headers and content-digest tracking, or must degrade
 // gracefully against an older server.
 type serverCapabilities struct {
+	BundleEnv                 bool `json:"bundle_env"`
 	RollingRestart            bool `json:"rolling_restart"`
 	ScheduleInputs            bool `json:"schedule_inputs"`
 	RuntimeCapabilities       bool `json:"runtime_capabilities"`
@@ -101,6 +102,7 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 			FleetRunLifecycle:         true,
 			ServiceAccountCredentials: true,
 			ScheduleDeployConvergence: true,
+			BundleEnv:                 true,
 			ScheduleRefreshStale:      true,
 			DeployPreflight:           true,
 			StaleUVLockRefusal:        true,

@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"time"
 
 	"github.com/rvben/shinyhub/internal/deployevent"
 )
@@ -143,6 +144,9 @@ func consumeDeployEvents(resp *http.Response, format outputFormat, out, errOut i
 			phase := event.Phase
 			if phase == "" {
 				phase = "deployment"
+			}
+			if status == http.StatusConflict && event.FailureKind == "capacity" {
+				return nil, &fleetCapacityError{msg: fmt.Sprintf("deploy deferred: %s", event.Message), retryable: event.CapacityRetryable, retryAfter: time.Duration(event.RetryAfterSeconds) * time.Second}
 			}
 			err := &httpStatusError{Status: status, msg: fmt.Sprintf("deploy failed during %s: %s", phase, event.Message)}
 			if format == formatNDJSON {

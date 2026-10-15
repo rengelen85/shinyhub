@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rvben/shinyhub/internal/appenv"
 	"github.com/rvben/shinyhub/internal/auth"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/deploy"
@@ -18,6 +20,7 @@ import (
 
 type envListItem struct {
 	Key       string `json:"key"`
+	Source    string `json:"source,omitempty"`
 	Value     string `json:"value,omitempty"`
 	Secret    bool   `json:"secret"`
 	Set       bool   `json:"set"`
@@ -30,6 +33,9 @@ func (s *Server) handleApplyAppEnv(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 	app, ok := s.requireManageApp(w, r, slug)
 	if !ok {
+		return
+	}
+	if checkAppPreconditions(w, r, app) {
 		return
 	}
 	query := r.URL.Query()
@@ -68,7 +74,12 @@ func (s *Server) handleListAppEnv(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "list env")
 		return
 	}
-	out := make([]envListItem, 0, len(vars))
+	bundle, err := s.servingBundleEnv(app.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read serving bundle env")
+		return
+	}
+	items := make(map[string]envListItem, len(vars)+len(bundle))
 	for _, v := range vars {
 		item := envListItem{
 			Key:       v.Key,
@@ -79,7 +90,19 @@ func (s *Server) handleListAppEnv(w http.ResponseWriter, r *http.Request) {
 		if !v.IsSecret {
 			item.Value = string(v.Value)
 		}
-		out = append(out, item)
+		items[v.Key] = item
+	}
+	for key, value := range bundle {
+		items[key] = envListItem{Key: key, Value: value, Set: true, Source: "bundle"}
+	}
+	keys := make([]string, 0, len(items))
+	for key := range items {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]envListItem, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, items[key])
 	}
 	limit, offset := parsePagination(r)
 	writeList(w, out, limit, offset, nil)
@@ -124,7 +147,13 @@ func (s *Server) handleUpsertAppEnv(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if checkAppPreconditions(w, r, app) {
+		return
+	}
 
+	if s.rejectBundleEnvEdit(w, app.ID, key) {
+		return
+	}
 	var body upsertEnvRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -233,6 +262,9 @@ func (s *Server) handleDeleteAppEnv(w http.ResponseWriter, r *http.Request) {
 
 	app, ok := s.requireManageApp(w, r, slug)
 	if !ok {
+		return
+	}
+	if checkAppPreconditions(w, r, app) {
 		return
 	}
 
@@ -407,4 +439,30 @@ func (s *Server) maybeRestartForChange(r *http.Request, app *db.App, slug string
 		Status: "running",
 	})
 	return true, nil
+}
+
+// Resolve serving authority, never the latest pending candidate. A failed deploy
+// must not expose candidate configuration through the management API.
+func (s *Server) servingBundleEnv(appID int64) (map[string]string, error) {
+	deployment, err := s.store.GetServingDeployment(appID)
+	if errors.Is(err, db.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return appenv.LoadBundle(deployment.BundleDir)
+}
+
+func (s *Server) rejectBundleEnvEdit(w http.ResponseWriter, appID int64, key string) bool {
+	values, err := s.servingBundleEnv(appID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read serving bundle env")
+		return true
+	}
+	if _, owned := values[key]; owned {
+		writeError(w, http.StatusConflict, "env key is managed by the serving bundle; edit the manifest and redeploy")
+		return true
+	}
+	return false
 }

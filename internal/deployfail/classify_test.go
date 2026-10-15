@@ -142,3 +142,14 @@ func TestHookFailedIsValidKind(t *testing.T) {
 		t.Errorf("HookFailed = %q, want hook_failed (public contract)", HookFailed)
 	}
 }
+
+func TestClassifyCapacityRefusals(t *testing.T) {
+	for _, message := range []string{"activation deferred for capacity: CPU: 0 cores available", "capacity-blocked/cpu: allocated to live workers"} {
+		if got := ClassifyMessage(message); got != Capacity {
+			t.Fatalf("classify %q = %s", message, got)
+		}
+	}
+	if !Capacity.Valid() {
+		t.Fatal("capacity must be a valid public kind")
+	}
+}

@@ -26,6 +26,7 @@ func (e *protocolError) Error() string { return e.op + ": " + e.err.Error() }
 func (e *protocolError) Unwrap() error { return e.err }
 
 type fleetPlanFlags struct {
+	environment      string
 	file             string
 	detailedExitcode bool
 	failOnChanges    bool
@@ -54,6 +55,7 @@ func newFleetPlanCmd() *cobra.Command {
 			return runFleetPlan(cmd, f)
 		},
 	}
+	cmd.Flags().StringVar(&f.environment, "environment", "", "Select a declared environment for an unbound host")
 	cmd.Flags().StringVarP(&f.file, "file", "f", defaultFleetManifest, "Path to the fleet manifest")
 	cmd.Flags().BoolVar(&f.detailedExitcode, "detailed-exitcode", false, "Exit 2 when changes are pending, 0 when none")
 	cmd.Flags().BoolVar(&f.failOnChanges, "fail-on-changes", false, "Alias for --detailed-exitcode: exit 2 when changes are pending (CI gate)")
@@ -75,7 +77,7 @@ func runFleetPlan(cmd *cobra.Command, f *fleetPlanFlags) error {
 		f.jsonOutput = true
 	}
 	f.file = resolveFleetManifest(cmd, f.file, cmd.ErrOrStderr())
-	pf, err := fleetPreflight(f.file, cmd.ErrOrStderr(), "plan", f.waitForServer)
+	pf, err := fleetPreflight(f.file, cmd.ErrOrStderr(), "plan", f.waitForServer, f.environment)
 	if err != nil {
 		return err
 	}
@@ -194,6 +196,7 @@ func reportAppsFetchError(cfg *cliConfig, errOut io.Writer, err error) error {
 }
 
 type serverCaps struct {
+	BundleEnv                 bool   `json:"bundle_env"`
 	EnvironmentLabel          string `json:"-"`
 	RuntimeCapabilities       bool   `json:"runtime_capabilities"`
 	TrustedPublishing         bool   `json:"trusted_publishing"`

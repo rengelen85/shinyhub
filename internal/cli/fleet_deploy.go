@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -154,6 +155,22 @@ func deployAppBundleFromSpecWithDowntime(cfg *cliConfig, slug string, spec bundl
 		if err := parseDiskQuotaError("deploy "+slug, resp.StatusCode, rb); err != nil {
 			return "", false, nil, failureKindFromBody(resp.StatusCode, rb), err
 		}
+		if failureKindFromBody(resp.StatusCode, rb) == deployfail.Capacity {
+			var detail struct {
+				Retryable  *bool `json:"capacity_retryable"`
+				RetryAfter int   `json:"retry_after_seconds"`
+			}
+			_ = json.Unmarshal(rb, &detail)
+			retryable := legacyPressureRefusal(serverErrorMessage(rb, resp.Status))
+			if detail.Retryable != nil {
+				retryable = *detail.Retryable
+			}
+			delay := time.Duration(detail.RetryAfter) * time.Second
+			if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
+				delay = time.Duration(seconds) * time.Second
+			}
+			return "", false, nil, deployfail.Capacity, &fleetCapacityError{msg: serverErrorMessage(rb, resp.Status), retryable: retryable, retryAfter: delay}
+		}
 		// A refused no-downtime handoff preserves the working version and races
 		// nothing, so it is a precondition the operator clears with
 		// --allow-downtime, not a state change to re-plan. It is classified
@@ -242,9 +259,16 @@ func failureKindFromBody(status int, body []byte) deployfail.Kind {
 	var env struct {
 		Error       string `json:"error"`
 		FailureKind string `json:"failure_kind"`
+		UpdateState string `json:"update_state"`
 	}
 	_ = json.Unmarshal(body, &env)
+	if status == http.StatusConflict && env.UpdateState == "blocked_capacity" {
+		return deployfail.Capacity
+	}
 	if k := deployfail.Kind(env.FailureKind); k.Valid() {
+		if k == deployfail.Capacity && status != http.StatusConflict {
+			return deployfail.ServerError
+		}
 		return k
 	}
 	switch {
@@ -259,7 +283,11 @@ func failureKindFromBody(status int, body []byte) deployfail.Kind {
 	if msg == "" {
 		msg = string(body)
 	}
-	return deployfail.ClassifyMessage(msg)
+	kind := deployfail.ClassifyMessage(msg)
+	if kind == deployfail.Capacity && status != http.StatusConflict {
+		return deployfail.ServerError
+	}
+	return kind
 }
 
 // readPromotedDigest re-GETs the app list and returns the live (succeeded)

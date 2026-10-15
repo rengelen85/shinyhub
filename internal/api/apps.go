@@ -3241,6 +3241,9 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		// failed-first-deploy Overview box does not read.
 		diagnostic := s.deployFailureDiagnostic(slug, err)
 		kind := deployfail.Classify(err)
+		if kind == deployfail.Capacity && !preservedCapacityBlock {
+			kind = deployfail.ServerError
+		}
 		slog.Error("deploy_run_failed", "slug", slug, "err", err)
 		if producerBarrierEntered {
 			quarantineStatus := "failed"
@@ -3360,7 +3363,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		s.recordDeploy("failure")
 		if preservedCapacityBlock {
 			if deployResponse.stream {
-				deployResponse.fail(http.StatusConflict, capacityConflictMessage(lateCapacity), "", "capacity")
+				deployResponse.capacityFailure(lateCapacity)
 			} else {
 				w.Header().Set("X-ShinyHub-Conflict", "generation-handoff-deferred")
 				writeCapacityConflict(w, lateCapacity)
@@ -3677,7 +3680,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 	// Phase C: reconcile manifest-declared per-app group access. Runs whenever a
 	// manifest is present so a removed [access] block drops its manifest rules
 	// (declarative); manual rules are preserved by the store.
-	if manifest != nil {
+	if manifest != nil && !manifest.Sparse {
 		agResults, err := s.applyManifestAccessGroups(app, manifest.Access)
 		if err != nil {
 			slog.Error("manifest [access] apply failed", "slug", slug, "err", err)

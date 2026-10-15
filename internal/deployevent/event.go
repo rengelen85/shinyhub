@@ -25,20 +25,22 @@ const (
 // additive and optional so older clients can ignore detail added by newer
 // servers while preserving the stable type/phase/status core.
 type Event struct {
-	Type           string          `json:"type"`
-	Phase          string          `json:"phase,omitempty"`
-	Status         string          `json:"status,omitempty"`
-	Message        string          `json:"message,omitempty"`
-	ElapsedSeconds int64           `json:"elapsed_seconds,omitempty"`
-	Current        int             `json:"current,omitempty"`
-	Total          int             `json:"total,omitempty"`
-	Replica        *int            `json:"replica,omitempty"`
-	FileCount      int             `json:"file_count,omitempty"`
-	Bytes          int64           `json:"bytes,omitempty"`
-	Digest         string          `json:"digest,omitempty"`
-	StatusCode     int             `json:"status_code,omitempty"`
-	FailureKind    string          `json:"failure_kind,omitempty"`
-	Result         json.RawMessage `json:"result,omitempty"`
+	CapacityRetryable bool            `json:"capacity_retryable,omitempty"`
+	RetryAfterSeconds int             `json:"retry_after_seconds,omitempty"`
+	Type              string          `json:"type"`
+	Phase             string          `json:"phase,omitempty"`
+	Status            string          `json:"status,omitempty"`
+	Message           string          `json:"message,omitempty"`
+	ElapsedSeconds    int64           `json:"elapsed_seconds,omitempty"`
+	Current           int             `json:"current,omitempty"`
+	Total             int             `json:"total,omitempty"`
+	Replica           *int            `json:"replica,omitempty"`
+	FileCount         int             `json:"file_count,omitempty"`
+	Bytes             int64           `json:"bytes,omitempty"`
+	Digest            string          `json:"digest,omitempty"`
+	StatusCode        int             `json:"status_code,omitempty"`
+	FailureKind       string          `json:"failure_kind,omitempty"`
+	Result            json.RawMessage `json:"result,omitempty"`
 }
 
 // Phase constructs a phase update.

@@ -145,7 +145,7 @@ func effectiveEnv(env []string) []string {
 // The check is advisory: a requirements file that cannot be read fails the
 // build or the launch, which report it themselves.
 func reportRequirementsIndexOverride(p Params) {
-	appEnv, _ := p.Manager.ResolveAppEnv(p.Slug)
+	appEnv, _ := p.Manager.ResolveBundleAppEnv(p.Slug, p.BundleDir)
 	base := append(process.SanitizedEnv(), appEnv...)
 	idx, err := process.ReadRequirementsIndex(p.BundleDir, base)
 	if err != nil {

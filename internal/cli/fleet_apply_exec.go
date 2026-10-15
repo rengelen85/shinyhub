@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ type convergeOpts struct {
 	preconditions            bool // server supports If-Match-style headers
 	retries                  int  // attempts AFTER the first for deploys/transient config PATCHes
 	healthTimeout            time.Duration
+	capacityWait             time.Duration
 	warmTimeout              time.Duration
 	waitForWarm              bool
 	verifySchedules          bool
@@ -177,6 +179,7 @@ func deployWithRetry(cfg *cliConfig, slug string, spec bundleBuildSpec, visibili
 	if opt.recoveryRevision != "" {
 		ifRevision = &opt.recoveryRevision
 	}
+	var capacityDeadline time.Time
 	for attempts = 1; attempts <= total; attempts++ {
 		var c bool
 		var ff []deployRunRef
@@ -196,6 +199,40 @@ func deployWithRetry(cfg *cliConfig, slug string, spec bundleBuildSpec, visibili
 		var uncertain *fleetDeployOutcomeError
 		if errors.As(err, &uncertain) {
 			return "", attempts, committed, deployRuns, failed, err
+		}
+		var capacity *fleetCapacityError
+		if errors.As(err, &capacity) && capacity.retryable && !committed && opt.recoveryRevision == "" && opt.capacityWait > 0 {
+			if capacityDeadline.IsZero() {
+				capacityDeadline = time.Now().Add(opt.capacityWait)
+			}
+			delay := capacity.retryAfter
+			if delay <= 0 {
+				delay = time.Second
+			}
+			remaining := time.Until(capacityDeadline)
+			if remaining > 0 {
+				lastWait := delay >= remaining
+				if lastWait {
+					delay = remaining
+				}
+				if !updateFleetProgress(out, "Waiting for CPU capacity", "working version preserved", capacityDeadline, false) {
+					fmt.Fprintf(out, "  %s: transient CPU pressure; retrying in %s (working version preserved)\n", slug, delay)
+				}
+				ctx := opt.context
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return "", attempts, false, deployRuns, failed, ctx.Err()
+				case <-timer.C:
+				}
+				total++ // Capacity waiting has its own budget, independent of --retries.
+				continue
+			}
+			return "", attempts, false, deployRuns, failed, err
 		}
 		if attempts == total {
 			return "", attempts, committed, deployRuns, failed, err
@@ -302,6 +339,9 @@ func fleetDeployRunLabel(slug, schedule string) string {
 func applyConfigDrift(cfg *cliConfig, slug string, drift []fleet.ConfigDriftItem, declared fleet.Config, ifD, ifMB *string, runID string) error {
 	body := map[string]any{}
 	for _, c := range drift {
+		if strings.HasPrefix(c.Key, "env.") {
+			return fmt.Errorf("app %s: bundle env did not converge; re-plan and redeploy the desired bundle", slug)
+		}
 		switch c.Key {
 		case "visibility":
 			if err := patchAppAccess(cfg, slug, c.Desired, ifD, ifMB, runID); err != nil {
@@ -373,7 +413,10 @@ func applyConfigDrift(cfg *cliConfig, slug string, drift []fleet.ConfigDriftItem
 			}
 		}
 	}
-	return patchApp(cfg, slug, body, ifD, ifMB, runID)
+	if err := patchApp(cfg, slug, body, ifD, ifMB, runID); err != nil {
+		return err
+	}
+	return nil
 }
 
 // applyConfigDriftWithRetry gives transient server failures on the config-only
@@ -521,7 +564,7 @@ func convergeAppFromSpec(cfg *cliConfig, d fleet.AppDiff, entry fleet.AppEntry, 
 		// attributed to the deploy. A post-deploy failure (config patch, deploy-triggered run)
 		// uses fail directly and must NOT inherit a deploy attempt's kind.
 		res.deployFailed = true
-		if res.status == statusFailed && !isDiskQuotaError(err) {
+		if res.status == statusFailed && !isDiskQuotaError(err) && finalFailureKind(res) != deployfail.Capacity {
 			if tail, lerr := fetchLogTail(cfg, d.Slug, logTailLines); lerr == nil {
 				res.logTail = tail
 			}
@@ -633,7 +676,7 @@ func convergeAppFromSpec(cfg *cliConfig, d fleet.AppDiff, entry fleet.AppEntry, 
 		return finish(status, attempts), true
 	}
 	recoveryFailureMutation := func(err error) applyMutationState {
-		if isConflictError(err) || (len(res.attemptsDetail) > 0 && res.attemptsDetail[len(res.attemptsDetail)-1].Kind == deployfail.DowntimeRequired) {
+		if isConflictError(err) || onlyCapacityFailures(res.attemptsDetail) || (len(res.attemptsDetail) > 0 && res.attemptsDetail[len(res.attemptsDetail)-1].Kind == deployfail.DowntimeRequired) {
 			return mutationNone
 		}
 		state, readErr := readFleetRecoverySnapshot(cfg, d.Slug, opt.healthTimeout)
@@ -742,6 +785,14 @@ func convergeAppFromSpec(cfg *cliConfig, d fleet.AppDiff, entry fleet.AppEntry, 
 		if err != nil {
 			if recovered, ok := concurrentRecovery(err, statusAdopted, attempts); ok {
 				return recovered
+			}
+			if !committed && onlyCapacityFailures(failed) {
+				state := mutationNone
+				if releaseErr := releaseAdoptReservation(cfg, d.Slug, obs.ManagedBy, marker, opt); releaseErr != nil {
+					state = mutationUnknown
+					err = errors.Join(err, fmt.Errorf("restore adoption reservation: %w", releaseErr))
+				}
+				return failDeploy(err, attempts, state)
 			}
 			// A refused conditional upload cannot have promoted our bundle.
 			// Another actor's release must not be credited to this adoption.
@@ -947,4 +998,31 @@ func convergeAppFromSpec(cfg *cliConfig, d fleet.AppDiff, entry fleet.AppEntry, 
 
 	res.failureKind = failureInvalidAction
 	return fail(fmt.Errorf("unknown fleet action %q", d.Action), 0)
+}
+
+// fleetCapacityError preserves structured admission evidence through either wire protocol.
+type fleetCapacityError struct {
+	msg        string
+	retryable  bool
+	retryAfter time.Duration
+}
+
+func (e *fleetCapacityError) Error() string { return e.msg }
+
+// Old servers have no transient flag. Recognize only the measured-pressure
+// refusal; accounting and unknown capacity errors still fail fast.
+func legacyPressureRefusal(message string) bool {
+	return strings.HasPrefix(message, "working version preserved: CPU: ") && strings.Contains(message, "cores available; need ")
+}
+
+func onlyCapacityFailures(failed []attemptOutcome) bool {
+	if len(failed) == 0 {
+		return false
+	}
+	for _, attempt := range failed {
+		if attempt.Kind != deployfail.Capacity {
+			return false
+		}
+	}
+	return true
 }

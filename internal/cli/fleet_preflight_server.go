@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/rvben/shinyhub/internal/deploy"
@@ -64,9 +62,10 @@ type deployPreflightResponse struct {
 // directory, so an entrypoint contributed by a shared [[bundle_file]] input or
 // kept out by the ignore file is judged as the extracted bundle will be.
 type fleetBundleFacts struct {
-	Dir      string
-	Manifest *deploy.Manifest
-	AppType  string
+	ResolvedManifest []byte
+	Dir              string
+	Manifest         *deploy.Manifest
+	AppType          string
 	// StaleLock is the upload's stale-lock refusal (wrapping
 	// process.ErrStaleLock) when the uv.lock in the upload no longer records
 	// what its pyproject.toml declares, and nil otherwise.
@@ -81,9 +80,10 @@ func resolveFleetBundleFacts(spec bundleBuildSpec, manifest *deploy.Manifest, pr
 		uploaded[name] = true
 	}
 	facts := fleetBundleFacts{
-		Dir:      spec.Dir,
-		Manifest: manifest,
-		AppType:  deploy.DetectAppTypeIn(spec.Dir, func(name string) bool { return uploaded[name] }),
+		ResolvedManifest: spec.Manifest,
+		Dir:              spec.Dir,
+		Manifest:         manifest,
+		AppType:          deploy.DetectAppTypeIn(spec.Dir, func(name string) bool { return uploaded[name] }),
 	}
 	// Only a lock the server's own check shows is stale is recorded; a lock
 	// it cannot judge is accepted by the upload and so is not a problem here.
@@ -149,7 +149,7 @@ func fleetServerPreflight(cfg *cliConfig, caps serverCaps, m *fleet.Manifest, di
 	}
 	var problems []fleetServerPreflightProblem
 	for _, d := range diff {
-		if !preflightsDeploy(d.Action) || ownershipOnlyAdopt(d, caps.FleetPreconditions) {
+		if (m.ResolvedEnvironment == "" && (!preflightsDeploy(d.Action) || ownershipOnlyAdopt(d, caps.FleetPreconditions))) || d.Action == fleet.ActionDelete {
 			continue
 		}
 		entry, ok := entries[d.Slug]
@@ -193,13 +193,13 @@ func fleetServerPreflight(cfg *cliConfig, caps serverCaps, m *fleet.Manifest, di
 // manifest the deploy will upload.
 func buildDeployPreflightRequest(facts fleetBundleFacts, entry *fleet.AppEntry) (deployPreflightRequest, error) {
 	req := deployPreflightRequest{AppType: facts.AppType}
-	data, err := os.ReadFile(filepath.Join(facts.Dir, deploy.ManifestFilename))
-	switch {
-	case err == nil:
-		req.Manifest = string(data)
-	case errors.Is(err, os.ErrNotExist):
-	default:
-		return req, fmt.Errorf("app %q: read %s: %w", entry.Slug, deploy.ManifestFilename, err)
+	data, err := fleetSourceManifestData(facts.Dir)
+	if err != nil {
+		return req, fmt.Errorf("app %q: read manifest: %w", entry.Slug, err)
+	}
+	req.Manifest = string(data)
+	if facts.ResolvedManifest != nil {
+		req.Manifest = string(facts.ResolvedManifest)
 	}
 	if entry.Config.Replicas != nil || entry.Config.Autoscale != nil {
 		req.Settings = &deployPreflightSettings{Replicas: entry.Config.Replicas}

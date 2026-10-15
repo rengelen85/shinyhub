@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/rvben/shinyhub/internal/deploy"
 	"github.com/rvben/shinyhub/internal/fleet"
 	"github.com/spf13/cobra"
 )
@@ -133,7 +132,18 @@ func validateFleetManifest(file string, data []byte) (*fleet.Manifest, []string)
 		// parse its shinyhub.toml exactly as the server does at deploy time.
 		if ps.Kind == fleet.SourceLocal {
 			localSources[app.Slug] = ps.LocalPath
-			if _, err := deploy.LoadManifest(ps.LocalPath); err != nil {
+			if len(m.Environments) == 0 && len(app.Config.Env) > 0 {
+				if _, _, err := resolveEnvironmentBundle(bundleBuildSpec{Dir: ps.LocalPath}, app.Config); err != nil {
+					msgs = append(msgs, fmt.Sprintf("app %q: %v", app.Slug, err))
+				}
+			}
+			for _, name := range m.EnvironmentNames() {
+				merged := app.Environments[name].Config.Merge(app.Config)
+				if _, _, err := resolveEnvironmentBundle(bundleBuildSpec{Dir: ps.LocalPath}, merged, app.Environments[name].Config); err != nil {
+					msgs = append(msgs, fmt.Sprintf("app %q environment %q: %v", app.Slug, name, err))
+				}
+			}
+			if _, err := loadFleetSourceManifest(ps.LocalPath); err != nil {
 				msgs = append(msgs, fmt.Sprintf("app %q: shinyhub.toml: %v", app.Slug, err))
 			}
 		}

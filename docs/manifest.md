@@ -107,6 +107,12 @@ started (e.g. during early-startup deploys), the reload is skipped and
 the schedule rows are still written. The scheduler picks them up when it
 starts.
 
+Fleet may generate `sparse = true` at the root when adding settings to a source
+without a manifest. A sparse manifest accepts only app sizing, lifecycle and
+plaintext env declarations. Omitted identity, privacy and access policies retain
+their live settings, including on the first parallel handoff from a bare bundle.
+Ordinary manifests retain their existing reconciliation semantics.
+
 ## `[app]` - app-level settings
 
 | Field | Type | Meaning |
@@ -119,6 +125,7 @@ starts.
 | `max_sessions_per_replica` | int 0..1000 | Per-replica admission cap for new cookieless sessions. `0` means "use the runtime default". |
 | `render_seconds` | float 0..600 | CPU cost of one page render, used to pace admission so a burst queues on a wait page instead of stalling every session. `0` disables pacing. Applied live on deploy (no restart). See [Render pacing](scaling.md#render-pacing). |
 | `min_warm_replicas` | int 0..1000 | Minimum number of replica processes kept running when the app idles. Workers live inside a replica; this setting counts outer app processes, not `[app.worker]` workers. `0` (default) allows full hibernation. When set above `0`, the watcher stops only enough replicas to reach this floor so the first post-idle request hits a warm process. If the stored `replicas` value is less than `min_warm_replicas`, the floor self-clamps to `replicas`. Absent key leaves the stored value unchanged (same declared-only semantics as `replicas`). Inert under `[app.worker] isolation = "grouped"` or `"per_session"` (elastic pools boot workers on demand and report `idle` with none running); the server accepts it and reports a manifest warning; use `[app.worker] warm_spares` there. See [Pre-warming](scaling.md#pre-warming). |
+| `env` | table of strings | Plaintext variables belonging to this deployment, available during builds, hooks, producers and worker startup. Merges over server-managed env by key; wake and rollback retain their bundle's values. At most 100 keys, uppercase POSIX names, values up to 64 KiB; `PORT` and `SHINYHUB_*` are reserved. Use server-managed secret env for credentials. |
 | `command` | array of strings | Launch-command override. See [`[app] command`](#app-command) below. |
 | `startup_timeout_seconds` | int 1..3600 | Readiness deadline for deploy, wake, scale, rollback, and `shinyhub run`; default 120 seconds. Read at boot and not stored in the database. |
 | `build_timeout_seconds` | int 30..7200 | Host-side uv/renv dependency-build deadline; default 900 seconds. Read at build time and inert for Docker runtimes. |

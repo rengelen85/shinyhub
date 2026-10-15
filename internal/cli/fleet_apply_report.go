@@ -217,7 +217,7 @@ func renderResultRows(out io.Writer, s styler, res []applyResult, wSlug int) {
 	for _, r := range res {
 		statusWord := s.status(string(r.status))
 		if r.status == statusFailed {
-			if isDowntimeDeferral(r) {
+			if isDowntimeDeferral(r) || resultFailureKind(r) == string(deployfail.Capacity) {
 				statusWord = s.yellow("blocked")
 			}
 			if k := resultFailureKind(r); k != "" {
@@ -364,7 +364,7 @@ func applyRecoveryFor(ctx applyReportContext, results []applyResult) applyRecove
 
 	safe := true
 	for _, r := range results {
-		if r.status != statusFailed || !r.deployFailed || !retryableDeployFailure(finalFailureKind(r)) {
+		if r.status != statusFailed || !r.deployFailed || !(retryableDeployFailure(finalFailureKind(r)) || finalFailureKind(r) == deployfail.Capacity) {
 			if r.status == statusFailed {
 				safe = false
 			}
@@ -434,7 +434,11 @@ func applyRecoveryGuidance(results []applyResult) (commands, notes []string, ful
 		if errors.As(r.err, &quarantine) {
 			if quarantine.repairCommand != "" {
 				commands = append(commands, quarantine.repairCommand)
-				notes = append(notes, "A corrective deployment is required for "+r.slug+"; producer success alone cannot repair the failed deployment. Replace <source-dir> with the desired bundle source, include any fleet bundle files, and choose --allow-downtime only if interruption is acceptable. Re-apply after repair succeeds.")
+				if strings.HasPrefix(quarantine.repairCommand, "shinyhub fleet apply ") {
+					notes = append(notes, "A corrective deployment is required for "+r.slug+"; producer success alone cannot repair the failed deployment. Replace <fleet.toml> with the original fleet manifest and preserve its environment selection (including --environment if it was explicit). Choose --allow-downtime only if interruption is acceptable.")
+				} else {
+					notes = append(notes, "A corrective deployment is required for "+r.slug+"; producer success alone cannot repair the failed deployment. Replace <source-dir> with the desired bundle source, include any fleet bundle files, and choose --allow-downtime only if interruption is acceptable. Re-apply after repair succeeds.")
+				}
 				addressed = true
 			} else if quarantine.repairAdvice != "" {
 				notes = append(notes, quarantine.repairAdvice)
@@ -566,6 +570,8 @@ func renderApplyReportWithContext(out io.Writer, ctx applyReportContext, o apply
 			switch {
 			case isDiskQuotaError(r.err):
 				// The quota error already carries the operator recovery step.
+			case resultFailureKind(r) == string(deployfail.Capacity):
+				fmt.Fprintln(out, "    working version preserved; retry when CPU pressure clears, or adjust the worker budget if allocated capacity is exhausted")
 			case isDowntimeDeferral(r):
 				fmt.Fprintf(out, "    %s\n", s.dim("working version still serving; re-run with --allow-downtime to accept a stop-first deployment"))
 			case len(r.scheduleRefreshes) > 0:

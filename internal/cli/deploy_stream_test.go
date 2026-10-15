@@ -83,3 +83,13 @@ func TestResolveDeployFormatAllowsExplicitNDJSONButKeepsPipedJSONDefault(t *test
 		t.Fatalf("piped default = %q, %v", got, err)
 	}
 }
+
+func TestStreamedCapacityIsDeferredRatherThanStaleSavedPlan(t *testing.T) {
+	response := deployEventResponse(`{"type":"error","phase":"capacity","status_code":409,"failure_kind":"capacity","message":"working version preserved","capacity_retryable":true,"retry_after_seconds":60}`)
+	_, err := consumeDeployEvents(response, formatTable, io.Discard, io.Discard, false)
+	var capacity *fleetCapacityError
+	var status *httpStatusError
+	if !errors.As(err, &capacity) || errors.As(err, &status) {
+		t.Fatalf("capacity can be mistaken for a stale saved plan: %v", err)
+	}
+}

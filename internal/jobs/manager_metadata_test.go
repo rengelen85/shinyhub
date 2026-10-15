@@ -1,6 +1,8 @@
 package jobs_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -104,5 +106,41 @@ func TestManager_Run_PassesDeploymentMetadataToRuntime(t *testing.T) {
 	}
 	if got.DeploymentID != 42 {
 		t.Errorf("StartParams.DeploymentID = %d, want 42", got.DeploymentID)
+	}
+}
+
+func TestProducerAndScheduledRunUseTheirOwnBundleEnvironment(t *testing.T) {
+	rt := &fakeRuntime{exitInfo: process.ExitInfo{Code: 0}}
+	st := newFakeStore(makeSchedule("concurrent", 30), makeApp())
+	st.envVars = []db.AppEnvVar{{Key: "MODE", Value: []byte("stored")}}
+	old, candidate := t.TempDir(), t.TempDir()
+	for dir, value := range map[string]string{old: "serving", candidate: "candidate"} {
+		if err := os.WriteFile(filepath.Join(dir, "shinyhub.toml"), []byte("[app.env]\nMODE='"+value+"'\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	serving := &db.Deployment{ID: 21, AppID: 10, Version: "v21", BundleDir: old, Status: db.DeploymentSucceeded}
+	target := &db.Deployment{ID: 22, AppID: 10, Version: "v22", BundleDir: candidate, Status: db.DeploymentPending}
+	st.deployments = []*db.Deployment{target, serving}
+	m := newTestManager(t, rt, st)
+	if _, err := m.RunForDeployment(1, "deploy", nil, target); err != nil {
+		t.Fatal(err)
+	}
+	waitForCalls(t, rt, 1, 2*time.Second)
+	if got := lastEnv(effectiveEnv(lastParams(rt)), "MODE"); got != "candidate" {
+		t.Fatalf("candidate producer MODE=%q", got)
+	}
+	st.mu.Lock()
+	st.deployments = []*db.Deployment{serving}
+	st.mu.Unlock()
+	if _, err := m.Run(1, "manual", nil); err != nil {
+		t.Fatal(err)
+	}
+	waitForCalls(t, rt, 2, 2*time.Second)
+	if got := lastEnv(effectiveEnv(lastParams(rt)), "MODE"); got != "serving" {
+		t.Fatalf("serving job MODE=%q", got)
+	}
+	if string(st.envVars[0].Value) != "stored" {
+		t.Fatal("producer mutated stored settings")
 	}
 }

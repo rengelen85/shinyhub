@@ -18,6 +18,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/mattn/go-shellwords"
+	"github.com/rvben/shinyhub/internal/appenv"
 	"github.com/rvben/shinyhub/internal/appmetaspec"
 	"github.com/rvben/shinyhub/internal/autoscalespec"
 	"github.com/rvben/shinyhub/internal/config"
@@ -58,6 +59,9 @@ type Hook struct {
 // has no null literal: the convention mirrors the CLI's
 // `--hibernate-timeout -1`.
 type AppSettings struct {
+	InheritLivePolicy bool `toml:"-"`
+	// Env is plaintext configuration owned by this bundle, including builds and jobs.
+	Env map[string]string `toml:"env"`
 	// Framework selects a managed API launcher; empty retains existing inference.
 	// FastAPI exports app:app from app.py; Plumber reads plumber.R.
 	Framework string `toml:"framework"`
@@ -203,7 +207,8 @@ type AutoscaleSettings struct {
 }
 
 // Command, startup/build timeouts, and readiness settings are not part of
-// IsZero: they are read at boot, not reconciled into the DB. MemoryLimitMB /
+// IsZero: they are read at boot, not reconciled into the DB. Env likewise
+// belongs to the bundle and is resolved at launch. MemoryLimitMB /
 // CPUQuotaPercent ARE reconciled into the DB (like Replicas), so they count.
 func (a AppSettings) IsZero() bool {
 	return a.HibernateTimeoutMinutes == nil &&
@@ -286,6 +291,9 @@ type TracingSettings struct {
 
 // Manifest is the decoded shinyhub.toml.
 type Manifest struct {
+	// Sparse declarations preserve omitted live policy and manifest access rules.
+	// Fleet sets this when it materializes settings for a source without a manifest.
+	Sparse    bool            `toml:"sparse"`
 	App       AppSettings     `toml:"app"`
 	Hooks     []Hook          `toml:"hook"`
 	Schedules []ScheduleSpec  `toml:"schedule"`
@@ -331,6 +339,9 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", ManifestFilename, err)
 	}
+	if meta.IsDefined("app", "env") && meta.Type("app", "env") != "Hash" {
+		return nil, fmt.Errorf("app.env must be a table of strings")
+	}
 	// Strict-mode: reject any key that did not map to a known struct field.
 	// Catches typos and future-compatibility mismatches at deploy time rather
 	// than silently ignoring them.
@@ -342,6 +353,18 @@ func ParseManifest(data []byte) (*Manifest, error) {
 		sort.Strings(keys)
 		return nil, fmt.Errorf("parse %s: unknown field(s): %s", ManifestFilename, strings.Join(keys, ", "))
 	}
+	if m.Sparse {
+		allowed := map[string]bool{"replicas": true, "min_warm_replicas": true, "max_sessions_per_replica": true, "autoscale": true, "hibernate_timeout_minutes": true, "render_seconds": true, "env": true}
+		for _, key := range meta.Keys() {
+			if key[0] == "sparse" {
+				continue
+			}
+			if key[0] != "app" || (len(key) > 1 && !allowed[key[1]]) {
+				return nil, fmt.Errorf("sparse manifest only accepts app sizing, lifecycle and env declarations: %s", key.String())
+			}
+		}
+	}
+	m.App.InheritLivePolicy = m.Sparse
 	for i, h := range m.Hooks {
 		if err := validateHook(h); err != nil {
 			return nil, fmt.Errorf("%s [[hook]] #%d: %w", ManifestFilename, i+1, err)
@@ -395,6 +418,10 @@ func validateHook(h Hook) error {
 }
 
 func normalizeAndValidateApp(a *AppSettings) error {
+	if err := appenv.ValidateBundle(a.Env); err != nil {
+		return err
+	}
+
 	if a.VersionSwitch != "" && a.VersionSwitch != "manual" && a.VersionSwitch != "when_hidden" {
 		return fmt.Errorf("app.version_switch must be manual or when_hidden, got %q", a.VersionSwitch)
 	}

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -414,5 +416,40 @@ func TestStart_ResolverErrorAborts(t *testing.T) {
 	}
 	if rt.captured != nil {
 		t.Error("runtime.Start must not be called when resolver fails")
+	}
+}
+
+func TestStartBundleEnvironmentIsGenerationScoped(t *testing.T) {
+	rt := &captureRuntime{}
+	m := NewManager(t.TempDir(), rt)
+	stored := []string{"MODE=stored", "KEEP=stored"}
+	secret := []string{"MODE=secret", "TOKEN=private"}
+	m.SetEnvResolver(func(string) ([]string, []string, error) { return stored, secret, nil })
+	old, candidate := t.TempDir(), t.TempDir()
+	for dir, value := range map[string]string{old: "old", candidate: "candidate"} {
+		if err := os.WriteFile(filepath.Join(dir, "shinyhub.toml"), []byte("[app.env]\nMODE='"+value+"'\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, dir := range []string{old, candidate, old} {
+		_, err := m.Start(StartParams{Slug: "versioned", Dir: dir, Command: []string{"true"}, Port: 19090 + i, GenerationScoped: true, DeploymentID: int64(i + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "old"
+		if dir == candidate {
+			want = "candidate"
+		}
+		effective := map[string]string{}
+		for _, e := range append(append([]string{}, rt.captured.Env...), rt.captured.SecretEnv...) {
+			key, value, _ := strings.Cut(e, "=")
+			effective[key] = value
+		}
+		if effective["MODE"] != want || effective["KEEP"] != "stored" || effective["TOKEN"] != "private" {
+			t.Fatalf("activation %d: %v", i, effective)
+		}
+	}
+	if stored[0] != "MODE=stored" || secret[0] != "MODE=secret" {
+		t.Fatal("launch mutated shared settings")
 	}
 }

@@ -169,6 +169,9 @@ func (s *Server) manifestHandoffReasons(app *db.App, previous *db.Deployment, ma
 		return []string{"previous manifest is unavailable"}
 	}
 	old, err := deploy.LoadManifest(previous.BundleDir)
+	if err == nil && old == nil && manifest.Sparse {
+		old = &deploy.Manifest{}
+	}
 	if err != nil || old == nil {
 		return []string{"previous manifest is unavailable or unreadable"}
 	}
@@ -183,11 +186,13 @@ func (s *Server) manifestHandoffReasons(app *db.App, previous *db.Deployment, ma
 		"max_sessions_per_replica": true, "autoscale": true,
 		"memory_limit_mb": true, "cpu_quota_percent": true, "render_seconds": true,
 		"worker": true, "version_switch": true,
+		// Env is read from each immutable bundle; candidate changes never alter old workers.
+		"env": true, "replicas": true,
 	}
 	before, after := reflect.ValueOf(old.App), reflect.ValueOf(manifest.App)
 	for i := 0; i < after.NumField(); i++ {
 		field := after.Type().Field(i).Tag.Get("toml")
-		if safe[field] || after.Type().Field(i).Name == "HibernateResetToDefault" {
+		if safe[field] || (after.Type().Field(i).Name == "HibernateResetToDefault" || after.Type().Field(i).Name == "InheritLivePolicy") {
 			continue
 		}
 		if !reflect.DeepEqual(before.Field(i).Interface(), after.Field(i).Interface()) {
@@ -195,10 +200,10 @@ func (s *Server) manifestHandoffReasons(app *db.App, previous *db.Deployment, ma
 		}
 	}
 	m := manifest.App
-	if !reflect.DeepEqual(m.IdentityHeaders, app.IdentityHeaders) {
+	if (!m.InheritLivePolicy || m.IdentityHeaders != nil) && !reflect.DeepEqual(m.IdentityHeaders, app.IdentityHeaders) {
 		reasons = append(reasons, "app.identity_headers: reconciliation changes live identity forwarding")
 	}
-	if !reflect.DeepEqual(m.UsageIdentityMode, app.UsageIdentityMode) {
+	if (!m.InheritLivePolicy || m.UsageIdentityMode != nil) && !reflect.DeepEqual(m.UsageIdentityMode, app.UsageIdentityMode) {
 		reasons = append(reasons, "app.usage_identity_mode: reconciliation changes live privacy policy")
 	}
 	if !unchangedOptional(m.Replicas, app.Replicas) {
@@ -213,6 +218,9 @@ func (s *Server) manifestHandoffReasons(app *db.App, previous *db.Deployment, ma
 		if isolationErr != nil || !supportedHandoffIsolation(current) || !supportedHandoffIsolation(target) {
 			reasons = append(reasons, "app.worker: parallel handoff supports grouped and multiplex worker policy only")
 		}
+	}
+	if manifest.Sparse {
+		return reasons
 	}
 	if !reflect.DeepEqual(old.Access, manifest.Access) {
 		reasons = append(reasons, "access: access policy change requires stop-first reconciliation")

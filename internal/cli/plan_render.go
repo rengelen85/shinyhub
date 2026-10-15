@@ -110,6 +110,9 @@ func renderFleetPlanHumanWithBundleFiles(out io.Writer, model planDocument, flee
 		severity = planSeverityWarning
 	}
 	lines := paintPlanLines(s, severity, wrapPlanValue("", model.Outcome, width))
+	if model.Environment != "" {
+		lines = append(lines, "Environment: "+model.Environment)
+	}
 	lines = append(lines, fleetPlanMetaLines(s, fleetID, model.Target, command, width)...)
 
 	ownership := filterPlanResources(model.Resources, planActionAdopt)
@@ -369,7 +372,11 @@ func planChangeLines(s styler, changes []planChange, width int) []string {
 }
 
 func planHumanChangeValues(change planChange) (string, string) {
-	return planHumanValue(change.Current), planHumanValue(change.Planned)
+	planned := planHumanValue(change.Planned)
+	if change.Environment != "" {
+		planned += " (" + change.Environment + ")"
+	}
+	return planHumanValue(change.Current), planned
 }
 
 func planHumanValue(v *planValue) string {

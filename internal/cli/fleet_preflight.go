@@ -41,7 +41,7 @@ type preflightResult struct {
 // /api/server-info until the server is a healthy shinyhub or waitFor elapses
 // (the EC2-churn case). On any error it removes temp clones itself and returns
 // a nil result; on success the caller owns cleanup via the returned closure.
-func fleetPreflight(file string, errOut io.Writer, cmdName string, waitFor time.Duration) (*preflightResult, error) {
+func fleetPreflight(file string, errOut io.Writer, cmdName string, waitFor time.Duration, environment ...string) (*preflightResult, error) {
 	s := stylerFor(errOut)
 	var cleanups []func()
 	runCleanups := func() {
@@ -112,6 +112,13 @@ func fleetPreflight(file string, errOut io.Writer, cmdName string, waitFor time.
 		fmt.Fprintf(errOut, "  %s not authenticated: %v\n     run 'shinyhub connect <url>' or pass --config\n", s.failMark(), err)
 		return nil, &ExitCodeError{Code: 3, Err: err, Reported: true}
 	}
+	explicit := ""
+	if len(environment) > 0 {
+		explicit = environment[0]
+	}
+	if err := m.ResolveEnvironment(cfg.Host, explicit); err != nil {
+		return nil, &ExitCodeError{Code: 1, Kind: KindValidation, Err: err}
+	}
 	if waitFor > 0 {
 		if _, werr := waitForServerReady(cfg, waitFor, serverPollInterval, errOut, time.Now, time.Sleep); werr != nil {
 			fmt.Fprintf(errOut, "  %s %v\n", s.failMark(), werr)
@@ -159,19 +166,37 @@ func fleetPreflight(file string, errOut io.Writer, cmdName string, waitFor time.
 			spec = bundleBuildSpec{Dir: dir}
 			bundles[app.Slug] = spec
 		}
+		var resolvedManifest *deploy.Manifest
+		if m.ResolvedEnvironment != "" || len(app.Config.Env) > 0 {
+			var err error
+			spec, resolvedManifest, err = resolveEnvironmentBundle(spec, app.Config, app.Environments[m.ResolvedEnvironment].Config)
+			if err != nil {
+				resolveProblems = append(resolveProblems, fmt.Sprintf("app %q: %v", app.Slug, err))
+				continue
+			}
+			bundles[app.Slug] = spec
+		}
 		preview, derr := previewBundleSpec(spec)
 		if derr != nil {
 			resolveProblems = append(resolveProblems, fmt.Sprintf("app %q: %v", app.Slug, derr))
 			continue
 		}
 		localDigests[app.Slug] = preview.Digest
-		bm, merr := deploy.LoadManifest(dir)
+		bm, merr := loadFleetSourceManifest(dir)
+		if m.ResolvedEnvironment != "" || len(app.Config.Env) > 0 {
+			bm = resolvedManifest
+			merr = nil
+		}
 		if merr != nil {
 			resolveProblems = append(resolveProblems, fmt.Sprintf("app %q: %v", app.Slug, merr))
 			continue
 		}
 		if manifestUsesProducerInputs(bm) && !caps.ScheduleInputs {
 			resolveProblems = append(resolveProblems, fmt.Sprintf("app %q: server does not support schedule inputs; upgrade to a server advertising schedule_inputs", app.Slug))
+			continue
+		}
+		if bm != nil && (len(bm.App.Env) > 0 || bm.Sparse) && !caps.BundleEnv {
+			resolveProblems = append(resolveProblems, fmt.Sprintf("app %q: server does not support versioned bundle env; upgrade the server before applying environment variables", app.Slug))
 			continue
 		}
 		if bm != nil {
@@ -193,6 +218,17 @@ func fleetPreflight(file string, errOut io.Writer, cmdName string, waitFor time.
 	observedBySlug := make(map[string]fleet.ObservedApp, len(apps))
 	for _, a := range apps {
 		oa := observedFromApp(a)
+		for _, entry := range m.Apps {
+			if entry.Slug == a.Slug {
+				var err error
+				oa, err = observeFleetEnv(cfg, a.Slug, fleet.EffectiveConfig(entry), oa)
+				if err != nil {
+					runCleanups()
+					return nil, &ExitCodeError{Code: 3, Err: err}
+				}
+				break
+			}
+		}
 		if caps.DeploymentRepairState {
 			if a.DeploymentRepairRequired == nil {
 				runCleanups()
@@ -330,6 +366,7 @@ func stringPtr(v string) *string  { return &v }
 // and intentionally absent; every field here has a stored API counterpart.
 func bundleFleetConfig(a deploy.AppSettings) fleet.Config {
 	c := fleet.Config{
+		Env:  a.Env,
 		Name: a.Name, Description: a.Description, Project: a.Project, Icon: a.Icon,
 		HibernateTimeoutMinutes: a.HibernateTimeoutMinutes,
 		HibernateResetToDefault: a.HibernateResetToDefault,

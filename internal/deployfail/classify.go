@@ -1,6 +1,9 @@
 package deployfail
 
-import "strings"
+import (
+	"errors"
+	"strings"
+)
 
 // Classify maps a deploy error to its Kind. It is computed from the error
 // chain produced by internal/deploy: a build failure ("uv sync:" / "renv
@@ -10,6 +13,12 @@ import "strings"
 func Classify(err error) Kind {
 	if err == nil {
 		return ""
+	}
+	var classified interface{ DeployFailureKind() string }
+	if errors.As(err, &classified) {
+		if kind := Kind(classified.DeployFailureKind()); kind.Valid() {
+			return kind
+		}
 	}
 	return ClassifyMessage(err.Error())
 }
@@ -33,6 +42,8 @@ func ClassifyMessage(msg string) Kind {
 	switch {
 	case mentionsHookFailure(msg):
 		return HookFailed
+	case strings.HasPrefix(msg, "activation deferred for capacity"), strings.HasPrefix(msg, "capacity-blocked/"):
+		return Capacity
 	case MentionsMissingExecutable(msg, "Rscript"),
 		MentionsMissingExecutable(msg, "uv"),
 		MentionsMissingExecutable(msg, "python3"),

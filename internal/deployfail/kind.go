@@ -20,6 +20,10 @@ const (
 	Crashed                Kind = "crashed"                 // process exited before healthy
 	ServerError            Kind = "server_error"            // a 5xx the server could not classify
 
+	// Capacity preserves the working deployment after admission is refused.
+	// The response separately identifies transient pressure and retry delay.
+	Capacity Kind = "capacity"
+
 	// DowntimeRequired is the server's refusal to deploy without downtime when
 	// parallel generation handoff does not support the app's current shape
 	// (non-multiplex isolation, a draining generation, a config-bearing
@@ -40,7 +44,7 @@ const (
 func (k Kind) Valid() bool {
 	switch k {
 	case RuntimeMissing, BuildFailed, InterpreterUnavailable, HookFailed, BundleInvalid,
-		ReadinessTimeout, Crashed, ServerError, DowntimeRequired, ZipError, TransportError, Unknown:
+		ReadinessTimeout, Crashed, ServerError, Capacity, DowntimeRequired, ZipError, TransportError, Unknown:
 		return true
 	}
 	return false

@@ -3,6 +3,7 @@ package fleet
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // Action is the reconcile verb for one app.
@@ -21,6 +22,7 @@ const (
 // ObservedApp is the subset of GET /api/apps the diff needs. The CLI maps the
 // API payload into this; the diff stays I/O-free and API-shape-agnostic.
 type ObservedApp struct {
+	Env  map[string]string
 	Slug string
 	// Name and Description are the server's stored display metadata. They are
 	// pointers for the same reason the scalars below are: nil means "not
@@ -94,9 +96,10 @@ type ObservedAutoscale struct {
 // ConfigDriftItem is one fleet-declared key whose server value differs from
 // the desired value. Values are rendered as strings for stable display.
 type ConfigDriftItem struct {
-	Key     string
-	Server  string
-	Desired string
+	Environment string
+	Key         string
+	Server      string
+	Desired     string
 }
 
 // UnmanagedConfigItem is one operational setting that neither the fleet
@@ -176,10 +179,10 @@ func Diff(m *Manifest, localDigests map[string]string, observed []ObservedApp) [
 		if matchingSource {
 			switch {
 			case o.DeploymentRepairRequired == nil && (o.LastDeploymentStatus == "failed" || o.DesiredStatus == "failed"):
-				d.RecoveryWarnings = append(d.RecoveryWarnings, "deployment repair state is unavailable; upgrade the server or manually redeploy the desired bundle with shinyhub deploy '<source-dir>' --slug "+app.Slug+" (include any fleet bundle files)")
+				d.RecoveryWarnings = append(d.RecoveryWarnings, "deployment repair state is unavailable; upgrade the server, then reapply the desired bundle with shinyhub fleet apply -f '<fleet.toml>' using the original environment selection")
 			case o.DeploymentRepairRequired != nil && *o.DeploymentRepairRequired && o.LastDeploymentStatus != "pending":
 				if o.DesiredStatus == "stopped" {
-					d.RecoveryWarnings = append(d.RecoveryWarnings, "deployment repair is required, but the app is deliberately stopped; manually redeploy the desired bundle to repair its data without starting consumers")
+					d.RecoveryWarnings = append(d.RecoveryWarnings, "deployment repair is required, but the app is deliberately stopped; repair using the original fleet manifest and environment while preserving the stopped intent")
 				} else {
 					d.RecoveryReason = RecoveryFailed
 				}
@@ -200,6 +203,12 @@ func Diff(m *Manifest, localDigests map[string]string, observed []ObservedApp) [
 
 		srcChanged := d.LocalDigest == "" || o.ContentDigest == "" || d.LocalDigest != o.ContentDigest || d.RecoveryReason != ""
 		cfgChanged := len(d.ConfigDrift) > 0
+		for _, change := range d.ConfigDrift {
+			if strings.HasPrefix(change.Key, "env.") {
+				srcChanged = true
+				break
+			}
+		}
 
 		switch {
 		case srcChanged && cfgChanged:
@@ -308,6 +317,17 @@ func ConfigDrift(app AppEntry, o ObservedApp) []ConfigDriftItem {
 func configDrift(app AppEntry, o ObservedApp) []ConfigDriftItem {
 	var d []ConfigDriftItem
 	c := EffectiveConfig(app)
+	keys := make([]string, 0, len(c.Env))
+	for key := range c.Env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		current, ok := o.Env[key]
+		if !ok || current != c.Env[key] {
+			d = append(d, ConfigDriftItem{Key: "env." + key, Server: "(redacted)", Desired: "(redacted)"})
+		}
+	}
 	if v := app.Visibility; v != "" && v != o.Access && o.Access != "" {
 		d = append(d, ConfigDriftItem{Key: "visibility", Server: o.Access, Desired: v})
 	}
@@ -336,6 +356,15 @@ func configDrift(app AppEntry, o ObservedApp) []ConfigDriftItem {
 	d = appendIntDrift(d, "worker_warm_spares", c.WorkerWarmSpares, o.WorkerWarmSpares)
 	d = appendIntDrift(d, "worker_max_session_lifetime_secs", c.WorkerMaxSessionLifetimeSecs, o.WorkerMaxSessionLifetimeSecs)
 	d = appendAutoscaleDrift(d, c.Autoscale, o.Autoscale)
+	if app.ResolvedEnvironment != "" {
+		overlay := app.Environments[app.ResolvedEnvironment].Config
+		for i := range d {
+			if overlay.Declares(d[i].Key) {
+				d[i].Environment = app.ResolvedEnvironment
+			}
+		}
+	}
+
 	return d
 }
 

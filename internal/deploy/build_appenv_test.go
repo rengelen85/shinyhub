@@ -151,3 +151,37 @@ func TestRunSandboxedBuildStep_AppEnvLayering(t *testing.T) {
 		t.Errorf("per-app override must win over inherited server var:\n%s", got)
 	}
 }
+
+func TestCandidateBundleEnvReachesBuildAndHooksWithoutChangingFallback(t *testing.T) {
+	bundle := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundle, ManifestFilename), []byte("[app.env]\nMODE='candidate'\n[[hook]]\non='post-deploy'\ncommand=['true']\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manager := managerWithEnv(t, []string{"MODE=serving", "KEEP=stored"}, nil, nil)
+	var buildEnv, hookEnv []string
+	defer SetSyncHooksForTest(func(_ context.Context, _ string, env []string) error { buildEnv = env; return nil }, func(context.Context, string, []string) error { return nil })()
+	defer SetEnsureProjectForTest(func(context.Context, string, []string) error { return nil })()
+	original := hookRunner
+	hookRunner = func(_ context.Context, _ string, _ []string, env []string, _ io.Writer) error {
+		hookEnv = env
+		return fmt.Errorf("candidate hook failed")
+	}
+	defer func() { hookRunner = original }()
+	p := Params{Slug: "demo", BundleDir: bundle, Manager: manager}
+	if err := buildEnvironment(p, "python", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := runManifestPostDeployHooks(p, true); err == nil {
+		t.Fatal("expected failed candidate hook")
+	}
+	for name, env := range map[string][]string{"build": buildEnv, "hook": hookEnv} {
+		joined := strings.Join(env, "\n")
+		if !strings.Contains(joined, "MODE=candidate") || strings.Contains(joined, "MODE=serving") || !strings.Contains(joined, "KEEP=stored") {
+			t.Fatalf("%s env=%v", name, env)
+		}
+	}
+	serving, err := manager.ResolveBundleAppEnv("demo", t.TempDir())
+	if err != nil || !strings.Contains(strings.Join(serving, "\n"), "MODE=serving") {
+		t.Fatalf("candidate changed serving fallback: %v %v", serving, err)
+	}
+}

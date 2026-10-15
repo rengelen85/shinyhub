@@ -202,6 +202,14 @@ func (s *Server) applyManifestAppSettings(r *http.Request, app *db.App, m deploy
 			return err
 		}
 	}
+	if m.InheritLivePolicy {
+		if m.IdentityHeaders == nil {
+			m.IdentityHeaders = app.IdentityHeaders
+		}
+		if m.UsageIdentityMode == nil {
+			m.UsageIdentityMode = app.UsageIdentityMode
+		}
+	}
 	usagePolicyChanged := (app.UsageIdentityMode == nil) != (m.UsageIdentityMode == nil) ||
 		(app.UsageIdentityMode != nil && m.UsageIdentityMode != nil && *app.UsageIdentityMode != *m.UsageIdentityMode)
 	if usagePolicyChanged && s.usagePolicy == nil {

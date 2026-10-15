@@ -1271,3 +1271,21 @@ func TestLoadManifest_ParsesAppProject(t *testing.T) {
 		t.Error("AppSettings with a declared project must not report IsZero")
 	}
 }
+
+func TestSparseManifestRestrictsDeclarations(t *testing.T) {
+	for _, body := range []string{
+		"[app]\nidentity_headers=true\n",
+		"[app]\nusage_identity_mode='disabled'\n",
+		"[access]\nviewer_groups=['team']\n",
+		"[[hook]]\non='post-deploy'\ncommand=['true']\n",
+		"[[schedule]]\nname='refresh'\ncron='0 5 * * *'\ncmd='true'\n",
+	} {
+		if _, err := ParseManifest([]byte("sparse=true\n" + body)); err == nil {
+			t.Fatalf("sparse declaration silently accepted unsupported policy: %s", body)
+		}
+	}
+	parsed, err := ParseManifest([]byte("sparse=true\n[app]\nreplicas=3\n[app.env]\nMODE='production'\n"))
+	if err != nil || !parsed.App.InheritLivePolicy {
+		t.Fatalf("sparse settings not accepted: %+v %v", parsed, err)
+	}
+}

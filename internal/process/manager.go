@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rvben/shinyhub/internal/appenv"
 	"github.com/rvben/shinyhub/internal/safego"
 	"github.com/rvben/shinyhub/internal/storage"
 	"github.com/rvben/shinyhub/internal/tracing"
@@ -536,6 +537,17 @@ func (m *Manager) ResolveAppEnv(slug string) ([]string, error) {
 	return append(append([]string{}, env...), secretEnv...), nil
 }
 
+// ResolveBundleAppEnv resolves the deployment's effective environment for builds
+// and hooks. It never edits global settings; older bundles retain their values.
+func (m *Manager) ResolveBundleAppEnv(slug, dir string) ([]string, error) {
+	env, err := m.ResolveAppEnv(slug)
+	if err != nil {
+		return nil, err
+	}
+	env, _, err = appenv.WithBundle(env, nil, dir)
+	return env, err
+}
+
 // SetPlatformDefaultEnvResolver sets the function that supplies platform-wide
 // default env vars (currently OTEL_* tracing config). The returned values are
 // prepended to the env so user-supplied per-app env wins on duplicate keys.
@@ -970,6 +982,18 @@ func (m *Manager) Start(p StartParams) (*ProcessInfo, error) {
 		}
 	}
 
+	bundleEnv, err := appenv.LoadBundle(p.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve bundle env: %w", err)
+	}
+	// Bundle-owned values are passed before launch-coupled Env (PORT etc.).
+	bundleValues := make([]string, 0, len(bundleEnv))
+	for key, value := range bundleEnv {
+		bundleValues = append(bundleValues, key+"="+value)
+	}
+	slices.Sort(bundleValues)
+	p.SecretEnv = dropReservedKeys(p.SecretEnv, bundleValues)
+	p.Env = append(bundleValues, p.Env...)
 	if m.envResolver != nil {
 		userEnv, userSecretEnv, err := m.envResolver(p.Slug)
 		if err != nil {

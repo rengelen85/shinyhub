@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"github.com/rvben/shinyhub/internal/activation"
 	"net/http"
 	"strings"
 	"sync"
@@ -77,4 +78,8 @@ func (d *deployResponder) result(value any) {
 		return
 	}
 	d.event(deployevent.Event{Type: deployevent.TypeResult, Result: raw})
+}
+
+func (d *deployResponder) capacityFailure(block *activation.CapacityError) {
+	d.event(deployevent.Event{Type: deployevent.TypeError, Phase: "capacity", StatusCode: http.StatusConflict, Message: capacityConflictMessage(block), FailureKind: "capacity", CapacityRetryable: block.Transient, RetryAfterSeconds: max(1, int(block.RetryAfter.Seconds()))})
 }
