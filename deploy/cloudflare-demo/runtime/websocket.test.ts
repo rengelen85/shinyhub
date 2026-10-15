@@ -34,13 +34,15 @@ test("workerd relay preserves frames and completes both close directions", { tim
       assert.equal(event.wasClean, true);
       assert.equal(messages[0], "hello");
       assert.deepEqual([...new Uint8Array(messages[1] as ArrayBuffer)], [0, 127, 255]);
-      let result;
-      for (let attempt = 0; attempt < 20; attempt++) {
-        result = await (await worker.fetch(`/result?id=${id}`)).json();
-        if (result) break;
-        await delay(25);
+      for (const hop of [id, `${id}-inner`]) {
+        let result;
+        for (let attempt = 0; attempt < 20; attempt++) {
+          result = await (await worker.fetch(`/result?id=${hop}`)).json();
+          if (result) break;
+          await delay(25);
+        }
+        assert.deepEqual(result, { clean: true, codes: [1000, 1000] });
       }
-      assert.deepEqual(result, { clean: true, codes: [1000, 1000] });
     }
   } finally { await worker.stop(); }
 });

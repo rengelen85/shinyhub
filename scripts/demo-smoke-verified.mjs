@@ -1,7 +1,20 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+
+const require = createRequire(new URL("../deploy/cloudflare-demo/package.json", import.meta.url));
+const WebSocket = require("ws");
+
+export async function waitForTelemetry(probe, observed, signal, { timeoutMS = 30_000, intervalMS = 1_000 } = {}) {
+  const deadline = Date.now() + timeoutMS;
+  while (!observed()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for correlated server telemetry");
+    await probe();
+    if (!observed()) await delay(intervalMS, undefined, { signal });
+  }
+}
 
 export const websocketPaths = [
   "/app/operations-dashboard/websocket/",
@@ -21,14 +34,24 @@ export function smokeInspector(id) {
       if (record.type === "tail-info" || (record.event?.type && record.event?.message)) { failure = "Tail stream reported incomplete telemetry"; return; }
       const request = record.event?.request;
       const headers = request?.headers ?? {};
+      const logMessages = (record.logs ?? []).flatMap(log => log.message ?? []).flatMap(message => {
+        if (typeof message !== "string") return [message];
+        try { return [JSON.parse(message)]; } catch { return []; }
+      });
       let url;
       try { url = request?.url ? new URL(request.url) : undefined; } catch { return; }
       const correlated = Object.entries(headers).some(([key, value]) =>
         key.toLowerCase() === "x-shinyhub-demo-smoke" && value === id)
-        || url?.searchParams.get("__demo_smoke") === id;
+        || url?.searchParams.get("__demo_smoke") === id
+        || logMessages.some(message => message?.smoke_id === id);
       if (!correlated) return;
       observed = true;
-      if ((record.exceptions?.length ?? 0) > 0 || (record.outcome && record.outcome !== "ok")) {
+      // Cloudflare can mark a streamed HTTP invocation canceled after the
+      // client has consumed its successful response. The smoke suite checks
+      // that response separately; upgrades still require clean server closes.
+      const completedHTTP = record.outcome === "canceled"
+        && record.event?.response?.status >= 200 && record.event.response.status < 400;
+      if ((record.exceptions?.length ?? 0) > 0 || (record.outcome && record.outcome !== "ok" && !completedHTTP)) {
         failure = "Smoke request produced a server-side exception or unsuccessful invocation";
       }
       if (record.event?.response?.status >= 500 && record.event.response.status !== 503) {
@@ -41,9 +64,9 @@ export function smokeInspector(id) {
             try { message = JSON.parse(message); } catch { continue; }
           }
           if (message?.event === "demo_websocket_closed" && message.smoke_id === id
-            && message.client_code === 1000 && message.backend_code === 1000 && url
+            && message.client_code === 1000 && message.backend_code === 1000
             && typeof message.connection_id === "string") {
-            closed.add(url.pathname);
+            closed.add(message.smoke_path ?? url?.pathname);
             connections.add(message.connection_id);
           }
         }
@@ -75,6 +98,7 @@ export async function verifiedSmoke(env = process.env) {
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "user-agent": "ShinyHub-Demo-Verification/1.0" },
       signal: AbortSignal.timeout(15_000),
     });
+    if (method === "DELETE" && response.status === 404) return;
     if (!response.ok) throw new Error(`Cloudflare tail ${method} failed (HTTP ${response.status})`);
     const data = await response.json();
     if (!data.success) throw new Error(`Cloudflare tail ${method} was unsuccessful`);
@@ -86,7 +110,7 @@ export async function verifiedSmoke(env = process.env) {
   const stop = () => controller.abort(new Error("Verification interrupted"));
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
-  let session, socket, child, streamFailure;
+  let session, socket, child, streamFailure, primaryFailure;
   try {
     session = await api(endpoint, "POST", { filters: [] });
     socket = new WebSocket(session.url, "trace-v1");
@@ -97,7 +121,7 @@ export async function verifiedSmoke(env = process.env) {
     let messages = Promise.resolve();
     socket.addEventListener("message", event => {
       messages = messages.then(async () => {
-        const text = typeof event.data === "string" ? event.data : await event.data.text();
+        const text = typeof event.data === "string" ? event.data : event.data.toString();
         inspector.ingest(JSON.parse(text));
       }).catch(() => { streamFailure = new Error("Could not decode Cloudflare tail telemetry"); });
     });
@@ -105,8 +129,12 @@ export async function verifiedSmoke(env = process.env) {
     await until(() => { if (streamFailure) throw streamFailure; return opened; }, 15_000, controller.signal);
     // Prove the listener is receiving events before starting the smoke suite.
     const status = new URL("/__demo/status", env.SHINYHUB_DEMO_URL ?? "https://demo.shinyhub.dev");
-    await fetch(status, { headers: { "x-shinyhub-demo-smoke": id, "user-agent": "ShinyHub-Demo-Verification/1.0" }, signal: AbortSignal.timeout(10_000) }).then(r => r.arrayBuffer());
-    await until(() => { check(); return inspector.observed; }, 20_000, controller.signal);
+    // Tail registration can propagate after the socket opens. Keep probing a
+    // passive endpoint so a missed first request cannot block verification.
+    await waitForTelemetry(() => fetch(status, {
+      headers: { "x-shinyhub-demo-smoke": id, "user-agent": "ShinyHub-Demo-Verification/1.0" },
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
+    }).then(r => r.arrayBuffer()), () => { check(); return inspector.observed; }, controller.signal);
     await new Promise((resolve, reject) => {
       child = spawn(fileURLToPath(new URL("./demo-smoke.sh", import.meta.url)), [], {
         env: { ...env, SHINYHUB_DEMO_SMOKE_ID: id }, stdio: "inherit", signal: controller.signal,
@@ -120,12 +148,21 @@ export async function verifiedSmoke(env = process.env) {
     await messages;
     check();
     console.log("Demo smoke passed: all three WebSockets closed cleanly at both proxy ends; correlated server telemetry contains no errors.");
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
   } finally {
     child?.kill("SIGTERM");
-    socket?.close();
+    socket?.terminate();
     process.removeListener("SIGTERM", stop);
     process.removeListener("SIGINT", stop);
-    if (session) await api(`${endpoint}/${encodeURIComponent(session.id)}`, "DELETE");
+    if (session) {
+      try { await api(`${endpoint}/${encodeURIComponent(session.id)}`, "DELETE"); }
+      catch (error) {
+        if (!primaryFailure) throw error;
+        console.error(error.message);
+      }
+    }
   }
 }
 

@@ -14,7 +14,9 @@ export default {
     });
     backend[1].addEventListener("close", event => backend[1].close(event.code, event.reason));
     const client = new WebSocketPair();
-    bridgeContainerWebSocket(client[1], backend[0], () => {}, result => results.set(id, result));
+    const middle = new WebSocketPair();
+    bridgeContainerWebSocket(middle[1], backend[0], () => {}, result => results.set(`${id}-inner`, result));
+    bridgeContainerWebSocket(client[1], middle[0], () => {}, result => results.set(id, result));
     return new Response(null, { status: 101, webSocket: client[0] });
   },
 };

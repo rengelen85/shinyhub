@@ -42,14 +42,23 @@ socket closes, the normal ten-minute idle window applies. A missing close
 acknowledgement has a five-second deadline and emits `demo_websocket_failed`.
 HTTP continues to use the container SDK. This is a focused workaround for the
 SDK relay; retain the runtime tests when changing the SDK or compatibility date.
+The outer Worker also coordinates its browser-to-Durable-Object hop so a
+pass-through cannot acknowledge the browser close before the inner relay ends.
 
 The WebSocket smoke checks require both a successful upgrade and a clean close.
 For deployments, `scripts/demo-smoke-verified.mjs` opens a temporary Cloudflare
-tail before the suite, proves it receives a marked passive status request, and
-requires normal close evidence from both proxy ends for all three apps. A
+tail before the suite, repeats marked passive status requests until registration
+has propagated, and requires normal close evidence from both proxy ends for all
+three apps. A
 correlated exception, error log, failed invocation, missing evidence, or lost tail
-fails verification even if the client reported success. The deployment token
-needs Worker tail access (the existing Workers Scripts permission). The session
+fails verification even if the client reported success.
+Successful streamed HTTP responses may have a `canceled` invocation outcome;
+these require the client HTTP checks to pass and never substitute for WebSocket
+close evidence. Structured synthetic markers preserve correlation when query
+values are redacted in tail events. Install the demo Worker's npm dependencies
+before running the verifier (it uses `ws` for bounded connection cleanup).
+The deployment token needs Worker tail access (the existing Workers Scripts
+permission). The session
 is deleted in `finally`; raw tail records, cookies and unrelated visitor details
 are never printed or saved. A synthetic UUID correlates requests without using
 visitor identifiers. The ordinary smoke script remains usable without Cloudflare
