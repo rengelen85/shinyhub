@@ -103,7 +103,7 @@ func TestSparseEnvFirstHandoffPreservesLivePolicy(t *testing.T) {
 	if rec := deployBareGeneration(t, srv, token, app.Slug, "print('old')", false); rec.Code != 200 {
 		t.Fatal(rec.Body.String())
 	}
-	if _, err := store.DB().Exec("UPDATE apps SET identity_headers=1,usage_identity_mode='disabled' WHERE id=?", app.ID); err != nil {
+	if _, err := store.DB().Exec("UPDATE apps SET identity_headers=?,usage_identity_mode='disabled' WHERE id=?", true, app.ID); err != nil {
 		t.Fatal(err)
 	}
 	body, ct := buildMultiFileBundleUpload(t, map[string]string{"app.py": "print('new')", "shinyhub.toml": "sparse=true\n[app]\nreplicas=3\n[app.env]\nMODE='new'\n"})
