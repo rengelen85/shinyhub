@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-15
 
 - Export `ResponsesChat` as a protocol-oriented name for `OpenAIChat`, preserving
   the original name, class identity, arguments and defaults. Document adapter
