@@ -94,6 +94,12 @@ jobs:
       - name: Test the demo Worker
         run: make test-worker
 
+      - name: Test WebSocket forwarding in the Workers runtime
+        working-directory: deploy/cloudflare-demo
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: npm run test:runtime
+
       - name: Verify Cloudflare deployment credentials
         working-directory: deploy/cloudflare-demo
         env:
@@ -113,7 +119,10 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: npm run deploy
 
-      - name: Smoke-test the deployed release
+      - name: Smoke-test the deployed release and server-side transports
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           expected_version=$(node -p "require('./package.json').version")
-          SHINYHUB_DEMO_EXPECTED_VERSION="$expected_version" ./scripts/demo-smoke.sh
+          SHINYHUB_DEMO_EXPECTED_VERSION="$expected_version" node ./scripts/demo-smoke-verified.mjs

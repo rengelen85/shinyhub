@@ -118,3 +118,17 @@ test("real SDK port polling survives slow boots and reports genuinely stuck boot
     if (!Number.isFinite(readyAfterMS)) assert.match(String(errors[0]), /after 90000ms/);
   }
 });
+
+test("an active custom WebSocket defers idle shutdown, then restores normal SDK expiry", async () => {
+  const { demo } = fixture();
+  let renewed = 0, stopped = 0;
+  demo.renewActivityTimeout = () => { renewed++; };
+  demo.stop = async () => { stopped++; };
+  demo.activeWebSockets = 1;
+  await demo.onActivityExpired();
+  assert.equal(renewed, 1);
+  assert.equal(stopped, 0);
+  demo.activeWebSockets = 0;
+  await demo.onActivityExpired();
+  assert.equal(stopped, 1);
+});

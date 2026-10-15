@@ -78,7 +78,7 @@ func TestDemoWorkerSpendsColdStartsOnVisitorsOnly(t *testing.T) {
 	worker := string(source)
 
 	for _, required := range []string{
-		`await container.getState()`,
+		`await readContainerState(`,
 		`classifyColdRequest({`,
 		// The cold gate holds only while the container is down. A running
 		// one that is not yet confirmed healthy is forwarded, because the
@@ -167,7 +167,7 @@ func TestDemoWorkerSpendsColdStartsOnVisitorsOnly(t *testing.T) {
 	// every request, so the Worker consults its own recent observation first.
 	handle := indexOf(t, worker, "src/demo-worker.ts", "options.container(env)")
 	memo := indexOf(t, worker, "src/demo-worker.ts", "mayAssumeAwake(lastHealthyAt, now)")
-	stateRead := indexOf(t, worker, "src/demo-worker.ts", "await container.getState()")
+	stateRead := indexOf(t, worker, "src/demo-worker.ts", "await readContainerState(")
 	if memo < handle {
 		t.Error("the awake memo is consulted before the container handle exists, so it cannot be gating the state read")
 	}

@@ -6,6 +6,16 @@ app_url=${SHINYHUB_DEMO_APP_URL:-https://apps.demo.shinyhub.dev}
 max_attempts=${SHINYHUB_DEMO_SMOKE_ATTEMPTS:-60}
 retry_delay=${SHINYHUB_DEMO_SMOKE_RETRY_DELAY:-5}
 
+# Synthetic marker only: it links this run's HTTP requests to server telemetry.
+# Use a wrapper so new probes cannot accidentally omit the marker.
+curl() {
+  if [ -n "${SHINYHUB_DEMO_SMOKE_ID:-}" ]; then
+    command curl --header "X-ShinyHub-Demo-Smoke: $SHINYHUB_DEMO_SMOKE_ID" "$@"
+  else
+    command curl "$@"
+  fi
+}
+
 # A container that drops back out of "healthy" once the initial wake has
 # already succeeded - a rollout swap onto a freshly deployed image, a crash, a
 # restart, anything that flips it back to asleep - cannot be polled back to

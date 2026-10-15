@@ -35,11 +35,25 @@ start after the container sleeps, then check `/healthz` and all seven public
 apps. `/__demo/status` reads lifecycle state without waking the container or
 extending its idle deadline; use it when waiting for a natural sleep cycle.
 
-The WebSocket smoke checks require both a successful upgrade and a clean close
-handshake. An error after opening, an abnormal close, or a missing close reply
-fails the check. Correlate close-time transport exceptions with the client
-result when investigating alerts; a successful client handshake alone does not
-establish that Cloudflare's server-side logs are clean.
+The WebSocket relay coordinates both close handshakes with
+`accept({ allowHalfOpen: true })`, forwards text and binary frames in order, and
+renews activity for messages. Active sockets defer idle shutdown; after the last
+socket closes, the normal ten-minute idle window applies. A missing close
+acknowledgement has a five-second deadline and emits `demo_websocket_failed`.
+HTTP continues to use the container SDK. This is a focused workaround for the
+SDK relay; retain the runtime tests when changing the SDK or compatibility date.
+
+The WebSocket smoke checks require both a successful upgrade and a clean close.
+For deployments, `scripts/demo-smoke-verified.mjs` opens a temporary Cloudflare
+tail before the suite, proves it receives a marked passive status request, and
+requires normal close evidence from both proxy ends for all three apps. A
+correlated exception, error log, failed invocation, missing evidence, or lost tail
+fails verification even if the client reported success. The deployment token
+needs Worker tail access (the existing Workers Scripts permission). The session
+is deleted in `finally`; raw tail records, cookies and unrelated visitor details
+are never printed or saved. A synthetic UUID correlates requests without using
+visitor identifiers. The ordinary smoke script remains usable without Cloudflare
+credentials for client-only checks.
 
 Memory and disk bill for the whole time the container is awake, so the Worker
 decides at the edge what is allowed to reach it (`src/edge-policy.ts`). It
@@ -194,15 +208,60 @@ events from stdout/stderr and the Worker:
   returned HTTP 5xx. It records only the operation and status, without request
   paths, query strings, cookies, or response bodies.
 
-The Worker errors alert uses `worker-errors-alert.sql`. Deploy the explicit
-upstream failure logging before applying that query. It excludes automatic
-`cf-worker-event` HTTP 503 summaries: sleeping and readiness polling deliberately
-return 503, which Cloudflare labels as errors even when execution succeeds.
-Real upstream 503s remain covered by `demo_upstream_failed`; exceptions, startup
-and allocation failures, error/fatal logs, and other HTTP 5xx summaries remain
-covered. Keep the threshold at one record and the evaluation/execution windows
-at ten minutes. Do not exclude all error-level 503 records, since exception logs
-can carry that status too.
+Request recovery is bounded: bodyless GET/HEAD proxy requests can retry once
+on HTTP 500/502/503/504 or a recognized transient container exception, with a
+250 ms delay and a five-second recovery deadline. A fresh Durable Object handle
+is used on retry; caller cancellation is preserved. Successful streams outlive
+the recovery deadline. Writes, session POSTs and WebSocket upgrades are never
+replayed. An exhausted transport failure returns an uncached 503 with
+`Retry-After: 2`; actual upstream failures still emit `demo_upstream_failed`.
+`demo_request_recovered` records successful recovery without request data.
+State lookups have a five-second total deadline and one retry for an evicted or
+disconnected object, without waking the container; exhaustion logs
+`demo_state_failed` and returns a retryable response.
+
+Install two custom alerts, **in this order**, after deploying the Worker:
+
+1. **ShinyHub demo — Container lifecycle errors**, using
+   `worker-lifecycle-alert.sql`. Alarm failures remain visible here.
+2. Update **ShinyHub demo — Worker errors** with `worker-errors-alert.sql`.
+   This covers request/RPC errors and unknown invocation types, excluding alarms
+   already covered by the lifecycle alert. Never apply this split without the
+   lifecycle alert enabled.
+
+For both, keep threshold `>= 1`, evaluation/execution windows `10m`, automatic
+time range, repeat interval `1h`, and the existing email destination. The value
+counts error **records**, not failed requests or affected users. Cloudflare's
+adaptive alert dataset rejects DISTINCT aggregates; do not add a distinct count
+without validating support in the live query preview. Use `traceId`/`requestId`
+in the log drilldown or the local diagnostic summary to group related records.
+Clearing means a subsequent query window was clear, not that recovery took ten
+minutes.
+
+Both queries exclude automatic `cf-worker-event` HTTP 503 summaries: sleeping
+and readiness polling deliberately return 503. Real upstream 503s remain
+covered by `demo_upstream_failed`; exception records with status 503 stay visible.
+Unknown invocation types/identifiers retain coverage. Do not raise the threshold
+or suppress all deployment/WebSocket errors to make the mail quiet.
+
+For a deduplicated diagnostic summary, export the matching Worker log records as
+JSON/JSONL and run `node scripts/demo-error-summary.mjs < logs.json` from the repo
+root. The output reports records and correlated failure groups separately,
+without printing URLs, cookies, exception messages, or correlation IDs. Records
+without identifiers are counted individually; failure groups are not users.
+
+To run deployment verification manually (with the deployment credentials in the
+environment):
+
+```bash
+node scripts/demo-smoke-verified.mjs  # from the repository root
+```
+
+No production change is needed for the local runtime regression test:
+
+```bash
+npm run test:runtime  # from deploy/cloudflare-demo
+```
 
 Search Cloudflare Logs for these event names to inspect successful boot
 durations and failed attempts. Events are emitted at startup transitions, not

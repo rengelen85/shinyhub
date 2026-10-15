@@ -22,19 +22,41 @@ class WorkerErrorsAlertTest(unittest.TestCase):
         ]
         with sqlite3.connect(":memory:") as db:
             db.execute("ATTACH DATABASE ':memory:' AS logs")
-            db.execute("CREATE TABLE logs.workersLogs(accountTag, scriptName, level, error, httpStatus, logType)")
+            db.execute("CREATE TABLE logs.workersLogs(accountTag, scriptName, level, error, httpStatus, logType, invocationType, traceId, requestId, id)")
             for label, level, error, status, kind, expected in cases:
                 with self.subTest(label=label):
                     db.execute("DELETE FROM logs.workersLogs")
-                    db.execute("INSERT INTO logs.workersLogs VALUES (?, ?, ?, ?, ?, ?)",
+                    db.execute("INSERT INTO logs.workersLogs(accountTag, scriptName, level, error, httpStatus, logType, id) VALUES (?, ?, ?, ?, ?, ?, 'record')",
                                ("d39e08a123830e48534a95a0116442dd", "shinyhub-demo", level, error, status, kind))
                     self.assertEqual(db.execute(sql).fetchone()[0], expected)
             for account, script in [("other-account", "shinyhub-demo"),
                                     ("d39e08a123830e48534a95a0116442dd", "other-worker")]:
                 db.execute("DELETE FROM logs.workersLogs")
-                db.execute("INSERT INTO logs.workersLogs VALUES (?, ?, 'fatal', 'failure', 500, 'cf-worker-log')",
+                db.execute("INSERT INTO logs.workersLogs(accountTag, scriptName, level, error, httpStatus, logType, id) VALUES (?, ?, 'fatal', 'failure', 500, 'cf-worker-log', 'record')",
                            (account, script))
                 self.assertEqual(db.execute(sql).fetchone()[0], 0)
+
+    def test_lifecycle_split_preserves_all_records_and_unknown_invocations(self):
+        root = pathlib.Path(__file__).parent
+        request_sql = (root / "worker-errors-alert.sql").read_text()
+        lifecycle_sql = (root / "worker-lifecycle-alert.sql").read_text()
+        with sqlite3.connect(":memory:") as db:
+            db.execute("ATTACH DATABASE ':memory:' AS logs")
+            db.execute("CREATE TABLE logs.workersLogs(accountTag, scriptName, level, error, httpStatus, logType, invocationType, traceId, requestId, id)")
+            rows = [
+                # One failed trace across Worker and DO invocations, with duplicate logs.
+                ("fetch", "trace-1", "req-1", "a"), ("fetch", "trace-1", "req-1", "b"),
+                ("fetch", "trace-1", "req-2", "c"),
+                # Lifecycle logs are a separate alert; absent trace falls back to request.
+                ("alarm", "", "alarm-1", "d"), ("alarm", None, "alarm-1", "e"),
+                # Missing identifiers/types must remain visible.
+                (None, "", "", "f"), ("jsrpc", None, None, "g"),
+            ]
+            for kind, trace, request, record in rows:
+                db.execute("INSERT INTO logs.workersLogs VALUES (?, ?, 'error', 'failure', NULL, 'cf-worker-log', ?, ?, ?, ?)",
+                           ("d39e08a123830e48534a95a0116442dd", "shinyhub-demo", kind, trace, request, record))
+            self.assertEqual(db.execute(request_sql).fetchone()[0], 5)
+            self.assertEqual(db.execute(lifecycle_sql).fetchone()[0], 2)
 
 
 if __name__ == "__main__":

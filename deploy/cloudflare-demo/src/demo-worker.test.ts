@@ -22,8 +22,9 @@ function fixture(status = "stopped", passiveReadiness = false) {
   const work: Promise<unknown>[] = [];
   let response = () => Response.json({ ok: true });
   let start = async () => {};
+  let stateRead = async () => ({ status });
   const backend = {
-    async getState() { counts.state++; return { status }; },
+    async getState() { counts.state++; return stateRead(); },
     async start() { counts.start++; await start(); },
     async fetch(request: Request) { counts.fetch++; requests.push(request); return response(); },
   };
@@ -32,6 +33,7 @@ function fixture(status = "stopped", passiveReadiness = false) {
   const ctx = { waitUntil(p: Promise<unknown>) { work.push(p); } } as ExecutionContext;
   return { counts, requests, work,
     fetch(request: Request) { return worker.fetch!(request, {}, ctx); },
+    setStateRead(value: () => Promise<{ status: string }>) { stateRead = value; },
     setStatus(value: string) { status = value; },
     setResponse(value: () => Response) { response = value; },
     setStart(value: () => Promise<void>) { start = value; },
@@ -317,4 +319,41 @@ test("non-GET monitoring requests cannot start, proxy or read state", async () =
   assert.equal(response.status, 405);
   assert.equal(response.headers.get("allow"), "GET");
   assert.deepEqual(f.counts, { resolve: 1, state: 0, start: 0, fetch: 0 });
+});
+
+
+test("an evicted state read reacquires the handle without spending a cold start", async () => {
+  const f = fixture();
+  let reads = 0;
+  f.setStateRead(async () => {
+    if (++reads === 1) throw new Error("Durable Object instance is no longer active");
+    return { status: "stopped" };
+  });
+  const response = await f.fetch(new Request(`https://${control}/api/server-info`));
+  assert.equal(response.status, 503);
+  assert.equal(reads, 2);
+  assert.equal(f.counts.start, 0);
+  assert.equal(f.counts.fetch, 0);
+});
+
+test("persistent state disconnections return a bounded logged unavailability response", async (t) => {
+  const errors = t.mock.method(console, "error", () => {});
+  const f = fixture();
+  f.setStateRead(async () => { throw new Error("Network connection lost. private details"); });
+  const response = await f.fetch(new Request(`https://${control}/`));
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("retry-after"), "2");
+  assert.doesNotMatch(await response.text(), /private/);
+  assert.deepEqual(errors.mock.calls[0].arguments, [{ event: "demo_state_failed", operation: "state" }]);
+  assert.equal(f.counts.start, 0);
+});
+
+test("an interrupted viewer-session POST is never replayed and gives the visitor a retry", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const f = fixture("healthy");
+  f.setResponse(() => { throw new Error("Network connection lost."); });
+  const response = await f.fetch(new Request(`https://${control}/__demo/session`, { method: "POST" }));
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get("location")!, /demo_error=1/);
+  assert.equal(f.counts.fetch, 1);
 });

@@ -1,4 +1,5 @@
 import { Container, getContainer } from "@cloudflare/containers";
+import { bridgeContainerWebSocket } from "./container-websocket.ts";
 import demoEntrypoint from "../entrypoint.sh";
 import { createDemoWorker } from "./demo-worker.ts";
 import { DEMO_HOST, APP_HOST } from "./edge-policy.ts";
@@ -12,6 +13,45 @@ export class ShinyHubDemo extends Container {
   sleepAfter = "10m";
   // Reuse the pinned production release image with the validated startup gate.
   entrypoint = ["/bin/sh", "-c", demoEntrypoint];
+
+  private activeWebSockets = 0;
+
+  override async onActivityExpired(): Promise<void> {
+    if (this.activeWebSockets > 0) {
+      this.renewActivityTimeout();
+      return;
+    }
+    return super.onActivityExpired();
+  }
+
+  override async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return super.fetch(request);
+    if (!this.ctx.container!.running || (await this.getState()).status !== "healthy") {
+      await this.startAndWaitForPorts(this.defaultPort, { abort: request.signal });
+    }
+    this.renewActivityTimeout();
+    const upstream = await this.ctx.container!.getTcpPort(this.defaultPort).fetch(
+      request.url.replace(/^https:/, "http:"), request,
+    );
+    if (upstream.webSocket === null) return upstream;
+    const pair = new WebSocketPair();
+    const connectionID = crypto.randomUUID();
+    const marker = new URL(request.url).searchParams.get("__demo_smoke");
+    const smokeID = marker && /^[0-9a-f-]{36}$/.test(marker) ? marker : undefined;
+    this.activeWebSockets++;
+    bridgeContainerWebSocket(pair[1], upstream.webSocket, () => this.renewActivityTimeout(), (result) => {
+      this.activeWebSockets--;
+      this.renewActivityTimeout();
+      const log = {
+        event: result.clean ? "demo_websocket_closed" : "demo_websocket_failed",
+        connection_id: connectionID, smoke_id: smokeID,
+        client_code: result.codes[0], backend_code: result.codes[1],
+      };
+      if (result.clean) console.info(log);
+      else console.error(log);
+    });
+    return new Response(null, { status: 101, webSocket: pair[0], headers: upstream.headers });
+  }
 
   override async startAndWaitForPorts(
     ...args: Parameters<Container["startAndWaitForPorts"]>

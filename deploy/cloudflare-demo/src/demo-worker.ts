@@ -1,3 +1,4 @@
+import { containerRequest, readContainerState, unavailableResponse, isTransientContainerError } from "./container-request.ts";
 import {
   decorateDemoLogin,
   DEMO_SCRIPT_PATH,
@@ -139,7 +140,17 @@ export function createDemoWorker<Env>(options: DemoWorkerOptions<Env>): Exported
       let asleep = false;
       const passiveProbe = options.passiveReadiness && url.pathname === DEMO_READY_PATH;
       if (!healthy || passiveProbe) {
-        const state = await container.getState();
+        let state: { status: string };
+        let stateAttempt = 0;
+        try {
+          state = await readContainerState(() => (stateAttempt++ === 0 ? container : options.container(env)).getState(), request.signal);
+        } catch (error) {
+          lastHealthyAt = null;
+          if (request.signal.aborted || (!isTransientContainerError(error)
+            && !(error instanceof Error && error.name === "TimeoutError"))) throw error;
+          console.error({ event: "demo_state_failed", operation: "state" });
+          return unavailableResponse();
+        }
         healthy = state.status === "healthy";
         asleep = isAsleep(state.status);
         if (healthy) {
@@ -262,17 +273,18 @@ export function createDemoWorker<Env>(options: DemoWorkerOptions<Env>): Exported
 
         headers.set("content-type", "application/json");
         headers.delete("content-length");
-        const loginResponse = await container.fetch(new Request(
+        const loginResponse = await containerRequest(new Request(
           new URL("/api/auth/session", url).toString(),
           {
             method: "POST",
             headers,
+            signal: request.signal,
             body: JSON.stringify({
               username: DEMO_VIEWER_USERNAME,
               password: DEMO_VIEWER_PASSWORD,
             }),
           },
-        ));
+        ), (attempt) => container.fetch(attempt), () => {});
         reportUpstreamFailure(loginResponse, "viewer_session");
         // The end of the cold path. A visitor who followed a link to an app now
         // has the session that link needed, so this is where the page they asked
@@ -296,7 +308,18 @@ export function createDemoWorker<Env>(options: DemoWorkerOptions<Env>): Exported
         });
       }
 
-      const upstream = await container.fetch(new Request(request, { headers, signal: request.signal }));
+      let upstream: Response;
+      let proxyAttempt = 0;
+      try {
+        upstream = await containerRequest(
+          new Request(request, { headers, signal: request.signal }),
+          (attempt) => (proxyAttempt++ === 0 ? container : options.container(env)).fetch(attempt),
+          () => console.info({ event: "demo_request_recovered", operation: "proxy" }),
+        );
+      } catch (error) {
+        lastHealthyAt = null;
+        throw error;
+      }
       reportUpstreamFailure(upstream, "proxy");
       if (upstream.status >= 500) lastHealthyAt = null;
 

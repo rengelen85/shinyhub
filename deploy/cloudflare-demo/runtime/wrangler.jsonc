@@ -1,0 +1,5 @@
+{
+  "name": "demo-websocket-runtime-test",
+  "main": "websocket-worker.ts",
+  "compatibility_date": "2026-08-15"
+}

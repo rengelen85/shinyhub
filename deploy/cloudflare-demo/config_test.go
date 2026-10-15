@@ -131,7 +131,7 @@ func TestCloudflareDemoColdStartStaysOffTheRootRequestPath(t *testing.T) {
 	}
 	workerSource := string(worker)
 	for _, required := range []string{
-		`container.getState()`,
+		`readContainerState(`,
 		`if (!healthy) {`,
 		`ctx.waitUntil(container.start()`,
 		`demoWakeResponse(destination, entryURL)`,
@@ -215,7 +215,8 @@ func TestCloudflareDemoDeploysAfterSuccessfulReleases(t *testing.T) {
 		`npx wrangler whoami --account "$CLOUDFLARE_ACCOUNT_ID"`,
 		`run: npm run deploy`,
 		`SHINYHUB_DEMO_EXPECTED_VERSION`,
-		`./scripts/demo-smoke.sh`,
+		`node ./scripts/demo-smoke-verified.mjs`,
+		`run: npm run test:runtime`,
 	} {
 		if !strings.Contains(workflowSource, required) {
 			t.Errorf("demo deployment workflow is missing %q", required)

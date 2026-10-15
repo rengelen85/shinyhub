@@ -34,7 +34,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.exit(2);
   }
   for (const endpoint of endpoints) {
-    await checkWebSocket(endpoint);
+    const url = new URL(endpoint);
+    if (process.env.SHINYHUB_DEMO_SMOKE_ID) url.searchParams.set("__demo_smoke", process.env.SHINYHUB_DEMO_SMOKE_ID);
+    await checkWebSocket(url.toString());
     console.log(`${endpoint} -> websocket open and clean close`);
   }
 }
