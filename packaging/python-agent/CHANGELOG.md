@@ -12,6 +12,8 @@
 - Handle bounded multiline Responses SSE and tolerate malformed optional usage
   metadata without discarding valid answers. Exercise the real HTTP transport
   locally, with explicit live checks for fresh zero-budget users.
+- Add optional `register(..., notice=...)` plain-text panel notices that persist
+  across new chats and never enter model requests or usage token counts.
 
 ## 0.2.0 — 2026-10-01
 

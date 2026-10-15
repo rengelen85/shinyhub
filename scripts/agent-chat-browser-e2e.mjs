@@ -33,7 +33,7 @@ function fixture(native, captureShadow = true) {
   </script>
   ${native ? '<script id="shinyhub-app-nav" src="/nav.js" data-nav-url="/nav.json" data-current-slug="demo" data-current-name="Demo" data-home-url="/"></script>' : ''}
   <script src="/chat.js"></script>
-  <script>handlers.get('shinyhub-agent-chat-capabilities')({version:1,enabled:true,session:'browser-session'});</script>
+  <script>handlers.get('shinyhub-agent-chat-capabilities')({version:1,enabled:true,session:'browser-session',notice:'This assistant uses generative AI and can make mistakes. Check important figures against the charts before you act on them.'});</script>
   </body></html>`;
 }
 
@@ -69,6 +69,20 @@ async function start(tab) {
   await tab.locator('.sh-agent-send').click();
 }
 
+async function assertNoticeDescription(tab, expected) {
+  const session = await tab.context().newCDPSession(tab);
+  try {
+    const { nodes } = await session.send('Accessibility.getFullAXTree');
+    const question = nodes.find((node) => node.role?.value === 'textbox' &&
+      node.name?.value === 'Question for the app assistant');
+    assert.ok(question, 'question field is present in the accessibility tree');
+    assert.equal(question.description?.value, expected,
+      'question field describes the actual notice text');
+  } finally {
+    await session.detach();
+  }
+}
+
 async function sizing(tab, native, action) {
   return tab.evaluate(({ native, action }) => {
     const root = native ? navRoot : document;
@@ -86,7 +100,12 @@ async function sizing(tab, native, action) {
 }
 
 try {
-  browser = await chromium.launch({ channel: process.env.SHINYHUB_E2E_BROWSER_CHANNEL || 'chrome', headless: true });
+  browser = await chromium.launch({
+    ...(process.env.SHINYHUB_E2E_BROWSER_EXECUTABLE
+      ? { executablePath: process.env.SHINYHUB_E2E_BROWSER_EXECUTABLE }
+      : { channel: process.env.SHINYHUB_E2E_BROWSER_CHANNEL || 'chrome' }),
+    headless: true,
+  });
   const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] });
   context.setDefaultTimeout(5000);
   // The public hook must work against the actual closed shadow root, with no
@@ -120,6 +139,36 @@ try {
     assert.equal(await tab.locator('.sh-agent-panel').isVisible(), false);
     await tab.close();
   }
+  // A landscape phone has far less vertical room than the regular matrix.
+  for (const native of [false, true]) {
+    const tab = await context.newPage();
+    await tab.setViewportSize({ width: 844, height: 390 });
+    await tab.goto(`${origin}/${native ? 'native' : 'fallback'}`);
+    await tab.evaluate(() => window.shinyhubAgentChat.open());
+    await assertNoticeDescription(tab, await tab.locator('.sh-agent-notice').textContent());
+    for (const streaming of [false, true]) {
+      if (streaming) {
+        await start(tab);
+        await tab.evaluate(() => chatEvent({ type: 'status', text: 'Reading your question' }));
+      }
+      const bounds = await tab.locator('.sh-agent-panel').evaluate((panel) => {
+        const rect = panel.getBoundingClientRect();
+        const visibleControl = panel.querySelector('.sh-agent-stop:not([hidden])') || panel.querySelector('.sh-agent-send');
+        const button = visibleControl.getBoundingClientRect();
+        const notice = panel.querySelector('.sh-agent-notice').getBoundingClientRect();
+        return { bottom: rect.bottom, buttonBottom: button.bottom,
+          buttonTop: button.top, top: rect.top, noticeHeight: notice.height,
+          logHeight: panel.querySelector(".sh-agent-log-wrap").getBoundingClientRect().height };
+      });
+      console.log(`Short panel ${native ? 'native' : 'fallback'} ${streaming ? 'streaming' : 'idle'}:`, bounds);
+      assert.ok(bounds.buttonBottom <= bounds.bottom + 1 && bounds.buttonTop >= bounds.top,
+        'send/stop must remain fully inside a short panel');
+      assert.ok(bounds.noticeHeight >= 32, 'short panels retain at least one readable notice line');
+      assert.ok(bounds.logHeight >= 32, 'short panels retain space for conversation content');
+      if (screenshots) await tab.screenshot({ path: resolve(screenshots, `notice-short-${native ? 'native' : 'fallback'}-${streaming ? 'streaming' : 'idle'}.png`) });
+    }
+    await tab.close();
+  }
   for (const native of [false, true]) {
     for (const width of [1280, 800, 375]) {
       console.log(`Checking ${native ? 'native toolbar' : 'fallback'} at ${width}px`);
@@ -134,9 +183,41 @@ try {
         assert.equal(await tab.locator('body').evaluate((body) => body.classList.contains('sh-agent-native-chat')), true);
         assert.equal(await tab.locator('.sh-agent-panel').evaluate((panel) => panel.slot), 'shinyhub-chat-content');
       } else await tab.locator('.sh-agent-launcher').click();
+      const notice = tab.locator('.sh-agent-notice');
+      assert.equal(await notice.isVisible(), true, 'notice is visible before the first turn');
+      const initialNotice = await notice.textContent();
+      await assertNoticeDescription(tab, initialNotice);
       await start(tab);
       const small = '| Business line | Cost (USD) | Share |\n| --- | ---: | ---: |\n| North American customer support and business services | $442.91K | 65% |\n';
       await delta(tab, small); await done(tab);
+      assert.equal(await notice.isVisible(), true);
+      assert.ok(await notice.evaluate((n) => {
+        const log = n.parentElement.querySelector('.sh-agent-log-wrap');
+        const composer = n.parentElement.querySelector('.sh-agent-composer');
+        return n.getBoundingClientRect().bottom <= log.getBoundingClientRect().top + 1 &&
+          composer.getBoundingClientRect().height > 44;
+      }), 'notice stays above the log without displacing the composer');
+      if (screenshots) await tab.screenshot({ path: resolve(screenshots, `notice-${native ? 'native' : 'fallback'}-${width}.png`) });
+      await tab.evaluate(() => chatEvent({ type: 'reset' }));
+      assert.equal(await notice.textContent(), initialNotice);
+      await tab.evaluate(() => handlers.get('shinyhub-agent-chat-capabilities')({
+        version: 1, enabled: true, session: 'browser-session', notice: 'Long notice\n'.repeat(83)
+      }));
+      assert.ok(await notice.evaluate((n) => n.scrollHeight > n.clientHeight), 'long notices have their own scroll area');
+      assert.equal(await notice.getAttribute('tabindex'), '0');
+      await notice.focus();
+      await tab.keyboard.press('End');
+      await tab.waitForFunction(() => document.querySelector('.sh-agent-notice').scrollTop > 0);
+      const noticeIssues = await tab.evaluate(axe.source + '\naxe.run(document.querySelector(".sh-agent-panel"), { rules: { "color-contrast": { enabled: false } } }).then(r => r.violations.map(v => v.id))');
+      assert.deepEqual(noticeIssues, [], 'overflowing notice must remain keyboard accessible');
+      assert.ok(await tab.locator('.sh-agent-composer').evaluate((c) => {
+        const rect = c.getBoundingClientRect(), panel = c.parentElement.getBoundingClientRect();
+        return rect.height > 44 && rect.bottom <= panel.bottom + 1;
+      }), 'long notices leave the composer usable');
+      await tab.evaluate((notice) => handlers.get('shinyhub-agent-chat-capabilities')({
+        version: 1, enabled: true, session: 'browser-session', notice
+      }), initialNotice);
+      await start(tab); await delta(tab, small); await done(tab);
       assert.ok(await tab.locator('.sh-agent-table-scroll').evaluate((w) => w.scrollWidth - w.clientWidth <= 1), 'ordinary tables should fit by wrapping descriptions');
       assert.equal(await tab.locator('td').first().evaluate((cell) => getComputedStyle(cell).whiteSpace), 'normal');
       assert.equal(await tab.locator('td').nth(1).evaluate((cell) => getComputedStyle(cell).whiteSpace), 'nowrap');

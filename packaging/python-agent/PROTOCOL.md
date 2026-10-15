@@ -97,6 +97,13 @@ Provider failures may add an error `code` of `budget_exceeded` or
 message as text and end the active request. Gateway configuration and end-user
 identity remain server-side; browser messages cannot supply attribution.
 
+Capabilities may include `notice`, an optional app-owned plain-text string of
+at most 1,000 characters. It is panel configuration, never conversation history
+or model input. The browser renders it outside the message log and fallback
+header, preserving it across resets and in native layouts. Each capabilities
+message replaces the current notice; an absent or blank notice removes it.
+Older clients ignore this additive field.
+
 For a write, the server validates the schema and app constraints, then emits
 `approval_required` with an `approvalId`, tool name, arguments, display
 `message`, optional plain-text `description` and `expiresIn` in seconds.

@@ -76,6 +76,38 @@ body.sh-agent-native-chat .sh-agent-reset { display: none; }
 .sh-agent-panel button,
 .sh-agent-panel textarea { font-family: inherit; }
 
+.sh-agent-notice {
+  flex: 0 1 auto;
+  max-height: 25%;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  padding: 12px 19px;
+  border-bottom: 1px solid #c6d0e0;
+  background: #e8edf6;
+  color: #344463;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.sh-agent-notice:focus-visible { outline-offset: -3px; }
+
+@media (max-height: 480px) {
+  .sh-agent-notice { padding-block: 6px; }
+  .sh-agent-panel.sh-agent-with-notice .sh-agent-header { min-height: 60px; padding-block: 10px; }
+  .sh-agent-panel.sh-agent-with-notice .sh-agent-resize { top: 60px; }
+}
+
+@media (min-width: 681px) and (max-height: 480px) {
+  body:not(.sh-agent-native-chat) .sh-agent-panel.sh-agent-with-notice {
+    bottom: 12px;
+    height: calc(100dvh - 24px);
+  }
+  body.sh-agent-toolbar-host:not(.sh-agent-native-chat) .sh-agent-panel.sh-agent-with-notice {
+    height: calc(100dvh - 72px);
+  }
+}
+
 .sh-agent-header {
   display: flex;
   flex: none;

@@ -1,8 +1,11 @@
 import asyncio
+import json
 
+import httpx
+import pytest
 from shiny import Inputs, reactive, ui
 from shiny._namespaces import Root
-from shinyhub_agent import AgentTool, register
+from shinyhub_agent import AgentTool, OpenAIChat, register
 from shinyhub_agent._shiny import (
     CHAT_CAPABILITIES_MESSAGE,
     CHAT_EVENT_MESSAGE,
@@ -162,3 +165,131 @@ def test_session_end_cancels_model_work_without_holding_reactive_lock(monkeypatc
         )
 
     asyncio.run(run())
+
+
+async def read_view(_):
+    return {}
+
+
+@pytest.mark.parametrize(
+    "notice", [None, "", "  \n", "<b>AI can make mistakes</b>", "x" * 1_000]
+)
+def test_notice_is_only_published_as_panel_configuration(notice):
+    async def run():
+        session = Session()
+        register(
+            session=session,
+            input=Inputs({}),
+            tools=[AgentTool("read_view", "Read view", SCHEMA, read_view)],
+            chat=object(),
+            notice=notice,
+        )
+        await session.flushed[0]()
+        capabilities = next(
+            value
+            for name, value in session.messages
+            if name == CHAT_CAPABILITIES_MESSAGE
+        )
+        if notice and notice.strip():
+            assert capabilities["notice"] == notice
+        else:
+            assert set(capabilities) == {"version", "session", "enabled"}
+        for fn in session.ended:
+            fn()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "notice, error",
+    [(False, TypeError), (42, TypeError), ([], TypeError), ("x" * 1_001, ValueError)],
+)
+def test_notice_validation_precedes_registration(notice, error):
+    session = Session()
+    with pytest.raises(error, match="notice"):
+        register(session=session, input=Inputs({}), tools=[], notice=notice)
+    assert session.flushed == []
+    assert not hasattr(session, "_shinyhub_agent_registration")
+
+
+def test_registered_notice_never_reaches_model_payload_or_usage(monkeypatch):
+    from shiny.reactive._core import _reactive_environment
+
+    monkeypatch.setattr(_reactive_environment, "_lock", None)
+    requests, records = [], []
+    notice = "NOTICE_ONLY: Check important figures against the charts."
+
+    def endpoint(request):
+        requests.append(json.loads(request.content))
+        events = [
+            {"type": "response.output_text.delta", "delta": "Costs increased."},
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [],
+                    "usage": {"input_tokens": 11, "output_tokens": 5},
+                },
+            },
+        ]
+        return httpx.Response(
+            200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events)
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "shinyhub_agent._openai.httpx.AsyncClient",
+        lambda *a, **kw: real_client(*a, transport=httpx.MockTransport(endpoint), **kw),
+    )
+
+    async def run():
+        session = Session()
+        value = reactive.Value(None)
+        register(
+            session=session,
+            input=Inputs({CHAT_INPUT: value}),
+            tools=[AgentTool("read_view", "Read view", SCHEMA, read_view)],
+            notice=notice,
+            chat=OpenAIChat("fake-key", "Use app facts", on_usage=records.append),
+        )
+        await session.flushed[0]()
+        capabilities = next(
+            v for name, v in session.messages if name == CHAT_CAPABILITIES_MESSAGE
+        )
+        assert capabilities["notice"] == notice
+        assert requests == records == []
+        for index, action in enumerate(["message", "message", "reset", "message"]):
+            value.set(
+                {
+                    "version": 1,
+                    "session": capabilities["session"],
+                    "requestId": f"request_{index:08}",
+                    **(
+                        {"action": action}
+                        if action == "reset"
+                        else {"message": "What changed?"}
+                    ),
+                }
+            )
+            await reactive.flush()
+
+            async def finished(request_id=f"request_{index:08}"):
+                while not any(
+                    name == CHAT_EVENT_MESSAGE
+                    and event["requestId"] == request_id
+                    and event["type"] in ("done", "reset", "error")
+                    for name, event in session.messages
+                ):
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(finished(), 2)
+        for fn in session.ended:
+            fn()
+
+    asyncio.run(run())
+    assert len(requests) == len(records) == 3
+    assert notice not in json.dumps(requests)
+    assert "Costs increased." in json.dumps(requests[1])
+    assert "Costs increased." not in json.dumps(requests[2])
+    assert all(
+        record.input_tokens == 11 and record.output_tokens == 5 for record in records
+    )

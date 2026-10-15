@@ -122,6 +122,31 @@ else:
 register(session=session, input=input, tools=tools, chat=chat)
 ```
 
+Pass `notice=` to `register()` to display an app-owned notice below the chat
+header, separate from assistant messages:
+
+```python
+register(
+    session=session, input=input, tools=tools, chat=chat,
+    notice="The assistant uses generative AI and can make mistakes. "
+           "Check important figures against the charts before you act on them.",
+)
+```
+
+The notice stays visible above the conversation in native and fallback panels,
+including after **New chat** and closing/reopening the panel. It is plain text:
+HTML and Markdown appear literally. It is never added to model requests,
+conversation history, or `UsageRecord` token counts. Long notices scroll within
+their own keyboard-accessible area to leave room for the conversation and
+composer. The question field references the notice for screen readers. Short
+screens use a compact layout when a notice is configured.
+
+`notice` accepts a string of at most 1,000 characters or `None` (the default).
+Empty or whitespace-only strings behave like `None`; nonblank strings retain
+their whitespace. Without a notice the existing panel is unchanged. Configure
+it per viewer alongside the app's existing chat access gate. It has no effect
+when `chat` is absent.
+
 Install `shinyhub-agent[bedrock]` for `BedrockChat`. It uses Bedrock's
 `ConverseStream` API and the standard AWS credential chain. Give the app only
 `bedrock:InvokeModelWithResponseStream` for its chosen model or inference
@@ -394,7 +419,7 @@ and budgets increase token use.
 
 Fixed bounds: 32 tools; 8192 UTF-8 bytes per schema or argument object; 32768
 UTF-8 bytes per tool or undo result; 500 characters per tool description;
-300 per confirmation; 140 per receipt. Tool execution, preflight and undo have
+300 per confirmation; 140 per receipt; 1,000 per panel notice. Tool execution, preflight and undo have
 an 8-second timeout including waiting for the reactive lock. Streams allow
 64 KiB per event and 1 MiB per response. Chat questions are capped at 2000
 characters, 10 per minute and 40 per session; reset does not reset those budgets.

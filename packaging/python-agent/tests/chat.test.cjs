@@ -49,7 +49,7 @@ test("bad or denied storage cannot break sizing, and native hosting hides fallba
 
 // Loads the widget into a fresh page, opens a session and asks one question, so
 // each test starts with an answer in flight and drives the events that follow.
-function ask(t, { savedSize = null, blockStorage = false } = {}) {
+function ask(t, { savedSize = null, blockStorage = false, notice, initialQuestion = true } = {}) {
   const dom = new JSDOM("<!doctype html><body></body>", {
     runScripts: "outside-only", url: "https://apps.example.test/"
   });
@@ -84,9 +84,9 @@ function ask(t, { savedSize = null, blockStorage = false } = {}) {
 
   const doc = window.document;
   let session;
-  function reconnect(next) {
+  function reconnect(next, nextNotice = notice) {
     session = next;
-    handlers.get("shinyhub-agent-chat-capabilities")({ version: 1, enabled: true, session });
+    handlers.get("shinyhub-agent-chat-capabilities")({ version: 1, enabled: true, session, notice: nextNotice });
   }
   reconnect("s1");
   doc.querySelector(".sh-agent-launcher").click();
@@ -96,7 +96,7 @@ function ask(t, { savedSize = null, blockStorage = false } = {}) {
     doc.querySelector(".sh-agent-composer").requestSubmit();
     requestId = inputs.filter((entry) => entry.name === ".shinyhub_agent_chat_request" && entry.value.message).at(-1).value.requestId;
   }
-  submit("Show only 2024");
+  if (initialQuestion) submit("Show only 2024");
   const send = (event) => handlers.get("shinyhub-agent-chat-event")(
     Object.assign({ version: 1, session, requestId }, event));
   return { window, doc, send, inputs, submit, flush, frames, clipboard, reconnect };
@@ -570,4 +570,52 @@ test('gateway budget errors show the safe message and allow another request', (t
   send({ type: 'delta', text: 'Available again' });
   send({ type: 'done' });
   assert.equal(answer(doc).textContent, 'Available again');
+});
+
+test("notice is literal, persistent panel content in fallback and native layouts", (t) => {
+  const notice = '<img src=x onerror=alert(1)> **Check important figures**';
+  const { window, doc, send, submit, reconnect } = ask(t, { notice, initialQuestion: false });
+  const element = doc.querySelector('.sh-agent-notice');
+  assert.equal(element.textContent, notice);
+  assert.equal(element.children.length, 1);
+  assert.equal(element.firstElementChild.tagName, "SPAN");
+  assert.equal(element.firstElementChild.children.length, 0);
+  assert.equal(element.firstElementChild.textContent, notice);
+  assert.equal(element.getAttribute('role'), 'note');
+  assert.equal(element.tabIndex, 0);
+  assert.equal(doc.querySelector('.sh-agent-panel').classList.contains('sh-agent-with-notice'), true);
+  assert.equal(element.getAttribute('aria-label'), 'App notice');
+  assert.equal(doc.querySelector('.sh-agent-input').getAttribute('aria-describedby'), element.firstElementChild.id);
+  assert.equal(element.closest('.sh-agent-log, .sh-agent-header'), null);
+  assert.equal(element.nextElementSibling.className, 'sh-agent-log-wrap');
+  submit('What changed?');
+  send({ type: 'delta', text: 'Costs increased.' });
+  send({ type: 'done' });
+  send({ type: 'reset' });
+  assert.equal(doc.querySelector('.sh-agent-notice'), element);
+  assert.equal(element.textContent, notice);
+  window.shinyhubAgentChat.close();
+  window.shinyhubAgentChat.open();
+  assert.equal(doc.querySelector('.sh-agent-notice'), element);
+  window.dispatchEvent(new window.CustomEvent('shinyhub:chat:host', {
+    detail: { version: 1, available: true, native: true }
+  }));
+  assert.equal(element.closest('.sh-agent-panel').hidden, false);
+  reconnect('s1');
+  assert.equal(doc.querySelectorAll('.sh-agent-notice').length, 1);
+  reconnect('s2', 'New session notice');
+  assert.equal(element.textContent, 'New session notice');
+  reconnect('s3', null);
+  assert.equal(doc.querySelector('.sh-agent-notice'), null);
+  assert.equal(doc.querySelector('.sh-agent-input').hasAttribute('aria-describedby'), false);
+  assert.equal(doc.querySelector('.sh-agent-panel').classList.contains('sh-agent-with-notice'), false);
+});
+
+test("absent and blank notices preserve the existing empty state", (t) => {
+  for (const notice of [undefined, null, '', '  \n ']) {
+    const { doc } = ask(t, { notice, initialQuestion: false });
+    assert.equal(doc.querySelector('.sh-agent-notice'), null);
+    assert.equal(doc.querySelector('.sh-agent-empty h3').textContent, 'Start with this view');
+    assert.equal(doc.querySelectorAll('.sh-agent-suggestion').length, 2);
+  }
 });

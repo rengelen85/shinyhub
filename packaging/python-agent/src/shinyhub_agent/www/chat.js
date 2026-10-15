@@ -404,6 +404,7 @@
   headerActions.append(expand, close);
   header.append(brand, headerActions);
   var resizeGrip = make("div", "sh-agent-resize");
+  var notice = null, noticeText = null;
   var logWrap = make("div", "sh-agent-log-wrap");
   var log = make("div", "sh-agent-log");
   log.setAttribute("role", "log");
@@ -462,6 +463,30 @@
   composer.append(input, controls);
   panel.append(header, resizeGrip, logWrap, status, announcer, composer);
   document.body.append(launcher, panel);
+
+  function updateNotice(value) {
+    if (typeof value !== "string" || !value.trim()) {
+      if (notice) notice.remove();
+      notice = null;
+      noticeText = null;
+      panel.classList.remove("sh-agent-with-notice");
+      input.removeAttribute("aria-describedby");
+      return;
+    }
+    if (!notice) {
+      notice = make("div", "sh-agent-notice");
+      notice.tabIndex = 0;
+      notice.setAttribute("role", "note");
+      notice.setAttribute("aria-label", "App notice");
+      noticeText = make("span", "");
+      noticeText.id = "shinyhub-agent-chat-notice";
+      notice.append(noticeText);
+      panel.insertBefore(notice, logWrap);
+    }
+    noticeText.textContent = value;
+    panel.classList.add("sh-agent-with-notice");
+    input.setAttribute("aria-describedby", noticeText.id);
+  }
 
   function emit(payload) {
     window.Shiny.setInputValue(".shinyhub_agent_chat_request", payload, { priority: "event" });
@@ -981,6 +1006,7 @@
         finish("App session reconnected. Start a new question.");
       }
       chatSession = message.session;
+      updateNotice(message.notice);
       launcher.hidden = toolbarAvailable || toolbarSuspended;
       announceChat("capabilities", { enabled: true, panel: panel, title: "Ask this app" });
       updateSend();

@@ -52,6 +52,7 @@ def register(
     input: Any,
     tools: Sequence[AgentTool],
     chat: ChatAgent | None = None,
+    notice: str | None = None,
     approval_timeout: float = 30,
     history_exchanges: int = 6,
     max_answer_chars: int = 8_000,
@@ -61,9 +62,20 @@ def register(
     """Register session tools; browser writes require an explicit opt-in.
 
     Chat writes retain server-side approval regardless of this setting.
+    An optional plain-text notice stays visible in the chat panel and is never
+    sent to the model. Blank notices are treated as absent; the limit is 1,000
+    characters.
     """
     from shiny import reactive
     from shiny.session import session_context
+
+    if notice is not None:
+        if not isinstance(notice, str):
+            raise TypeError("notice must be a string or None")
+        if len(notice) > 1_000:
+            raise ValueError("notice must be at most 1,000 characters")
+        if not notice.strip():
+            notice = None
 
     if getattr(session, REGISTRATION_MARKER, None) is not None:
         raise RuntimeError("Register agent tools only once per session")
@@ -122,9 +134,10 @@ def register(
             dispatcher.capabilities(),
         )
         if chat_session is not None:
-            await session.send_custom_message(
-                CHAT_CAPABILITIES_MESSAGE, chat_session.capabilities()
-            )
+            capabilities = chat_session.capabilities()
+            if notice is not None:
+                capabilities["notice"] = notice
+            await session.send_custom_message(CHAT_CAPABILITIES_MESSAGE, capabilities)
 
     session.on_flushed(publish, once=True)
 
