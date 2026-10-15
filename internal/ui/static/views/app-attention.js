@@ -1,7 +1,7 @@
 // Exception-first model + renderer for the operator Apps index. The rail is
 // deliberately strict: it contains only conditions that require an operator's
 // attention now, never routine stopped/hibernated state or a failed redeploy
-// whose previous release is still serving successfully.
+// whose previous release is still serving successfully without a repair fence.
 import { avatarView, renderAppAvatar } from './app-avatar.js';
 
 function successfulRelease(app) {
@@ -23,6 +23,16 @@ export function appAttention(app, live = null) {
 
   const status = (live && live.status) || app.status || '';
   const capacity = readiness(app, live);
+
+  if (app.deployment_repair_required) {
+    return {
+      severity: status === 'running' ? 'warning' : 'danger',
+      label: 'Deployment repair required',
+      detail: status === 'running'
+        ? 'The app is serving, but cannot recover after a restart. Successfully redeploy its bundle and required data producers; allow downtime when replacing the working version.'
+        : 'Successfully redeploy the desired bundle and its required data producers to clear the deployment fence.',
+    };
+  }
 
   if (!successfulRelease(app) && app.last_deployment_status === 'failed') {
     return {

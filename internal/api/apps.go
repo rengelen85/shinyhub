@@ -618,7 +618,8 @@ func (s *Server) handleGetApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load app compatibility state")
 		return
 	}
-	deploymentRepairRequired, repairErr := s.store.AppDeploymentCompatibilityQuarantined(app.ID)
+	deploymentRepairBlocker, repairErr := s.store.AppDeploymentRepairBlocker(app.ID)
+	deploymentRepairRequired := deploymentRepairBlocker != nil
 	if repairErr != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load deployment repair state")
 		return
@@ -648,6 +649,7 @@ func (s *Server) handleGetApp(w http.ResponseWriter, r *http.Request) {
 		"latest_schedule_activations":         latestActivations,
 		"schedule_convergence_satisfied":      scheduleConvergenceSatisfied,
 		"compatibility_quarantined":           compatibilityQuarantined,
+		"deployment_repair":                   deploymentRepairBlocker,
 		"producer_repair_required":            producerRepairRequired,
 		"producer_repair_schedules":           producer.RepairProducers,
 		"running_data_producers":              producer.RunningProducers,
@@ -2683,7 +2685,7 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 	if existing, lerr := s.store.GetServingDeployment(app.ID); lerr == nil {
 		prevActive = existing
 	}
-	preexistingCompatibilityQuarantine, err := s.store.AppCompatibilityQuarantined(app.ID)
+	preexistingDeploymentQuarantine, err := s.store.AppDeploymentCompatibilityQuarantined(app.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "check compatibility quarantine: "+err.Error())
 		return
@@ -2702,12 +2704,15 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// A corrective attempt inherits any durable compatibility quarantine from a
-	// previous failed producer barrier. Carry that fence onto the new pending row
+	// Only an existing deployment fence is inherited. Running writers and
+	// failed schedule writes have independent fences; copying either would turn
+	// a refused, untouched attempt into a deployment that requires repair.
+	// A corrective attempt carries a previous failed deployment barrier onto
+	// the new pending row
 	// before any path can stop or restore consumers; otherwise a failure before
 	// this attempt runs its own producer could resurrect the old incompatible
 	// bundle merely because the local producerBarrierEntered flag started false.
-	producerBarrierEntered := preexistingCompatibilityQuarantine
+	producerBarrierEntered := preexistingDeploymentQuarantine
 	if producerBarrierEntered {
 		if err := s.store.MarkDeploymentProducerBarrierEntered(pendingDep.ID); err != nil {
 			_ = s.store.FailDeploymentWithReason(pendingDep.ID, "compatibility quarantine could not be inherited")
@@ -3917,7 +3922,7 @@ func (s *Server) handleRollbackApp(w http.ResponseWriter, r *http.Request) {
 	if existing, lerr := s.store.GetServingDeployment(app.ID); lerr == nil {
 		prevActive = existing
 	}
-	preexistingCompatibilityQuarantine, err := s.store.AppCompatibilityQuarantined(app.ID)
+	preexistingDeploymentQuarantine, err := s.store.AppDeploymentCompatibilityQuarantined(app.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "check compatibility quarantine: "+err.Error())
 		return
@@ -3928,7 +3933,7 @@ func (s *Server) handleRollbackApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
-	producerBarrierEntered := preexistingCompatibilityQuarantine
+	producerBarrierEntered := preexistingDeploymentQuarantine
 	if producerBarrierEntered {
 		if err := s.store.MarkDeploymentProducerBarrierEntered(pendingDep.ID); err != nil {
 			_ = s.store.FailDeploymentWithReason(pendingDep.ID, "compatibility quarantine could not be inherited")

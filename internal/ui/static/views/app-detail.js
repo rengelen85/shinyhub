@@ -21,6 +21,7 @@ import { releaseStripModel, renderReleaseStrip } from '/static/views/release-str
 import { statusPillClass } from '/static/views/stat-format.js';
 import { seedDetailCapacity } from '/static/views/detail-capacity.js';
 import { formatStatus } from '/static/views/status-label.js';
+import { appAttention } from '/static/views/app-attention.js';
 import { appStatusView } from '/static/views/app-card-badge.js';
 import { awaitingFirstDeploy, firstDeployFailed } from '/static/views/app-deploy-state.js';
 import { crashBanner } from '/static/views/crash-banner.js';
@@ -1142,6 +1143,12 @@ function renderOverviewHealth(panel, app, envelope, metrics, metricsStale, envel
     title = 'Health data may be out of date';
     detail = 'The latest health check did not complete. The page will check again; use the logs before acting on these values.';
     action = ['View logs', `/apps/${app.slug}/logs`];
+  } else if (app.deployment_repair_required && !app.deploying) {
+    const repair = appAttention(app);
+    title = repair.label;
+    detail = repair.detail;
+    level = repair.severity === 'danger' ? 'danger' : 'watch';
+    action = ['Review deployments', `/apps/${app.slug}/deployments`];
   } else if (status === 'crashed' || status === 'failed') {
     title = 'App is unavailable';
     detail = 'Review the startup error and logs before restarting.';

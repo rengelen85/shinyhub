@@ -514,3 +514,15 @@ test('firstDeployFailed is the crashed-on-first-deploy case only', () => {
   assert.equal(firstDeployFailed({ deploy_count: 0, last_deployment_status: 'pending' }), false);
   assert.equal(firstDeployFailed({ deploy_count: 0, last_deployment_status: 'succeeded' }), false);
 });
+
+test('serving deployment fence is visible on operational health', async () => {
+  const app = { ...CRASHED_APP, status: 'running', deploy_count: 1,
+    last_deployment_status: 'failed', deployment_repair_required: true };
+  const h = await mountDetail({ app, tab: 'overview' });
+  try {
+    assert.equal(h.doc.querySelector('#overview-health-title').textContent, 'Deployment repair required');
+    assert.match(h.doc.querySelector('#overview-health-detail').textContent, /cannot recover after a restart/);
+    assert.equal(h.doc.querySelector('#overview-health-action').textContent, 'Review deployments');
+    assert.equal(h.doc.querySelector('#overview-health-action').getAttribute('href'), `/apps/${app.slug}/deployments`);
+  } finally { h.restore(); }
+});

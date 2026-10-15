@@ -21,6 +21,7 @@ type prestartSchedulePlan struct {
 	candidates               map[string]*db.Schedule
 	previousDeclarations     []*db.Schedule
 	deploymentRepairRequired bool
+	repairBlocker            *db.DeploymentSummary
 	deploymentRepairComplete bool
 }
 
@@ -39,7 +40,8 @@ func (s *Server) planPrestartSchedules(app *db.App, manifest *deploy.Manifest, d
 	if len(bundleDirs) > 0 {
 		plan.bundleDir = bundleDirs[0]
 	}
-	plan.deploymentRepairRequired, err = s.store.AppDeploymentCompatibilityQuarantined(app.ID)
+	plan.repairBlocker, err = s.store.AppDeploymentRepairBlocker(app.ID)
+	plan.deploymentRepairRequired = plan.repairBlocker != nil
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +110,8 @@ func (s *Server) planRollbackPrestartSchedules(app *db.App, deploymentID int64, 
 		return nil, err
 	}
 	plan.bundleDir = deployment.BundleDir
-	plan.deploymentRepairRequired, err = s.store.AppDeploymentCompatibilityQuarantined(app.ID)
+	plan.repairBlocker, err = s.store.AppDeploymentRepairBlocker(app.ID)
+	plan.deploymentRepairRequired = plan.repairBlocker != nil
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +217,11 @@ func (s *Server) convergePrestartAndFenceConsumer(
 		if len(plan.producers) == 0 {
 			if plan.deploymentRepairRequired && !plan.deploymentRepairComplete {
 				releaseConsumer()
-				return nil, errors.New(deploymentRepairNoProducerMessage)
+				message := deploymentRepairNoProducerMessage
+				if plan.repairBlocker != nil {
+					message += "; " + deploymentRepairGuidance(plan.repairBlocker)
+				}
+				return nil, errors.New(message)
 			}
 			quarantined, err := s.store.AppDataCompatibilityQuarantined(app.ID)
 			if err != nil {
@@ -366,7 +373,11 @@ func (plan *prestartSchedulePlan) downtimeReason(manifest *deploy.Manifest, slug
 		}
 	}
 	if plan.deploymentRepairRequired {
-		reason += "; an unresolved deployment producer barrier also requires repair"
+		if plan.repairBlocker != nil {
+			reason += "; " + deploymentRepairGuidance(plan.repairBlocker)
+		} else {
+			reason += "; an unresolved deployment producer barrier also requires repair"
+		}
 	}
 	return reason
 }

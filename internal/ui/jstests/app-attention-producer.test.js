@@ -29,3 +29,22 @@ test('failed apps render a recovery entry in the attention list', () => {
   assert.equal(section.querySelector('.app-attention-problem strong').textContent, 'Unavailable');
   assert.equal(section.querySelector('.app-attention-action').getAttribute('href'), '/apps/dashboard');
 });
+
+test('serving app with deployment fence needs attention before a restart', () => {
+  const app = { slug: 'fenced', name: 'Fenced', status: 'running', deploy_count: 2,
+    last_deployment_status: 'failed', deployment_repair_required: true };
+  const attention = appAttention(app);
+  assert.equal(attention.severity, 'warning');
+  assert.equal(attention.label, 'Deployment repair required');
+  assert.match(attention.detail, /cannot recover after a restart/);
+  const doc = new JSDOM('<!doctype html><body></body>').window.document;
+  const section = renderAppAttention(doc, [app]);
+  assert.equal(section.querySelector('.app-attention-problem strong').textContent, 'Deployment repair required');
+  assert.equal(section.querySelector('.app-attention-action').getAttribute('href'), '/apps/fenced');
+  assert.equal(appAttention({ ...app, deployment_repair_required: false }), null);
+});
+
+test('routine running producer does not look like a durable deployment repair', () => {
+  assert.equal(appAttention({ status: 'running', deploy_count: 1,
+    compatibility_quarantined: true, deployment_repair_required: false }), null);
+});

@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/rvben/shinyhub/internal/db"
 )
 
 var errScheduleActivationInFlight = errors.New("scheduled data activation owns serving runtime state")
@@ -50,6 +53,13 @@ func (s *Server) guardCompatibilityQuarantine(appID int64, operation string) err
 		return fmt.Errorf("%s: check compatibility quarantine: %w", operation, err)
 	}
 	if quarantined {
+		blocker, err := s.store.AppDeploymentRepairBlocker(appID)
+		if err != nil {
+			return fmt.Errorf("%s: inspect deployment repair state: %w", operation, err)
+		}
+		if blocker != nil {
+			return fmt.Errorf("%s: %w; %s", operation, errCompatibilityQuarantined, deploymentRepairGuidance(blocker))
+		}
 		producers, err := s.store.ProducerCompatibilityForApps([]int64{appID})
 		if err != nil {
 			return fmt.Errorf("%s: inspect producer repair state: %w", operation, err)
@@ -65,7 +75,7 @@ func (s *Server) guardCompatibilityQuarantine(appID int64, operation string) err
 		if len(commands) > 0 {
 			return fmt.Errorf("%s: %w; repair producers with %s before starting consumers", operation, errCompatibilityQuarantined, strings.Join(commands, "; "))
 		}
-		return fmt.Errorf("%s: %w; rerun every failed data producer successfully, or deploy a replacement producer policy that repairs the data, before starting consumers", operation, errCompatibilityQuarantined)
+		return fmt.Errorf("%s: %w; wait for running data producers to finish before starting consumers", operation, errCompatibilityQuarantined)
 	}
 	return nil
 }
@@ -92,4 +102,15 @@ func (s *Server) acquireRawConsumerBootGate(appID int64) (func(), error) {
 		return func() {}, nil
 	}
 	return s.jobs.AcquireConsumerBootGate(appID)
+}
+
+func deploymentRepairGuidance(dep *db.DeploymentSummary) string {
+	detail := fmt.Sprintf("unresolved deployment producer barrier from deployment %d (%s, %s) at %s", dep.ID, dep.Version, dep.Status, dep.CreatedAt.UTC().Format(time.RFC3339))
+	if dep.FailureReason != "" {
+		detail += ": " + dep.FailureReason
+	}
+	if dep.Status == db.DeploymentPending {
+		return detail + "; wait for the deployment to finish, or investigate an interrupted deployment before retrying"
+	}
+	return detail + "; successful producer runs alone do not clear this fence. Redeploy the desired bundle successfully, including its required data producers; use --allow-downtime to permit a stop-first deploy when replacing a working version"
 }

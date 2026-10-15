@@ -126,3 +126,44 @@ func TestProducerCompatibilityBatchNamesIndependentBlockers(t *testing.T) {
 		}
 	}
 }
+
+func TestDeploymentRepairBlockerTracksOriginalUntilSuccess(t *testing.T) {
+	store := mustOpenDB(t)
+	owner := mustCreateUser(t, store, "owner", "developer")
+	app := mustCreateApp(t, store, "cause", owner.ID)
+	promoteConvergenceDeployment(t, store, app.ID, "good", "sha256:good")
+	if blocker, err := store.AppDeploymentRepairBlocker(app.ID); err != nil || blocker != nil {
+		t.Fatalf("healthy blocker=%+v err=%v", blocker, err)
+	}
+	first, err := store.BeginDeployment(app.ID, "original", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDeploymentProducerBarrierEntered(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if blocker, err := store.AppDeploymentRepairBlocker(app.ID); err != nil || blocker == nil || blocker.ID != first.ID || blocker.Status != "pending" {
+		t.Fatalf("pending blocker=%+v err=%v", blocker, err)
+	}
+	if err := store.FailDeploymentWithReason(first.ID, "candidate wrote data"); err != nil {
+		t.Fatal(err)
+	}
+	later, err := store.BeginDeployment(app.ID, "refusal", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDeploymentProducerBarrierEntered(later.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FailDeploymentWithReason(later.ID, "refused before mutation"); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := store.AppDeploymentRepairBlocker(app.ID)
+	if err != nil || blocker == nil || blocker.ID != first.ID || blocker.FailureReason != "candidate wrote data" || blocker.CreatedAt.IsZero() {
+		t.Fatalf("causal blocker=%+v err=%v", blocker, err)
+	}
+	promoteConvergenceDeployment(t, store, app.ID, "repaired", "sha256:good")
+	if blocker, err := store.AppDeploymentRepairBlocker(app.ID); err != nil || blocker != nil {
+		t.Fatalf("repaired blocker=%+v err=%v", blocker, err)
+	}
+}

@@ -508,7 +508,14 @@ func requireAppCompatibilityClearContext(ctx context.Context, cfg *cliConfig, sl
 	var state struct {
 		CompatibilityQuarantined *bool `json:"compatibility_quarantined"`
 		ProducerRepairRequired   *bool `json:"producer_repair_required"`
-		App                      struct {
+		DeploymentRepair         *struct {
+			ID            int64      `json:"id"`
+			Version       string     `json:"version"`
+			Status        string     `json:"status"`
+			CreatedAt     *time.Time `json:"created_at"`
+			FailureReason string     `json:"failure_reason"`
+		} `json:"deployment_repair"`
+		App struct {
 			DeploymentRepairRequired *bool      `json:"deployment_repair_required"`
 			LastDeploymentStatus     string     `json:"last_deployment_status"`
 			CurrentVersion           string     `json:"current_version"`
@@ -522,8 +529,15 @@ func requireAppCompatibilityClearContext(ctx context.Context, cfg *cliConfig, sl
 	if state.CompatibilityQuarantined == nil || state.ProducerRepairRequired == nil {
 		return fmt.Errorf("verify app compatibility: server response omitted authoritative compatibility state")
 	}
+	// Prefer the causal deployment record over the latest attempt or app error.
+	if dep := state.DeploymentRepair; dep != nil {
+		state.App.CurrentVersion = fmt.Sprintf("%d (%s)", dep.ID, dep.Version)
+		state.App.LastDeploymentStatus = dep.Status
+		state.App.LastDeployedAt = dep.CreatedAt
+		state.App.LastError = dep.FailureReason
+	}
 	switch {
-	case *state.ProducerRepairRequired:
+	case *state.ProducerRepairRequired && (state.App.DeploymentRepairRequired == nil || !*state.App.DeploymentRepairRequired):
 		return &appCompatibilityQuarantineError{detail: "app compatibility quarantine requires a successful producer repair before consumers can start"}
 	case *state.CompatibilityQuarantined && state.App.DeploymentRepairRequired != nil && *state.App.DeploymentRepairRequired:
 		if state.App.LastDeploymentStatus == "pending" {
@@ -537,7 +551,7 @@ func requireAppCompatibilityClearContext(ctx context.Context, cfg *cliConfig, sl
 		if state.App.LastError != "" {
 			detail += ": " + state.App.LastError
 		}
-		detail += "; successful producers alone do not clear the deployment barrier. Redeploy the desired bundle with " + command + " (replace <source-dir> and include any fleet bundle files); if stopping the working version is acceptable and required, add --allow-downtime"
+		detail += "; successful producers alone do not clear the deployment barrier. Redeploy the desired bundle with " + command + " (replace <source-dir> and include any fleet bundle files), including its required data producers; if stopping the working version is acceptable and required, add --allow-downtime"
 		return &appCompatibilityQuarantineError{detail: detail, repairCommand: command}
 	case *state.CompatibilityQuarantined:
 		detail := "app compatibility is quarantined; consumers cannot start. Check active data producers and deployment history to identify the unresolved compatibility fence"

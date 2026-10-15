@@ -97,7 +97,9 @@ func writeAppsTable(w io.Writer, items []map[string]any) {
 	t := newTable("SLUG", "STATUS", "DEPLOYS").alignRight(2)
 	for _, a := range items {
 		status := cellString(a["status"])
-		if quarantined, _ := a["compatibility_quarantined"].(bool); quarantined {
+		if repair, _ := a["deployment_repair_required"].(bool); repair {
+			status += " (deployment repair required)"
+		} else if quarantined, _ := a["compatibility_quarantined"].(bool); quarantined {
 			status += " (quarantined)"
 		}
 		t.row(txt(a["slug"]), statusTxt(status), txt(a["deploy_count"]))

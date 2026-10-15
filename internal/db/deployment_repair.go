@@ -1,6 +1,8 @@
 package db
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -89,4 +91,22 @@ func (s *Store) ProducerCompatibilityForApps(appIDs []int64) (map[int64]AppProdu
 		result[appID] = state
 	}
 	return result, rows.Err()
+}
+
+// AppDeploymentRepairBlocker returns the oldest unresolved deployment fence.
+// Later refused attempts may inherit it, so the latest deployment need not be
+// the cause. A successful deployment clears all older fences.
+func (s *Store) AppDeploymentRepairBlocker(appID int64) (*DeploymentSummary, error) {
+	var dep DeploymentSummary
+	err := s.db.QueryRow(`SELECT failed.id, failed.version, failed.status,
+ COALESCE(failed.failure_reason, ''), failed.created_at FROM deployments failed
+ WHERE failed.app_id = ? AND `+deploymentRepairConditionSQL+`
+ ORDER BY failed.id LIMIT 1`, appID).Scan(&dep.ID, &dep.Version, &dep.Status, &dep.FailureReason, &dep.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load deployment repair blocker: %w", err)
+	}
+	return &dep, nil
 }

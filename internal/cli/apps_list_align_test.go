@@ -39,3 +39,14 @@ func TestAppsTableShowsServingQuarantine(t *testing.T) {
 		t.Fatal(out.String())
 	}
 }
+
+func TestAppsTableDistinguishesDeploymentRepairFromRunningProducer(t *testing.T) {
+	var out bytes.Buffer
+	writeAppsTable(&out, []map[string]any{
+		{"slug": "fenced", "status": "running", "deploy_count": 1, "compatibility_quarantined": true, "deployment_repair_required": true},
+		{"slug": "writer", "status": "running", "deploy_count": 1, "compatibility_quarantined": true, "deployment_repair_required": false},
+	})
+	if !strings.Contains(out.String(), "running (deployment repair required)") || !strings.Contains(out.String(), "running (quarantined)") {
+		t.Fatal(out.String())
+	}
+}
