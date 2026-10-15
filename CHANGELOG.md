@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **fleet**: wait within `--warm-timeout` when scheduled data producers temporarily quarantine an app, including unchanged apps. Report the running producers and deadline, preserve genuine repair failures, and defer scheduled activation without consuming failed-rollout attempts.
+
 - **fleet**: record bundle env convergence through content digest ([91f19d9](https://github.com/rvben/shinyhub/commit/91f19d99252789c3448955d4e1f271efff74115a))
 - **ci**: provision dependency validation runtimes ([6e6a2a2](https://github.com/rvben/shinyhub/commit/6e6a2a288494b612890e8f3ba7586d1363052c5b))
 - **demo**: avoid uncaught websocket disconnect errors ([7c42a18](https://github.com/rvben/shinyhub/commit/7c42a185140403882163892ff0997c97240e8441))
