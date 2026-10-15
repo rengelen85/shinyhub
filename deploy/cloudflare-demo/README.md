@@ -204,6 +204,10 @@ The existing Cloudflare observability configuration captures JSON startup
 events from stdout/stderr and the Worker:
 
 - `demo_boot_started`: the entrypoint began.
+- `demo_boot_phase_completed`: initialization, control-plane ownership, viewer
+  bootstrap, or fleet apply completed. `phase` names the completed phase and
+  `elapsed_ms` measures from entrypoint start; subtract consecutive values to
+  locate slow bootstrap steps. It contains no command output or credentials.
 - `demo_fleet_ready`: every application passed the startup gate. `elapsed_ms`
   measures from entrypoint start, including bootstrap and fleet reconciliation;
   `fleet_wait_ms` measures only the final readiness gate. `application_count`

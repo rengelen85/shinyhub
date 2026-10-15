@@ -64,6 +64,7 @@ export SHINYHUB_ADMIN_USER="$bootstrap_admin"
 export SHINYHUB_ADMIN_PASSWORD="${SHINYHUB_BOOTSTRAP_ADMIN_PASSWORD:-$(random_hex 32)}"
 shinyhub init --config "$SHINYHUB_CONFIG" --admin-user "$bootstrap_admin" --quiet
 unset SHINYHUB_ADMIN_USER SHINYHUB_ADMIN_PASSWORD bootstrap_admin
+boot_log demo_boot_phase_completed 0
 
 shinyhub serve &
 server_pid=$!
@@ -87,6 +88,8 @@ until python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1
   sleep 1
 done
 
+boot_log demo_boot_phase_completed 0
+
 viewer_password=${SHINYHUB_DEMO_VIEWER_PASSWORD:-explore-shinyhub-demo}
 boot_phase=viewer
 if ! create_output=$(env -u SHINYHUB_CONFIG \
@@ -106,11 +109,15 @@ fi
 # placeholders. This demo-only bootstrap is idempotent across container wakes.
 python /opt/shinyhub-demo/bootstrap-viewer.py /data/shinyhub.db
 
+boot_log demo_boot_phase_completed 0
+
 boot_phase=fleet_apply
 env -u SHINYHUB_CONFIG \
 SHINYHUB_HOST=http://127.0.0.1:8081 \
 SHINYHUB_TOKEN="$SHINYHUB_DEPLOY_TOKEN" \
   shinyhub fleet apply --prune --yes --file /opt/shinyhub-demo/fleet.toml
+
+boot_log demo_boot_phase_completed 0
 
 # Fleet reconciliation can finish before framework processes accept requests.
 # Keep the externally probed port closed until every public application serves.
