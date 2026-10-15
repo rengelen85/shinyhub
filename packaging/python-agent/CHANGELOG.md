@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Export `ResponsesChat` as a protocol-oriented name for `OpenAIChat`, preserving
+  the original name, class identity, arguments and defaults. Document adapter
+  protocols separately from gateway routing policies.
+- Support OpenAI-compatible Responses gateways with a validated `base_url`,
+  opt-in server-supplied end-user attribution, and a configurable usage provider.
+- Show fixed visitor messages for recognized gateway budget errors and missing
+  required end-user identity, preserving applied-action receipts.
+- Handle bounded multiline Responses SSE and tolerate malformed optional usage
+  metadata without discarding valid answers. Exercise the real HTTP transport
+  locally, with explicit live checks for fresh zero-budget users.
+
 ## 0.2.0 — 2026-10-01
 
 First regular release of the 0.2 series, following 0.2.0b4.

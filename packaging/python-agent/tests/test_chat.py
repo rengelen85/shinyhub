@@ -112,17 +112,19 @@ def test_write_tool_waits_for_current_session_approval():
             yield {"type": "delta", "text": "Showing year."}
 
     async def run():
+        approvals = asyncio.Queue()
+
         async def send(item):
             events.append(item)
+            if item["type"] == "approval_required":
+                approvals.put_nowait(item)
         chat = ChatSession(StubAgent(), tools, send)
         task = asyncio.create_task(chat.handle({
             "version": 1, "session": chat.nonce, "requestId": "request_12345678",
             "message": "Show year",
         }))
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        approval = await asyncio.wait_for(approvals.get(), 1)
         assert applied == []
-        approval = next(item for item in events if item["type"] == "approval_required")
         chat.decide({"version": 1, "session": "wrong", "approvalId": approval["approvalId"], "approved": True})
         assert applied == []
         chat.decide({"version": 1, "session": chat.nonce, "approvalId": approval["approvalId"], "approved": True})
@@ -154,16 +156,18 @@ def test_declined_action_does_not_run_handler():
                 yield {"type": "delta", "text": "Change cancelled."}
 
     async def run():
+        approvals = asyncio.Queue()
+
         async def send(item):
             events.append(item)
+            if item["type"] == "approval_required":
+                approvals.put_nowait(item)
         chat = ChatSession(StubAgent(), tools, send)
         task = asyncio.create_task(chat.handle({
             "version": 1, "session": chat.nonce, "requestId": "request_12345678",
             "message": "Change it",
         }))
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        approval = next(item for item in events if item["type"] == "approval_required")
+        approval = await asyncio.wait_for(approvals.get(), 1)
         chat.decide({"version": 1, "session": chat.nonce,
                      "approvalId": approval["approvalId"], "approved": False})
         await task
@@ -201,8 +205,12 @@ def test_action_receipt_can_undo_once_and_reject_stale_view():
             yield {"type": "delta", "text": "Showing year."}
 
     async def run():
+        approvals = asyncio.Queue()
+
         async def send(item):
             events.append(item)
+            if item["type"] == "approval_required":
+                approvals.put_nowait(item)
         chat = ChatSession(StubAgent(), tools, send)
 
         async def change_with_approval(request_id):
@@ -210,9 +218,7 @@ def test_action_receipt_can_undo_once_and_reject_stale_view():
                 "version": 1, "session": chat.nonce, "requestId": request_id,
                 "message": "Show year",
             }))
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            approval = [item for item in events if item["type"] == "approval_required"][-1]
+            approval = await asyncio.wait_for(approvals.get(), 1)
             chat.decide({"version": 1, "session": chat.nonce,
                          "approvalId": approval["approvalId"], "approved": True})
             await task

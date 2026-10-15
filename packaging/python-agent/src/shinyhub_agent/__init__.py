@@ -8,6 +8,9 @@ from ._openai import OpenAIChat
 from ._shiny import agent_dependency, chat_dependency, register
 from ._usage import UsageRecord
 
+# Protocol-oriented public name; retain the original class identity and API.
+ResponsesChat = OpenAIChat
+
 __version__ = "0.2.0"
 __all__ = [
     "AGUIChat",
@@ -15,6 +18,7 @@ __all__ = [
     "BedrockChat",
     "ChatAgent",
     "OpenAIChat",
+    "ResponsesChat",
     "ToolError",
     "ToolRegistry",
     "UsageRecord",

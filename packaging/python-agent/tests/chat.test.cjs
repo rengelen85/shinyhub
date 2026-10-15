@@ -560,3 +560,14 @@ test('following blocks terminate a table even when they contain matching pipe co
     send({ type: 'reset' }); submit('Next');
   }
 });
+
+test('gateway budget errors show the safe message and allow another request', (t) => {
+  const { doc, send, submit } = ask(t);
+  const message = 'The assistant budget is used up. Contact your administrator.';
+  send({ type: 'error', code: 'budget_exceeded', message });
+  assert.equal(doc.querySelector('.sh-agent-error').textContent, message);
+  submit('Try again');
+  send({ type: 'delta', text: 'Available again' });
+  send({ type: 'done' });
+  assert.equal(answer(doc).textContent, 'Available again');
+});

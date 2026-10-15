@@ -12,6 +12,7 @@ from typing import Any, Protocol
 import httpx
 
 from ._core import ToolError, ToolRegistry
+from ._errors import ProviderError
 from ._runtime import bounded_int
 from ._session import REQUEST_ID, VERSION
 from ._usage import usage_context
@@ -297,6 +298,10 @@ class ChatSession:
                         "message": "Stopped. The incomplete answer was discarded.",
                     }
                 )
+            except ProviderError as error:
+                logger.warning("Agent provider request failed: %s", error.code)
+                remember_applied_actions()
+                await emit({"type": "error", "code": error.code, "message": str(error)})
             except (ToolError, httpx.HTTPError, ValueError, KeyError, TypeError):
                 logger.exception("Agent chat run failed")
                 remember_applied_actions()

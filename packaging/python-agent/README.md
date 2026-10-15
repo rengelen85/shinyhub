@@ -90,7 +90,8 @@ footnotes, underscore emphasis and strikethrough. Inline emphasis uses asterisks
 backslash escapes preserve literal punctuation. Every source line break is
 displayed. This is a limited dialect, not full CommonMark or GFM support.
 
-`OpenAIChat` and `BedrockChat` append a shared description of these formatting
+`ResponsesChat` (also available as `OpenAIChat`) and `BedrockChat` append a
+shared description of these formatting
 capabilities to the app's `instructions` on every model request, including tool
 follow-ups. Explicit app formatting preferences still take precedence. With
 `AGUIChat`, configure the same formatting guidance on the hoster-owned endpoint;
@@ -99,7 +100,7 @@ advisory; safe rendering does not depend on the model following it.
 
 ```python
 import os
-from shinyhub_agent import AGUIChat, BedrockChat, OpenAIChat, chat_dependency
+from shinyhub_agent import AGUIChat, BedrockChat, ResponsesChat, chat_dependency
 
 # Include chat_dependency() alongside agent_dependency() in the app UI.
 if os.environ.get("SHINYHUB_AGENT_AGUI_URL"):
@@ -114,7 +115,7 @@ elif os.environ.get("SHINYHUB_AGENT_BEDROCK_MODEL_ID"):
         instructions="You help with this dashboard. Use registered tools for app facts.",
     )
 else:
-    chat = OpenAIChat(
+    chat = ResponsesChat(
         api_key=os.environ["OPENAI_API_KEY"],
         instructions="You help with this dashboard. Use registered tools for app facts.",
     )
@@ -165,6 +166,117 @@ consequential actions on the chat path when server-side approval is required.
 Upgrading from a release that exposed browser writes automatically requires
 this explicit opt-in to retain that behavior. Chat-only integrations need no
 change.
+
+## Backend protocols and routing
+
+Choose an adapter by the protocol exposed by your endpoint:
+
+| Adapter | Protocol | Where routing happens |
+| --- | --- | --- |
+| `ResponsesChat` | OpenAI Responses API with streaming and function tools | The configured endpoint, such as OpenAI or a compatible gateway |
+| `BedrockChat` | AWS Bedrock ConverseStream | Bedrock, using the configured model or inference profile |
+| `AGUIChat` | AG-UI streaming agent endpoint | The externally hosted agent |
+
+`ResponsesChat` and `OpenAIChat` are names for the **same class**, with identical
+arguments and defaults. Existing `OpenAIChat` integrations continue to work;
+there is no deprecation or migration requirement. `ResponsesChat` is the clearer
+name when the endpoint is a gateway rather than OpenAI itself. It still defaults
+to OpenAI's endpoint and an OpenAI model, so configure both for other services.
+
+The package does not choose between providers, balance requests, or configure
+fallbacks. Put those policies in your gateway or hosted agent. A separate
+adapter per vendor is unnecessary when the endpoint implements a supported
+protocol. Compatibility still requires the streaming events, tool calls and
+usage shapes that the adapter consumes; a gateway's “OpenAI-compatible” label
+alone is not sufficient. Chat Completions-only endpoints are not supported by
+`ResponsesChat`.
+
+Applications can also supply a custom backend implementing the exported
+`ChatAgent` protocol to `register(chat=...)`. That is an extension interface,
+not a built-in router. All built-in adapters validate app tool calls and retain
+server-side write approval.
+
+## Responses-compatible gateways (LiteLLM example)
+
+`ResponsesChat` can use a gateway's Responses API with a server-side virtual key
+and model alias:
+
+```python
+chat = ResponsesChat(
+    api_key=os.environ["LITELLM_API_KEY"],
+    base_url=os.environ["LITELLM_BASE_URL"],  # e.g. https://gateway.example/v1
+    model=os.environ["LITELLM_MODEL"],
+    instructions="Use app tools for facts.",
+    provider="litellm",
+    send_end_user=True,
+    on_usage=record_usage,  # Callback example in Usage attribution below.
+)
+# Inside server(), using identity verified by the app's authentication layer:
+register(session=session, input=input, tools=tools, chat=chat,
+         usage_metadata={"username": viewer.username})
+```
+
+`base_url` defaults to `https://api.openai.com/v1`. Requests append `/responses`
+after removing trailing slashes, preserving any path prefix. HTTPS is required,
+except HTTP on exactly `localhost` or `127.0.0.1` for local development. URLs
+with credentials, queries, or fragments are rejected. Redirects are not followed.
+`provider` defaults to `openai`; the explicit label appears in usage records and
+model-call spans. It identifies the gateway, while `model` holds its alias.
+
+`send_end_user` defaults to `False`. Enabling it sends the server-provided
+`usage_metadata["username"]` in the JSON `user` field on **every** model request,
+including tool follow-ups and the final round. The app must verify that identity;
+the library does not authenticate it. Missing or blank identity fails before
+network access. Browser-supplied identity is ignored. No end-user header or
+other metadata forwarding is added. Shared adapters isolate identity per turn.
+This flag is intended for gateways that use `user` for end-user budgets. If
+enabled with the default OpenAI endpoint, it sends that username to OpenAI too.
+
+Recognized LiteLLM budget errors produce a fixed visitor message: “The assistant
+budget is used up. Contact your administrator.” Upstream error text is never
+displayed. Ordinary rate limits remain generic failures. The gateway enforces
+budgets; usage records only observe calls, with unknown token counts left as
+`None`. Configure end-user budgets separately from app-key budgets.
+
+HTTPX uses environment configuration by default: `SSL_CERT_FILE` or
+`SSL_CERT_DIR` for corporate CAs, `HTTPS_PROXY` for an egress proxy, and `NO_PROXY`
+for gateway hosts that bypass it. See [HTTPX environment variables](https://www.python-httpx.org/environment_variables/).
+No custom HTTP client or header-forwarding option is provided.
+For local HTTP endpoints, set `NO_PROXY=localhost,127.0.0.1` so proxy environment
+settings do not send the virtual key and end-user identity through a proxy over
+plain HTTP.
+
+LiteLLM documents a [Responses API bridge](https://docs.litellm.ai/docs/response_api)
+for other providers. Verify the deployed LiteLLM version and Bedrock model alias
+before rollout: function-call IDs and results, streaming usage, approval and
+denial, `store: false`, `parallel_tool_calls: false`, and the tools-disabled
+final round must survive that bridge. Gateway spend logs must also show the
+expected end user. Zero-budget rejection semantics can vary by gateway version;
+explicitly verify that a zero-budget user is blocked before their first call.
+
+An opt-in live smoke test exercises local read/write tools against your gateway.
+Set `LITELLM_BASE_URL`, `LITELLM_API_KEY`, `LITELLM_MODEL`,
+`LITELLM_TEST_USER` (allowed), and `LITELLM_BLOCKED_TEST_USER` (already exhausted).
+Also set `LITELLM_ZERO_BUDGET_TEST_USER` to a distinct, freshly configured user
+with zero spend and a zero budget. All three users must differ. A gateway that
+allows the zero-budget user's first request fails this rollout check.
+It makes billable requests but does not configure gateway users or budgets.
+From this package's directory, in its test environment, run:
+
+```sh
+SHINYHUB_AGENT_LIVE_GATEWAY=1 PYTHONPATH=src python -m pytest tests/test_gateway_live.py -q
+```
+
+These tests are skipped by default. Passing mocked tests does not establish
+compatibility with a particular live gateway deployment.
+
+The default suite also uses a local HTTP contract server to exercise the real
+HTTPX transport, multiline SSE, split UTF-8, tools, approvals, denial, usage and
+budget isolation. This verifies client behavior without contacting a provider.
+For a rollout, additionally record the deployed LiteLLM version and model alias,
+run the live tests, and inspect gateway spend logs for those test users. The
+live tests check the app-side records; they do not query gateway administration
+APIs or establish spend-log attribution by themselves.
 
 ## Data sent to agents
 
@@ -323,9 +435,12 @@ register(session=session, input=input, tools=tools, chat=chat,
 ```
 
 App slug defaults from `SHINYHUB_APP_SLUG`. `usage_metadata` may set `app` and
-`username` (up to 256 characters each). Metadata stays in local logs, callbacks
-and tracing; it is not added to prompts or HTTP headers. Viewer identity is
-never automatically sent to the model. Resolve "me" in session-scoped tools.
+`username` (up to 256 characters each). By default metadata stays in local logs,
+callbacks and tracing; it is not added to prompts or HTTP headers. With
+`ResponsesChat(send_end_user=True)` (or `OpenAIChat` with the same flag), the
+username also leaves the app in the
+Responses API JSON `user` field, as described above. Other usage metadata is
+not forwarded. Resolve "me" in session-scoped tools.
 Shared adapters keep usage context separate for each viewer and turn.
 
 `shinyhub_agent._usage` also emits single-line JSON at INFO level with structured

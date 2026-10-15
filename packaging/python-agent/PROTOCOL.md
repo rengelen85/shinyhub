@@ -92,6 +92,11 @@ history; it ignores any history supplied by the browser. It streams
 `shinyhub-agent-chat-event` messages with matching `version`, `session`, and
 `requestId` for `status`, `delta`, `action_applied`, `done`, and `error`.
 
+Provider failures may add an error `code` of `budget_exceeded` or
+`end_user_required`, with a fixed visitor-safe `message`. Clients display the
+message as text and end the active request. Gateway configuration and end-user
+identity remain server-side; browser messages cannot supply attribution.
+
 For a write, the server validates the schema and app constraints, then emits
 `approval_required` with an `approvalId`, tool name, arguments, display
 `message`, optional plain-text `description` and `expiresIn` in seconds.
