@@ -67,10 +67,22 @@ export async function checkSessionRelays({ context, page, original, appURL, host
       await poll(ready, 'third successor ready');
       await output(second, 'v1', 1);
       await output(third, 'v1', 0);
-      // First relay's sessions are gone; its native stdout reader must stay
-      // alive until the adopted backend exits. Reactive work must still log.
-      process.kill(originalPID, 0);
-      assert.match(await readFile(join(work, 'server.log'), 'utf8'), /waiting for replicas launched by this process/);
+      // Once its sessions close, the retired controller must exit. The
+      // independent output pump must keep collecting the adopted app's logs.
+      await poll(() => {
+        try { process.kill(originalPID, 0); return false; }
+        catch (error) {
+          if (error.code === 'ESRCH') return true;
+          throw error;
+        }
+      }, 'retired controller exits after its last session closes');
+      const retirementLogged = (await readFile(join(work, 'server.log'), 'utf8')).split('\n').some(line => {
+        try {
+          const entry = JSON.parse(line);
+          return entry.msg === 'retired process exiting' && entry.pid === originalPID;
+        } catch { return false; }
+      });
+      assert.ok(retirementLogged, 'retired controller logs its exit');
       await second.getByRole('button', { name: 'Recalculate' }).click();
       await output(second, 'v1', 2, 1000, secondIdentity);
       await poll(async () => {
