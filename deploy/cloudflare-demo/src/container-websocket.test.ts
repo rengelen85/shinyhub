@@ -21,9 +21,9 @@ function fixture(timeout = 50) {
   const client = new Socket(), backend = new Socket();
   const results: { clean: boolean; codes: number[] }[] = [];
   let activity = 0;
-  bridgeContainerWebSocket(client as unknown as WebSocket, backend as unknown as WebSocket,
+  const completion = bridgeContainerWebSocket(client as unknown as WebSocket, backend as unknown as WebSocket,
     () => activity++, result => results.push(result), timeout);
-  return { client, backend, results, activity: () => activity };
+  return { client, backend, results, completion, activity: () => activity };
 }
 
 test("both directions preserve text/binary ordering and renew activity", async () => {
@@ -95,4 +95,21 @@ test("failed backend acceptance releases the relay and reports an error once", (
     () => {}, result => results.push(result)), /disconnected during accept/);
   assert.deepEqual(results, [{ clean: false, codes: [1006, 1006] }]);
   assert.equal(client.closes.length, 1);
+});
+
+
+test("invocation lifetime remains pending until both close acknowledgements or timeout", async () => {
+  const f = fixture();
+  let settled = false;
+  f.completion.then(() => { settled = true; });
+  f.client.ended();
+  await flush();
+  assert.equal(settled, false);
+  f.backend.ended();
+  await f.completion;
+  assert.equal(settled, true);
+  const missing = fixture(5);
+  missing.client.ended();
+  await missing.completion;
+  assert.equal(missing.results[0].clean, false);
 });

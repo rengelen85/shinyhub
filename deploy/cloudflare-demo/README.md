@@ -42,8 +42,8 @@ socket closes, the normal ten-minute idle window applies. A missing close
 acknowledgement has a five-second deadline and emits `demo_websocket_failed`.
 HTTP continues to use the container SDK. This is a focused workaround for the
 SDK relay; retain the runtime tests when changing the SDK or compatibility date.
-The outer Worker also coordinates its browser-to-Durable-Object hop so a
-pass-through cannot acknowledge the browser close before the inner relay ends.
+The outer Worker passes upgrades through unchanged. A second terminating relay
+can turn a normal DO close into an abnormal cross-isolate disconnect.
 
 The WebSocket smoke checks require both a successful upgrade and a clean close.
 For deployments, `scripts/demo-smoke-verified.mjs` opens a temporary Cloudflare
@@ -54,8 +54,14 @@ correlated exception, error log, failed invocation, missing evidence, or lost ta
 fails verification even if the client reported success.
 Successful streamed HTTP responses may have a `canceled` invocation outcome;
 these require the client HTTP checks to pass and never substitute for WebSocket
-close evidence. Structured synthetic markers preserve correlation when query
-values are redacted in tail events. Install the demo Worker's npm dependencies
+close evidence. Synthetic WebSocket clients send a correlation header because
+query values are redacted in tail events. Marked passive status probes publish
+the DO's bounded synthetic close records through the tail, so verification
+checks the actual container relay rather than relying on missing DO tail logs.
+Cloudflare may report `responseStreamDisconnected` for an otherwise successful
+transparent upgrade; this is accepted only for marked WebSocket paths, with
+normal close evidence from every actual container relay. Exceptions and error
+logs remain fatal regardless of close evidence. Install the demo Worker's npm dependencies
 before running the verifier (it uses `ws` for bounded connection cleanup).
 The deployment token needs Worker tail access (the existing Workers Scripts
 permission). The session
@@ -568,3 +574,9 @@ then stop the new native instance. Native allocation failures can require a
 Worker redeploy before cleanup finishes. Roll back routing and its compatible
 image together; never restore a checkpoint under a different image/key.
 Changing only `scheduling_policy` is not a complete rollback.
+
+The container relay registers its completion with `waitUntil()` to retain
+close-handshake work after a client disconnects. The five-second acknowledgement
+deadline bounds cleanup. The workerd regression test crosses a real Durable
+Object boundary to a TCP WebSocket backend and includes an immediate client
+close, text and binary frames, and both close directions.

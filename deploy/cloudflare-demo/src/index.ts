@@ -1,5 +1,6 @@
 import { Container, getContainer } from "@cloudflare/containers";
 import { bridgeContainerWebSocket } from "./container-websocket.ts";
+import { SmokeWebSocketEvidence, validSmokeID } from "./websocket-evidence.ts";
 import demoEntrypoint from "../entrypoint.sh";
 import { createDemoWorker } from "./demo-worker.ts";
 import { DEMO_HOST, APP_HOST } from "./edge-policy.ts";
@@ -15,6 +16,9 @@ export class ShinyHubDemo extends Container {
   entrypoint = ["/bin/sh", "-c", demoEntrypoint];
 
   private activeWebSockets = 0;
+  private smokeEvidence = new SmokeWebSocketEvidence();
+
+  getSmokeWebSocketResults(id: string) { return this.smokeEvidence.read(id); }
 
   override async onActivityExpired(): Promise<void> {
     if (this.activeWebSockets > 0) {
@@ -37,10 +41,12 @@ export class ShinyHubDemo extends Container {
     const pair = new WebSocketPair();
     const connectionID = crypto.randomUUID();
     const marker = new URL(request.url).searchParams.get("__demo_smoke");
-    const smokeID = marker && /^[0-9a-f-]{36}$/.test(marker) ? marker : undefined;
+    const smokeID = validSmokeID(marker) ? marker : undefined;
     this.activeWebSockets++;
-    bridgeContainerWebSocket(pair[1], upstream.webSocket, () => this.renewActivityTimeout(), (result) => {
+    // The close callback still has upstream I/O after the client disconnects.
+    this.ctx.waitUntil(bridgeContainerWebSocket(pair[1], upstream.webSocket, () => this.renewActivityTimeout(), (result) => {
       this.activeWebSockets--;
+      this.smokeEvidence.record(marker, new URL(request.url).pathname, connectionID, result);
       this.renewActivityTimeout();
       const log = {
         event: result.clean ? "demo_websocket_closed" : "demo_websocket_failed",
@@ -49,7 +55,7 @@ export class ShinyHubDemo extends Container {
       };
       if (result.clean) console.info(log);
       else console.error(log);
-    });
+    }));
     return new Response(null, { status: 101, webSocket: pair[0], headers: upstream.headers });
   }
 

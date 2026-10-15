@@ -1,5 +1,5 @@
+import { validSmokeID, type WebSocketCloseEvidence } from "./websocket-evidence.ts";
 import { containerRequest, readContainerState, unavailableResponse, isTransientContainerError } from "./container-request.ts";
-import { bridgeContainerWebSocket } from "./container-websocket.ts";
 import {
   decorateDemoLogin,
   DEMO_SCRIPT_PATH,
@@ -28,6 +28,7 @@ import {
 
 export interface DemoContainer {
   getState(): Promise<{ status: string }>;
+  getSmokeWebSocketResults?(id: string): Promise<WebSocketCloseEvidence[]>;
   start(): Promise<unknown>;
   fetch(request: Request): Promise<Response>;
 }
@@ -131,6 +132,17 @@ export function createDemoWorker<Env>(options: DemoWorkerOptions<Env>): Exported
       // Separate from the visitor wake probe: polling this never reaches the
       // container and never refreshes its idle deadline or the warm-state memo.
       if (url.hostname === controlHost && url.pathname === DEMO_STATUS_PATH) {
+        const marker = request.headers.get("x-shinyhub-demo-smoke");
+        if (request.method === "GET" && validSmokeID(marker) && container.getSmokeWebSocketResults) {
+          // Publish the DO's actual close evidence through the correlated HTTP
+          // probe. Real-time tails do not reliably include DO handler logs.
+          ctx.waitUntil(readContainerState(() => container.getSmokeWebSocketResults!(marker), request.signal)
+            .then(records => { for (const record of records) {
+              if (record.event === "demo_websocket_closed") console.info(record);
+              else console.error(record);
+            } })
+            .catch(() => console.error({ event: "demo_websocket_verification_failed", smoke_id: marker })));
+        }
         return passiveDemoStatus(request.method, container);
       }
       // Container state lives in the Durable Object, so reading it is a round trip
@@ -325,25 +337,7 @@ export function createDemoWorker<Env>(options: DemoWorkerOptions<Env>): Exported
       if (upstream.status >= 500) lastHealthyAt = null;
 
       if (upstream.status === 101 && upstream.webSocket) {
-        // Coordinate the outer Worker-to-DO hop too. A platform pass-through
-        // can acknowledge the browser close before the DO finishes its relay.
-        const pair = new WebSocketPair();
-        const marker = new URL(request.url).searchParams.get("__demo_smoke");
-        const smokeID = marker && /^[0-9a-f-]{36}$/.test(marker) ? marker : undefined;
-        const path = new URL(request.url).pathname;
-        const smokePath = smokeID && [
-          "/app/operations-dashboard/websocket/", "/app/bookmarking-demo/websocket/",
-          "/app/streamlit-demo/_stcore/stream",
-        ].includes(path) ? path : undefined;
-        const connectionID = crypto.randomUUID();
-        bridgeContainerWebSocket(pair[1], upstream.webSocket, () => {}, result => {
-          const log = { event: result.clean ? "demo_websocket_closed" : "demo_websocket_failed",
-            proxy: "edge", connection_id: connectionID, smoke_id: smokeID, smoke_path: smokePath,
-            client_code: result.codes[0], backend_code: result.codes[1] };
-          if (result.clean) console.info(log);
-          else console.error(log);
-        });
-        return new Response(null, { status: 101, webSocket: pair[0], headers: upstream.headers });
+        return upstream;
       }
 
       const responseHeaders = new Headers(upstream.headers);

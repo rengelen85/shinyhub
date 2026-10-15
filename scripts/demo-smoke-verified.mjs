@@ -51,7 +51,13 @@ export function smokeInspector(id) {
       // that response separately; upgrades still require clean server closes.
       const completedHTTP = record.outcome === "canceled"
         && record.event?.response?.status >= 200 && record.event.response.status < 400;
-      if ((record.exceptions?.length ?? 0) > 0 || (record.outcome && record.outcome !== "ok" && !completedHTTP)) {
+      // A transparent upgrade can end with this platform outcome even when
+      // its client and container relay both completed normal close handshakes.
+      // It cannot pass check() until independent DO evidence covers every app.
+      const disconnectedUpgrade = record.outcome === "responseStreamDisconnected"
+        && websocketPaths.includes(url?.pathname)
+        && Object.entries(headers).some(([key, value]) => key.toLowerCase() === "upgrade" && value?.toLowerCase() === "websocket");
+      if ((record.exceptions?.length ?? 0) > 0 || (record.outcome && record.outcome !== "ok" && !completedHTTP && !disconnectedUpgrade)) {
         failure = "Smoke request produced a server-side exception or unsuccessful invocation";
       }
       if (record.event?.response?.status >= 500 && record.event.response.status !== 503) {
@@ -142,7 +148,12 @@ export async function verifiedSmoke(env = process.env) {
       child.once("error", reject);
       child.once("exit", code => code === 0 ? resolve() : reject(new Error(`Demo smoke exited with status ${code}`)));
     });
-    await until(check, 30_000, controller.signal);
+    // Read only synthetic close records through the passive status probe.
+    // This proves the inner relay completed, without another WebSocket proxy.
+    await waitForTelemetry(() => fetch(status, {
+      headers: { "x-shinyhub-demo-smoke": id, "user-agent": "ShinyHub-Demo-Verification/1.0" },
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
+    }).then(r => r.arrayBuffer()), check, controller.signal);
     // Include late transport exceptions following the final close callback.
     await delay(2_000, undefined, { signal: controller.signal });
     await messages;

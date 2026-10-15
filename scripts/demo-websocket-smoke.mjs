@@ -1,4 +1,6 @@
 import { pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
+const require = createRequire(new URL("../deploy/cloudflare-demo/package.json", import.meta.url));
 
 export async function checkWebSocket(endpoint, Socket = WebSocket, timeoutMS = 15_000) {
   await new Promise((resolve, reject) => {
@@ -36,7 +38,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   for (const endpoint of endpoints) {
     const url = new URL(endpoint);
     if (process.env.SHINYHUB_DEMO_SMOKE_ID) url.searchParams.set("__demo_smoke", process.env.SHINYHUB_DEMO_SMOKE_ID);
-    await checkWebSocket(url.toString());
+    // Browsers cannot add headers, but the synthetic client can. Cloudflare
+    // redacts query values in tails; this marker correlates server exceptions.
+    const Socket = process.env.SHINYHUB_DEMO_SMOKE_ID
+      ? class extends require("ws") {
+        constructor(endpoint) { super(endpoint, { headers: { "x-shinyhub-demo-smoke": process.env.SHINYHUB_DEMO_SMOKE_ID } }); }
+      } : WebSocket;
+    await checkWebSocket(url.toString(), Socket);
     console.log(`${endpoint} -> websocket open and clean close`);
   }
 }

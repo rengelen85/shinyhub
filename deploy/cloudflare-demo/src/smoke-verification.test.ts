@@ -80,3 +80,20 @@ test("structured close markers correlate when Cloudflare redacts query values", 
   }] }], event: { request: { url: `https://demo.test${path}?__demo_smoke=REDACTED` } } });
   assert.equal(inspector.check(), true);
 });
+
+
+test("a disconnected upgrade needs independent clean DO evidence and cannot hide exceptions", () => {
+  const record = { outcome: "responseStreamDisconnected", exceptions: [], logs: [],
+    event: { request: { url: `https://demo.test${websocketPaths[0]}`,
+      headers: { upgrade: "websocket", "x-shinyhub-demo-smoke": id } } } };
+  const inspector = smokeInspector(id);
+  inspector.ingest(record);
+  assert.equal(inspector.check(), false);
+  for (const path of websocketPaths) inspector.ingest(trace(path));
+  assert.equal(inspector.check(), true);
+  inspector.ingest({ ...record, exceptions: [{ message: "Network connection lost" }] });
+  assert.throws(() => inspector.check(), /server-side/);
+  const ordinary = smokeInspector(id);
+  ordinary.ingest({ ...record, event: { request: { url: "https://demo.test/healthz", headers: { "x-shinyhub-demo-smoke": id } } } });
+  assert.throws(() => ordinary.check(), /unsuccessful/);
+});

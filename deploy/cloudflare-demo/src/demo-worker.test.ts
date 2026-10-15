@@ -357,3 +357,44 @@ test("an interrupted viewer-session POST is never replayed and gives the visitor
   assert.match(response.headers.get("location")!, /demo_error=1/);
   assert.equal(f.counts.fetch, 1);
 });
+
+test("WebSocket upgrades pass through without a second terminating relay", async () => {
+  const f = fixture("healthy");
+  const upgrade = Object.defineProperties(new Response(null), {
+    status: { value: 101 }, webSocket: { value: {} },
+  });
+  f.setResponse(() => upgrade);
+  const response = await f.fetch(new Request("https://" + apps + "/app/operations-dashboard/websocket/", {
+    headers: { upgrade: "websocket" },
+  }));
+  assert.equal(response, upgrade);
+  assert.equal(f.counts.fetch, 1);
+});
+
+test("marked passive status probes publish only their synthetic DO close evidence", async () => {
+  const id = crypto.randomUUID();
+  const record = { event: "demo_websocket_closed" as const, smoke_id: id,
+    smoke_path: "/app/operations-dashboard/websocket/", connection_id: "synthetic",
+    client_code: 1000, backend_code: 1000 };
+  const reads: string[] = [], logs: unknown[] = [], work: Promise<unknown>[] = [];
+  const worker = createDemoWorker({ controlHost: control, appHost: apps, container: () => ({
+    async getState() { return { status: "healthy" }; },
+    async start() { throw new Error("must not start"); },
+    async fetch() { throw new Error("must not proxy"); },
+    async getSmokeWebSocketResults(marker: string) { reads.push(marker); return [record]; },
+  }) });
+  const ctx = { waitUntil(p: Promise<unknown>) { work.push(p); } } as ExecutionContext;
+  const original = console.info;
+  console.info = record => logs.push(record);
+  try {
+    for (const marker of ["invalid", id]) {
+      const response = await worker.fetch!(new Request("https://" + control + "/__demo/status", {
+        headers: { "x-shinyhub-demo-smoke": marker, cookie: "private=not-logged" },
+      }), {}, ctx);
+      assert.equal(response.status, 200);
+    }
+    await Promise.all(work);
+    assert.deepEqual(reads, [id]);
+    assert.deepEqual(logs, [record]);
+  } finally { console.info = original; }
+});

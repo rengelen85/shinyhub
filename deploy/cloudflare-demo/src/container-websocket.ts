@@ -6,7 +6,9 @@ export function bridgeContainerWebSocket(
   activity: () => void,
   completed: (result: { clean: boolean; codes: number[] }) => void,
   closeTimeoutMS = 5_000,
-): void {
+): Promise<void> {
+  let resolveCompletion!: () => void;
+  const completion = new Promise<void>(resolve => { resolveCompletion = resolve; });
   const sockets = [client, backend];
   const closed = [false, false];
   const forwarded = [false, false];
@@ -19,7 +21,7 @@ export function bridgeContainerWebSocket(
     if (finished) return;
     finished = true;
     if (timer !== undefined) clearTimeout(timer);
-    completed({ clean, codes });
+    try { completed({ clean, codes }); } finally { resolveCompletion(); }
   };
   const fail = () => {
     if (finished) return;
@@ -64,4 +66,5 @@ export function bridgeContainerWebSocket(
     fail();
     throw error;
   }
+  return completion;
 }
