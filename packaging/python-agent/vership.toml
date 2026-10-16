@@ -1,0 +1,20 @@
+[project]
+type = "python"
+
+[changelog]
+unconventional = "exclude"
+
+[checks]
+lint = true
+tests = true
+lint_command = "python3 -m compileall -q src && node --check src/shinyhub_agent/www/bridge.js && node --check src/shinyhub_agent/www/chat.js"
+test_command = "make -C ../.. test-py-agent"
+
+[[version_files]]
+glob = "src/shinyhub_agent/__init__.py"
+search = '__version__ = "{prev}"'
+replace = '__version__ = "{version}"'
+
+# This workflow publishes a tag and PyPI distribution, without a GitHub Release.
+[verify]
+targets = ["tag", "pypi"]

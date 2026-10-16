@@ -20,3 +20,20 @@ field = "version"
 [[artifacts]]
 command = "node scripts/sync-package-lock-version.mjs"
 files = ["package-lock.json"]
+
+# The agent has its own version, changelog, PyPI workflow and tag namespace.
+[projects.agent]
+path = "packaging/python-agent"
+tag_prefix = "shinyhub-agent-v"
+paths = [
+  "packaging/python-agent",
+  "examples/agent-chat-demo",
+  "examples/agent-shiny-demo",
+  "examples/agent-charts-demo",
+  "scripts/agent-chat-browser-e2e.mjs",
+  "scripts/agent-shiny-browser-e2e.mjs",
+  "scripts/agent-charts-browser-e2e.mjs",
+  "scripts/vendor-agent-charts.py",
+  "scripts/namespace-chart-vendor.mjs",
+  ".github/workflows/publish-agent.yml",
+]
