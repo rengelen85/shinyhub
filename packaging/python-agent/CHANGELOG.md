@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.4.1...shinyhub-agent-v0.4.2) - 2026-10-16
+
 ### Added
 
 - Experimental inline charts, enabled explicitly with `register(..., charts=True)`.
@@ -18,6 +20,8 @@
 Charts remain disabled by default. Deployments must permit the renderer's CSP
 requirements; source data remains available when rendering is blocked. Validate
 model tool behavior against the intended deployment before enabling charts.
+
+- **agent**: add experimental opt-in inline charts ([eb86fca](https://github.com/rvben/shinyhub/commit/eb86fcaa41bf58355e87e7faf9e8c894d5ce0ea0))
 
 ## 0.4.1 — 2026-10-16
 
