@@ -24,7 +24,12 @@ from ._runtime import (
 )
 from ._suggestions import (
     FOLLOWUP_TOOL,
+    RECOVERY_INSTRUCTIONS,
+    RECOVERY_RESULT,
+    check_recovery,
     followup_spec,
+    only_followups,
+    recovery_followups,
     terminal_followups,
 )
 from ._usage import ModelCall, UsageCallback, usage_context
@@ -326,9 +331,10 @@ class OpenAIChat:
             not calls
             or (self.followups and all(call.name == FOLLOWUP_TOOL for call in calls))
         ):
-            if not output_text:
+            if not output_text and not calls:
                 raise ToolError("model_failed", "The assistant returned no answer.")
-            yield {"type": "delta", "text": output_text}
+            if output_text:
+                yield {"type": "delta", "text": output_text}
         has_text = bool(self.followups and (nonblank_text_seen or output_text))
         yield {
             "type": "model_response",
@@ -336,6 +342,57 @@ class OpenAIChat:
             "calls": calls,
             "has_text": has_text,
         }
+
+    async def _recover(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        request: dict[str, Any],
+        response: dict[str, Any],
+        turn: Turn,
+        round_number: int,
+    ) -> AsyncIterator[dict[str, Any]]:
+        questions = recovery_followups(response["calls"], self.followups)
+        # Preserve reasoning and call order, but omit blank assistant messages
+        # rejected by gateways translating Responses transcripts to other APIs.
+        output = [
+            {**item, "arguments": json.dumps({"questions": questions})}
+            if item.get("type") == "function_call"
+            else item
+            for item in response["output"]
+            if item.get("type") != "message"
+        ]
+        request = {
+            **request,
+            "instructions": panel_instructions(self.instructions)
+            + "\n\n"
+            + RECOVERY_INSTRUCTIONS,
+            "tool_choice": "none",
+            "input": [
+                *request["input"],
+                *output,
+                *[
+                    {
+                        "type": "function_call_output",
+                        "call_id": call.id,
+                        "output": json.dumps(RECOVERY_RESULT),
+                    }
+                    for call in response["calls"]
+                ],
+            ],
+        }
+        yield {"type": "status", "text": "Writing answer"}
+        async with ModelCall(
+            self.provider, self.model, turn.id, round_number, False, self.on_usage
+        ) as usage:
+            async for event in self._response(client, headers, request, usage):
+                if event["type"] == "model_response":
+                    response = event
+                elif event["type"] == "delta":
+                    yield event
+            check_recovery(response["calls"], response["has_text"])
+        if questions:
+            yield {"type": "suggestions", "questions": questions}
 
     async def run(
         self,
@@ -455,6 +512,12 @@ class OpenAIChat:
                     return
                 if self.followups:
                     has_text = response["has_text"]
+                    if not has_text and only_followups(response["calls"]):
+                        async for event in self._recover(
+                            client, headers, request, response, turn, round_index + 2
+                        ):
+                            yield event
+                        return
                     questions = terminal_followups(
                         response["calls"], has_text, self.followups
                     )

@@ -7,9 +7,33 @@ import unicodedata
 from collections.abc import Sequence
 from typing import Any
 
+from ._core import ToolError
 from ._runtime import ToolCall, bounded_int
 
 FOLLOWUP_TOOL = "suggest_followups"
+RECOVERY_RESULT = {"status": "recorded"}
+RECOVERY_INSTRUCTIONS = (
+    "Write your complete answer as ordinary text using the completed tool results. "
+    "Do not call tools or repeat the follow-up questions."
+)
+
+
+def only_followups(calls: Sequence[ToolCall]) -> bool:
+    return bool(calls) and all(call.name == FOLLOWUP_TOOL for call in calls)
+
+
+def recovery_followups(calls: Sequence[ToolCall], maximum: int) -> list[str]:
+    """Keep metadata only from a single call, independent of answer text."""
+    return terminal_followups(calls, True, maximum)
+
+
+def check_recovery(calls: Sequence[ToolCall], has_text: bool) -> None:
+    if calls and not only_followups(calls):
+        raise ToolError(
+            "model_failed", "The assistant requested tools instead of an answer."
+        )
+    if not has_text:
+        raise ToolError("empty_answer", "The assistant returned no answer.")
 
 
 def question_text(value: Any, maximum: int) -> str | None:

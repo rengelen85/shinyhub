@@ -229,8 +229,18 @@ to offer follow-ups only through that channel. A successfully completed model
 response with nonblank answer text and exactly one suggestion call ends the turn
 without a tool result or another model request. Suggestion calls do not consume
 app-tool budgets; their model tokens and request still appear in usage records.
-Suggestions are best-effort: a model may return none. No additional model request
-is made to obtain them, and the budget-ending response keeps all tools disabled.
+Suggestions are best-effort: a model may return none. If a model returns only
+suggestion calls without an answer, the adapter acknowledges them and makes at
+most one additional request to recover the answer. Invalid or repeated suggestions
+are dropped without preventing that recovery. Recovery never executes app tools
+or retries again; a completed answer may include new suggestion calls, which are
+ignored in favor of the original questions. Empty, incomplete, or app-tool-calling
+recovery responses fail the turn without suggestions. Bedrock keeps native tool
+results and tool configuration for recovery because Converse has no portable
+"none" tool choice; requested app calls are rejected before execution. OpenAI sets
+`tool_choice="none"` and also checks the response in case a gateway ignores it.
+Recovery does not consume app-tool budgets; its actual request and tokens are
+recorded in usage. The budget-ending response keeps all tools disabled.
 There is no guaranteed latency or token saving. Answer text and suggestion arguments
 share `max_output_tokens` (500 by default). Leave headroom for both: reaching the
 output-token limit fails the turn even if answer text has already streamed, and
@@ -238,7 +248,8 @@ no suggestions are shown. Incomplete provider responses are never promoted to
 successful answers.
 
 If suggestions appear beside app tools, they are discarded from both execution
-and the replayed tool transcript. Repeated suggestion calls are also discarded.
+and the replayed tool transcript. Repeated suggestion calls are also discarded; without answer text they trigger
+the same single recovery request, with a result for each call.
 Malformed suggestion JSON or invalid questions are dropped without losing a valid
 answer, within the existing stream and payload safety limits. The server trims
 questions, rejects blank, multiline, control-character, HTML-tag, and overlong
@@ -472,7 +483,8 @@ When the tool-round or per-turn call budget is exhausted, one final call with
 app tools disabled answers from completed results. If it fails or still
 requests tools, a deterministic response lists completed reads, applied actions
 and recent safe tool errors. The final call is additional to `max_tool_rounds`
-and is included in usage records.
+and is included in usage records. Suggestion-only answer recovery is terminal
+and distinct from this budget fallback; recovery failures propagate as errors.
 
 | Setting | Where | Default | Allowed range |
 | --- | --- | ---: | --- |
@@ -507,7 +519,8 @@ a frozen `UsageRecord` per provider request, including final calls, failures
 and cancellations. Records include UTC timestamp, provider, app, optional
 username, model, turn/call IDs, one-based round, final-call flag, tokens, cache
 tokens when available, duration in milliseconds, requested tool names and
-outcome. Unknown counts are `None`, not zero. AG-UI records describe endpoint
+outcome. The final-call flag identifies budget-exhaustion calls; suggestion-only
+answer recovery uses the next round number with `final=False`. Unknown counts are `None`, not zero. AG-UI records describe endpoint
 requests (`model="external"`); its protocol does not supply model token usage.
 Account for its internal model calls on the endpoint.
 
@@ -596,7 +609,9 @@ Before enabling follow-ups with a new model or gateway, run the opt-in, billable
 probes against that deployment. They use synthetic dashboard facts and the default
 500-token output limit. They check ordinary instructions (suggestions optional),
 a forced text-plus-suggestion response, and a read-tool round followed by an answer
-and suggestion. Suggestions must not add a request or repeat in the answer/history:
+and suggestion. A metadata-only response may add one answer-recovery request;
+text plus suggestions must keep the fast path. Questions must not repeat in the
+answer/history:
 
 ```sh
 # Configure only the backend being tested; normal AWS credentials apply to Bedrock.

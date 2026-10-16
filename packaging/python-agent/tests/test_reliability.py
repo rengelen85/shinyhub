@@ -106,10 +106,14 @@ def model_reply(backend, reply):
             for i, (name, args) in enumerate(calls)
         ]
         if text:
-            output.append({
-                "type": "message", "role": "assistant", "status": "completed",
-                "content": [{"type": "output_text", "text": text}],
-            })
+            output.append(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            )
         events.append(
             {
                 "type": "response.failed"
@@ -149,7 +153,42 @@ def model_reply(backend, reply):
     return "".join("data: " + json.dumps(event) + "\n\n" for event in events)
 
 
-async def run_backend(backend, replies, tools, approve, *, history=(), **options):
+async def run_backend(
+    backend, replies, tools, approve, *, history=(), session_state=None, **options
+):
+    async def collect(agent):
+        if session_state is None:
+            return [
+                event
+                async for event in agent.run(
+                    "Question", history, tools, approve, thread_id="thread"
+                )
+            ]
+        from shinyhub_agent._chat import ChatSession
+
+        events = []
+
+        async def send(event):
+            events.append(event)
+
+        chat = ChatSession(
+            agent,
+            tools,
+            send,
+            followups=options.get("followups", 0),
+            **session_state.get("options", {}),
+        )
+        session_state["chat"] = chat
+        await chat.handle(
+            {
+                "version": 1,
+                "session": chat.nonce,
+                "requestId": "request_12345678",
+                "message": "Question",
+            }
+        )
+        return events
+
     requests = []
     remaining = iter(replies)
     if backend == "bedrock":
@@ -162,12 +201,7 @@ async def run_backend(backend, replies, tools, approve, *, history=(), **options
         agent = BedrockChat(
             "test-model", "Use app facts", "eu-west-1", client=Client(), **options
         )
-        events = [
-            event
-            async for event in agent.run(
-                "Question", history, tools, approve, thread_id="thread"
-            )
-        ]
+        events = await collect(agent)
     else:
         real_client = httpx.AsyncClient
 
@@ -184,12 +218,7 @@ async def run_backend(backend, replies, tools, approve, *, history=(), **options
             else AGUIChat("https://agent.example/run", **options)
         )
         with patch("httpx.AsyncClient", side_effect=factory):
-            events = [
-                event
-                async for event in agent.run(
-                    "Question", history, tools, approve, thread_id="thread"
-                )
-            ]
+            events = await collect(agent)
     return events, requests
 
 

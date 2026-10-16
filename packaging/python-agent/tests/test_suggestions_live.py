@@ -98,10 +98,16 @@ def test_real_model_followup_compatibility(backend, scenario):
     chat, events = asyncio.run(run())
     assert not any(event["type"] == "error" for event in events)
     assert events[-1]["type"] == "done"
-    assert len(records) == (2 if scenario == "after_read" else 1), (
-        "Suggestions must not cause an extra model request"
+    expected = 2 if scenario == "after_read" else 1
+    assert expected <= len(records) <= expected + 1, (
+        "At most one answer recovery request"
     )
-    assert all(record.outcome == "success" for record in records)
+    if len(records) == expected + 1:
+        assert records[-2].tool_names
+        assert all(name == "suggest_followups" for name in records[-2].tool_names)
+        assert all(name == "suggest_followups" for name in records[-1].tool_names)
+        assert not records[-1].final
+    assert all(record.outcome == "completed" for record in records)
     assert len(reads) == (1 if scenario == "after_read" else 0)
     if scenario == "after_read":
         assert records[0].tool_names == ("read_view",)

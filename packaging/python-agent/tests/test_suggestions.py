@@ -1,4 +1,4 @@
-"""Suggestions are metadata: never actions, extra rounds, or chat history."""
+"""Suggestions are metadata; answer recovery is bounded and never executes actions."""
 
 import asyncio
 import json
@@ -258,23 +258,84 @@ def test_repeated_metadata_calls_are_dropped_without_another_round(backend):
 
 
 @pytest.mark.parametrize("backend", ["bedrock", "openai"])
-def test_suggestion_only_response_is_not_a_completed_answer(backend):
-    with pytest.raises(ToolError):
-        asyncio.run(
-            run_backend(
-                backend,
-                [
-                    {
-                        "calls": [
-                            ("suggest_followups", {"questions": ["Cost?"]}),
-                        ]
-                    }
-                ],
-                registry([]),
-                no_approval,
-                followups=2,
-            )
+@pytest.mark.parametrize("after_read", [False, True])
+@pytest.mark.parametrize("text", [None, "   "])
+def test_suggestion_only_response_recovers_answer(backend, after_read, text):
+    seen, usage = [], []
+    replies = (
+        [{"text": "Reading your view.", "calls": [("read_view", {})]}]
+        if after_read
+        else []
+    )
+    replies += [
+        {
+            "text": text,
+            "calls": [("suggest_followups", {"questions": [" Cost? ", "COST?"]})],
+        },
+        {"text": "The total is 123."},
+    ]
+    events, requests = asyncio.run(
+        run_backend(
+            backend,
+            replies,
+            registry(seen),
+            no_approval,
+            followups=2,
+            max_tool_rounds=2 if after_read else 1,
+            max_tool_calls_per_turn=2,
+            on_usage=usage.append,
         )
+    )
+    assert len(requests) == (3 if after_read else 2)
+    assert seen == (["read"] if after_read else [])
+    assert events[-2:] == [
+        {"type": "delta", "text": "The total is 123."},
+        {"type": "suggestions", "questions": ["Cost?"]},
+    ]
+    assert [u.round for u in usage] == list(range(1, len(requests) + 1))
+    assert len({u.turn_id for u in usage}) == 1
+    assert all(not u.final and u.outcome == "completed" for u in usage)
+    assert usage[-2].tool_names == ("suggest_followups",)
+    assert usage[-1].tool_names == ()
+    assert "action limit" not in json.dumps(events)
+    assert FOLLOWUP_INSTRUCTIONS not in json.dumps(requests[-1])
+    if backend == "bedrock":
+        assert requests[-1]["toolConfig"] == requests[-2]["toolConfig"]
+        content = requests[-1]["messages"][-2]["content"]
+        assert content == [
+            {
+                "toolUse": {
+                    "toolUseId": "call-0",
+                    "name": "suggest_followups",
+                    "input": {"questions": ["Cost?"]},
+                }
+            }
+        ]
+        assert requests[-1]["messages"][-1]["content"] == [
+            {
+                "toolResult": {
+                    "toolUseId": "call-0",
+                    "content": [{"json": {"status": "recorded"}}],
+                    "status": "success",
+                }
+            }
+        ]
+    else:
+        assert requests[-1]["tool_choice"] == "none"
+        assert requests[-1]["tools"] == requests[-2]["tools"]
+        assert requests[-1]["input"][-2:] == [
+            {
+                "type": "function_call",
+                "call_id": "call-0",
+                "name": "suggest_followups",
+                "arguments": json.dumps({"questions": ["Cost?"]}),
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-0",
+                "output": json.dumps({"status": "recorded"}),
+            },
+        ]
 
 
 @pytest.mark.parametrize("backend", ["bedrock", "openai"])
@@ -450,25 +511,6 @@ def test_malformed_suggestion_json_does_not_fail_the_answer(backend, monkeypatch
     assert not any(e["type"] == "suggestions" for e in events)
 
 
-@pytest.mark.parametrize("backend", ["bedrock", "openai"])
-def test_text_in_an_earlier_tool_round_does_not_make_metadata_only_response_terminal(
-    backend,
-):
-    with pytest.raises(ToolError):
-        asyncio.run(
-            run_backend(
-                backend,
-                [
-                    {"text": "Reading your view.", "calls": [("read_view", {})]},
-                    {"calls": [("suggest_followups", {"questions": ["Cost?"]})]},
-                ],
-                registry([]),
-                no_approval,
-                followups=2,
-            )
-        )
-
-
 @pytest.mark.parametrize("followups", [0, 2])
 @pytest.mark.parametrize(
     "content", [None, [None], [{"type": "output_text", "text": None}]]
@@ -638,3 +680,289 @@ def test_custom_agents_keep_default_error_messages_and_cannot_enable_metadata(ou
             assert chat.history[-1]["content"] == "Answer."
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["bedrock", "openai"])
+@pytest.mark.parametrize(
+    "arguments", [None, [], {}, {"questions": []}, {"questions": ["\n", "x" * 101]}]
+)
+def test_invalid_metadata_still_recovers_answer(backend, arguments):
+    events, requests = asyncio.run(
+        run_backend(
+            backend,
+            [{"calls": [("suggest_followups", arguments)]}, {"text": "Answer."}],
+            registry([]),
+            no_approval,
+            followups=2,
+        )
+    )
+    assert len(requests) == 2
+    assert events[-1] == {"type": "delta", "text": "Answer."}
+    if backend == "bedrock":
+        assert requests[1]["messages"][-2]["content"][0]["toolUse"]["input"] == {
+            "questions": []
+        }
+    else:
+        assert json.loads(requests[1]["input"][-2]["arguments"]) == {"questions": []}
+
+
+@pytest.mark.parametrize("backend", ["bedrock", "openai"])
+def test_repeated_metadata_only_calls_recover_with_matching_results(backend):
+    events, requests = asyncio.run(
+        run_backend(
+            backend,
+            [
+                {"calls": [("suggest_followups", {"questions": ["Cost?"]})] * 2},
+                {"text": "Answer."},
+            ],
+            registry([]),
+            no_approval,
+            followups=2,
+        )
+    )
+    assert len(requests) == 2
+    assert not any(e["type"] == "suggestions" for e in events)
+    if backend == "bedrock":
+        content = requests[1]["messages"][-1]["content"]
+        assert [part["toolResult"]["toolUseId"] for part in content] == [
+            "call-0",
+            "call-1",
+        ]
+    else:
+        results = [
+            item
+            for item in requests[1]["input"]
+            if item.get("type") == "function_call_output"
+        ]
+        assert [item["call_id"] for item in results] == ["call-0", "call-1"]
+
+
+@pytest.mark.parametrize("backend", ["bedrock", "openai"])
+def test_recovery_ignores_new_metadata_alongside_answer(backend):
+    usage = []
+    events, requests = asyncio.run(
+        run_backend(
+            backend,
+            [
+                {"calls": [("suggest_followups", {"questions": ["Cost?"]})]},
+                {
+                    "text": "Answer.",
+                    "calls": [("suggest_followups", {"questions": ["Different?"]})],
+                },
+            ],
+            registry([]),
+            no_approval,
+            followups=2,
+            on_usage=usage.append,
+        )
+    )
+    assert len(requests) == 2
+    assert events[-1] == {"type": "suggestions", "questions": ["Cost?"]}
+    assert usage[-1].tool_names == ("suggest_followups",)
+
+
+@pytest.mark.parametrize("backend", ["bedrock", "openai"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "empty",
+        "blank",
+        "app_call",
+        "metadata_only",
+        "incomplete",
+        "truncated",
+        "cancel",
+        "budget",
+    ],
+)
+def test_failed_recovery_never_emits_suggestions_or_commits_history(
+    backend, failure, monkeypatch
+):
+    import test_reliability
+    from shinyhub_agent._errors import ProviderError
+
+    original = test_reliability.model_reply
+
+    def reply(kind, value):
+        if value.get("recovery"):
+            if failure == "cancel":
+                raise asyncio.CancelledError
+            if failure == "budget":
+                raise ProviderError("budget_exceeded")
+        result = original(kind, value)
+        if kind == "openai" and failure == "app_call" and value.get("recovery"):
+            result = (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.output_item.added",
+                        "item": {"type": "function_call", "name": "write_view"},
+                    }
+                )
+                + "\n\n"
+                + result
+            )
+        if failure == "truncated" and value.get("recovery"):
+            if kind == "bedrock":
+                for event in result:
+                    if "messageStop" in event:
+                        event["messageStop"]["stopReason"] = "max_tokens"
+            else:
+                result = result.replace('"response.completed"', '"response.incomplete"')
+        return result
+
+    monkeypatch.setattr(test_reliability, "model_reply", reply)
+    final = {"recovery": True}
+    if failure == "blank":
+        final["text"] = "   "
+    elif failure == "app_call":
+        final.update(text="Answer.", calls=[("write_view", {})])
+    elif failure == "metadata_only":
+        final["calls"] = [("suggest_followups", {"questions": ["Again?"]})]
+    elif failure in ("incomplete", "truncated"):
+        final.update(text="Partial.", fail=failure == "incomplete")
+    seen, usage, state = [], [], {}
+    events, requests = asyncio.run(
+        run_backend(
+            backend,
+            [
+                {"text": "Reading.", "calls": [("read_view", {})]},
+                {"calls": [("suggest_followups", {"questions": ["Cost?"]})]},
+                final,
+            ],
+            registry(seen),
+            no_approval,
+            followups=2,
+            session_state=state,
+            on_usage=usage.append,
+        )
+    )
+    assert len(requests) == 3
+    assert seen == ["read"]
+    assert not any(e["type"] in ("suggestions", "done") for e in events)
+    assert events[-1]["type"] == "error"
+    assert sum(e.get("text") == "Using app tools" for e in events) == (
+        1 if backend == "bedrock" else 0
+    )
+    assert state["chat"].history == []
+    assert usage[-1].outcome == ("cancelled" if failure == "cancel" else "error")
+    if failure == "budget":
+        assert events[-1]["code"] == "budget_exceeded"
+
+
+@pytest.mark.parametrize("backend", ["bedrock", "openai"])
+@pytest.mark.parametrize("expired", [False, True])
+def test_session_recovery_emits_only_after_success_and_honors_expired_approval(
+    backend, expired
+):
+    state = {"options": {"approval_timeout": 1}}
+    seen = []
+    replies = ([{"calls": [("write_view", {})]}] if expired else []) + [
+        {"calls": [("suggest_followups", {"questions": ["Cost?"]})]},
+        {"text": "Answer."},
+    ]
+    events, requests = asyncio.run(
+        run_backend(
+            backend,
+            replies,
+            registry(seen),
+            no_approval,
+            followups=2,
+            session_state=state,
+        )
+    )
+    assert len(requests) == (3 if expired else 2)
+    assert seen == []
+    assert events[-1]["type"] == "done"
+    assert any(e["type"] == "suggestions" for e in events) is not expired
+    if not expired:
+        assert [e["type"] for e in events][-2:] == ["suggestions", "done"]
+    else:
+        assert any(e["type"] == "approval_expired" for e in events)
+    assert state["chat"].history == [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "Answer."},
+    ]
+
+
+@pytest.mark.parametrize("backend", ["bedrock", "openai"])
+def test_malformed_json_is_normalized_for_recovery(backend, monkeypatch):
+    import test_reliability
+
+    original = test_reliability.model_reply
+
+    def malformed(kind, reply):
+        result = original(kind, reply)
+        if not reply.get("calls"):
+            return result
+        if kind == "bedrock":
+            for event in result:
+                delta = event.get("contentBlockDelta", {}).get("delta", {})
+                if "toolUse" in delta:
+                    delta["toolUse"]["input"] = "{"
+            return result
+        return result.replace('"arguments": "{}"', '"arguments": "{"')
+
+    monkeypatch.setattr(test_reliability, "model_reply", malformed)
+    events, requests = asyncio.run(
+        run_backend(
+            backend,
+            [{"calls": [("suggest_followups", {})]}, {"text": "Answer."}],
+            registry([]),
+            no_approval,
+            followups=2,
+        )
+    )
+    assert len(requests) == 2
+    assert events[-1] == {"type": "delta", "text": "Answer."}
+    if backend == "bedrock":
+        assert requests[1]["messages"][-2]["content"][0]["toolUse"]["input"] == {
+            "questions": []
+        }
+    else:
+        assert json.loads(requests[1]["input"][-2]["arguments"]) == {"questions": []}
+
+
+def test_openai_recovery_preserves_reasoning_order_and_drops_blank_message(monkeypatch):
+    import test_reliability
+
+    original = test_reliability.model_reply
+    reasoning = {"type": "reasoning", "id": "reasoning-1", "summary": []}
+
+    def with_reasoning(kind, reply):
+        result = original(kind, reply)
+        if not reply.get("calls"):
+            return result
+        frames = [
+            json.loads(line[5:])
+            for line in result.splitlines()
+            if line.startswith("data:")
+        ]
+        frames[-1]["response"]["output"].insert(0, reasoning)
+        return "".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
+
+    monkeypatch.setattr(test_reliability, "model_reply", with_reasoning)
+    events, requests = asyncio.run(
+        run_backend(
+            "openai",
+            [
+                {
+                    "text": "   ",
+                    "calls": [("suggest_followups", {"questions": ["Cost?"]})],
+                },
+                {"text": "Answer."},
+            ],
+            registry([]),
+            no_approval,
+            followups=2,
+        )
+    )
+    assert len(requests) == 2
+    assert [item.get("type", "message") for item in requests[1]["input"]] == [
+        "message",
+        "reasoning",
+        "function_call",
+        "function_call_output",
+    ]
+    assert requests[1]["input"][1] == reasoning
+    assert events[-1] == {"type": "suggestions", "questions": ["Cost?"]}

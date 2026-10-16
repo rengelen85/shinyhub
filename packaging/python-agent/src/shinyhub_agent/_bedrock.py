@@ -20,7 +20,12 @@ from ._runtime import (
 )
 from ._suggestions import (
     FOLLOWUP_TOOL,
+    RECOVERY_INSTRUCTIONS,
+    RECOVERY_RESULT,
+    check_recovery,
     followup_spec,
+    only_followups,
+    recovery_followups,
     terminal_followups,
 )
 from ._usage import ModelCall, UsageCallback
@@ -218,6 +223,67 @@ class BedrockChat:
             raise ToolError("model_failed", "The assistant did not finish its reply.")
         yield {"type": "model_response", "content": content, "calls": normalized}
 
+    async def _recover(
+        self,
+        client: Any,
+        request: dict[str, Any],
+        response: dict[str, Any],
+        turn: Turn,
+        round_number: int,
+    ) -> AsyncIterator[dict[str, Any]]:
+        questions = recovery_followups(response["calls"], self.followups)
+        # Keep native tool results: Converse requires toolConfig for this transcript
+        # and has no portable tool-choice "none". Reject any new app calls below.
+        content = [
+            {"toolUse": {**part["toolUse"], "input": {"questions": questions}}}
+            if "toolUse" in part
+            else part
+            for part in response["content"]
+            if "text" not in part or part["text"].strip()
+        ]
+        request = {
+            **request,
+            "system": [
+                {
+                    "text": panel_instructions(self.instructions)
+                    + "\n\n"
+                    + RECOVERY_INSTRUCTIONS
+                }
+            ],
+            "messages": [
+                *request["messages"],
+                {"role": "assistant", "content": content},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "toolResult": {
+                                "toolUseId": call.id,
+                                "content": [{"json": RECOVERY_RESULT}],
+                                "status": "success",
+                            }
+                        }
+                        for call in response["calls"]
+                    ],
+                },
+            ],
+        }
+        yield {"type": "status", "text": "Writing answer"}
+        async with ModelCall(
+            "bedrock", self.model_id, turn.id, round_number, False, self.on_usage
+        ) as usage:
+            async for event in self._response(client, request, usage):
+                if event["type"] == "model_response":
+                    response = event
+                elif event["type"] == "delta":
+                    yield event
+            check_recovery(
+                response["calls"],
+                any(part.get("text", "").strip() for part in response["content"]),
+            )
+        if questions:
+            yield {"type": "suggestions", "questions": questions}
+
     async def run(
         self,
         message: str,
@@ -325,9 +391,18 @@ class BedrockChat:
             if not response["calls"]:
                 return
             if self.followups:
+                has_text = any(
+                    part.get("text", "").strip() for part in response["content"]
+                )
+                if not has_text and only_followups(response["calls"]):
+                    async for event in self._recover(
+                        client, request, response, turn, round_index + 2
+                    ):
+                        yield event
+                    return
                 questions = terminal_followups(
                     response["calls"],
-                    any(part.get("text", "").strip() for part in response["content"]),
+                    has_text,
                     self.followups,
                 )
                 response["calls"] = [
