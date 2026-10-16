@@ -30,9 +30,13 @@ class H(http.server.BaseHTTPRequestHandler):
         body = version.encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Test-Backend-Port", os.environ["PORT"])
         self.end_headers()
         self.wfile.write(body)
     def log_message(self, fmt, *args): pass
+print("Listening on http://127.0.0.1:" + os.environ["PORT"], flush=True)
+print("Uvicorn running on http://127.0.0.1:" + os.environ["PORT"], file=sys.stderr, flush=True)
+print("fixture initialized", flush=True)
 http.server.HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H).serve_forever()
 `
 
@@ -152,6 +156,53 @@ func TestDevelopmentStopResumeUsesLatestSourceAndStableURL(t *testing.T) {
 	}
 	if status, body := readControlledURL(t, ready.URL); status != 200 || body != "v2" {
 		t.Fatalf("resume did not serve latest source: %d %q", status, body)
+	}
+}
+
+func TestDevelopmentFileSavesKeepPublicURLWhileReplacingBackend(t *testing.T) {
+	r := startControlledRun(t, "v1", nil)
+	first := r.await("phase", "ready")
+	client := &http.Client{Timeout: time.Second}
+	previousPort := ""
+	for i, version := range []string{"v1", "v2", "v3"} {
+		if i > 0 {
+			r.write(version)
+			ready := r.await("phase", "ready")
+			if ready.URL != first.URL || ready.Generation <= first.Generation {
+				t.Fatalf("save changed public URL or did not advance generation: %+v", ready)
+			}
+		}
+		resp, err := client.Get(first.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if resp.StatusCode != http.StatusOK || string(body) != version {
+			t.Fatalf("original public URL after save: status=%d body=%q, want %s", resp.StatusCode, body, version)
+		}
+		port := resp.Header.Get("X-Test-Backend-Port")
+		if port == "" || port == previousPort {
+			t.Fatalf("backend was not replaced: previous port=%q current=%q", previousPort, port)
+		}
+		t.Logf("version=%s public=%s backend port=%s", version, first.URL, port)
+		previousPort = port
+	}
+	var initialized bool
+	for _, event := range r.records {
+		if event.Type != "log" || event.Source != "app" {
+			continue
+		}
+		if strings.Contains(event.Message, "http://127.0.0.1:") {
+			t.Fatalf("runtime startup address leaked after reload: %+v", event)
+		}
+		initialized = initialized || event.Message == "fixture initialized"
+	}
+	if !initialized {
+		t.Fatal("ordinary app output was lost")
 	}
 }
 

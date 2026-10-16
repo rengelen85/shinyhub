@@ -104,6 +104,10 @@ func (w *eventLogWriter) flush() {
 	w.fragment = ""
 }
 func flushEventWriter(w io.Writer) {
+	if rw, ok := w.(*runtimeLogWriter); ok {
+		rw.flush()
+		return
+	}
 	if w, ok := w.(*eventLogWriter); ok {
 		w.flush()
 	}

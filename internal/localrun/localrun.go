@@ -344,6 +344,7 @@ func Run(ctx context.Context, o Options, stdout, stderr io.Writer) (runErr error
 	}
 	defer lp.close()
 	if !o.NoReload && !o.Check {
+		fmt.Fprintf(stdout, "  Browser URL (available when ready): %s\n", lp.URL())
 		lp.enableBrowserRefresh()
 	}
 	proxyErrCh := make(chan error, 1)
@@ -438,7 +439,7 @@ func Run(ctx context.Context, o Options, stdout, stderr io.Writer) (runErr error
 	}
 	lp.activateBrowserRevision()
 	events.emit(Event{Type: "phase", Phase: "ready", Attempt: events.attempt.Load(), Generation: lp.revision.Load(), URL: lp.URL(), Message: "Watching for changes"})
-	fmt.Fprintf(stdout, "Ready\n  App: %s\n", lp.URL())
+	fmt.Fprintf(stdout, "Ready\n  Browser: %s\n", lp.URL())
 	if o.Check {
 		return nil
 	}
@@ -577,6 +578,8 @@ func startCandidate(ctx context.Context, w *workspace, slug string, userEnv []st
 	if ew, ok := stderr.(*eventLogWriter); ok {
 		appErr = events.writer(ew.out, "app", "stderr", events.attempt.Load())
 	}
+	appOut = &runtimeLogWriter{out: appOut, port: port}
+	appErr = &runtimeLogWriter{out: appErr, port: port}
 	c.Stdout = appOut
 	c.Stderr = appErr
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

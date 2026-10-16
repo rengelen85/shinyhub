@@ -73,7 +73,7 @@ func TestRun_CheckPresentsDevelopmentSummaryWithoutEnvironmentValues(t *testing.
 	for _, want := range []string{
 		"Local preflight", "  Source:", "  Workspace:", "  Data:",
 		"  Reload: off; exits after the first healthy start", "  Environment: API_TOKEN",
-		"Ready\n  App: http://127.0.0.1:",
+		"Ready\n  Browser: http://127.0.0.1:",
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("summary omitted %q:\n%s", want, output)

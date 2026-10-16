@@ -96,6 +96,10 @@ becomes healthy, so a syntax error, missing dependency, crash, or failed
 readiness check leaves the last healthy version serving. Fix the file and the
 next save retries automatically.
 
+Open the `Browser` URL in ShinyHub's `Ready` output or development view. It stays
+the same throughout a development session. Use `--port 8000` to keep that address
+across separate development sessions too.
+
 Open browser tabs refresh automatically after a successful local reload. Use
 `shinyhub dev . --open` to open the first tab as soon as the app is ready; later
 saves refresh that tab and any others viewing the app, preserving their URL.

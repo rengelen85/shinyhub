@@ -221,7 +221,7 @@ func runDevelopmentLoop(ctx context.Context, o Options, w *workspace, lp *localP
 			lp.unavailable.Store(false)
 			lp.activateBrowserRevision()
 			events.emit(Event{Type: "phase", Phase: "ready", Attempt: events.attempt.Load(), Generation: lp.revision.Load(), URL: lp.URL(), Message: "Watching for changes"})
-			fmt.Fprintf(stdout, "Ready\n  App: %s\n", lp.URL())
+			fmt.Fprintf(stdout, "Ready\n  Browser: %s\n", lp.URL())
 			if o.Open && !opened {
 				openBrowser(lp.URL())
 			}
