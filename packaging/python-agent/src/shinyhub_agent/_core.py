@@ -219,18 +219,35 @@ class ToolRegistry:
 
     @staticmethod
     def _result(result: Any) -> Any:
+        from ._charts import ChartData
+
+        if isinstance(result, ChartData):
+            result = result.as_result()
         encoded_result = json.dumps(result, allow_nan=False)
         if len(encoded_result.encode()) > MAX_RESULT_BYTES:
             raise ToolError("result_too_large", "The app returned too much data.")
         return result
 
-    async def execute(self, name: str, arguments: Any, *, timeout: float = 8.0) -> Any:
+    async def execute(
+        self,
+        name: str,
+        arguments: Any,
+        *,
+        timeout: float = 8.0,
+        _chart_data: bool = False,
+    ) -> Any:
         tool, snapshot = self._arguments(name, arguments)
 
         async def operation():
             # Recheck changing app constraints immediately before applying the action.
             await self._validate(tool, snapshot)
-            return self._result(await tool.handler(snapshot))
+            result = await tool.handler(snapshot)
+            if _chart_data:
+                from ._charts import ChartData
+
+                if isinstance(result, ChartData):
+                    return ChartData(result.rows, result.fields, result.title)
+            return self._result(result)
 
         return await self._invoke(operation, timeout)
 

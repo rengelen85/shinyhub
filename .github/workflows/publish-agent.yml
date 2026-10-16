@@ -49,12 +49,12 @@ jobs:
         run: |
           set -euo pipefail
           for archive in dist/*.whl dist/*.tar.gz; do
-            uv run --isolated --no-project --with "$archive" python -c 'import os; from importlib.resources import files; import shinyhub_agent as a; assert a.__version__ == os.environ["GITHUB_REF_NAME"].removeprefix("shinyhub-agent-v"); assert a.BedrockChat; assert files("shinyhub_agent").joinpath("www/chat.js").is_file(); assert files("shinyhub_agent").joinpath("www/bridge.js").is_file()'
+            uv run --isolated --no-project --with "$archive" python -c 'import os; from importlib.resources import files; import shinyhub_agent as a; assert a.__version__ == os.environ["GITHUB_REF_NAME"].removeprefix("shinyhub-agent-v"); assert a.BedrockChat; assert a.ChartData; assert all(files("shinyhub_agent").joinpath("www", path).is_file() for path in ("charts.js", "vendor/vega.min.js", "vendor/vega-lite.min.js", "vendor/vega-embed.min.js", "vendor/vega.LICENSE", "vendor/vega-lite.LICENSE", "vendor/vega-embed.LICENSE")); assert files("shinyhub_agent").joinpath("www/chat.js").is_file(); assert files("shinyhub_agent").joinpath("www/bridge.js").is_file()'
           done
           uv run --isolated --no-project --with dist/*.whl --with boto3 --with pytest pytest tests/ -q
           node tests/bridge.test.cjs
           npm --prefix ../.. ci --ignore-scripts --no-audit --no-fund
-          node --test tests/chat.test.cjs tests/bridge-approval.test.cjs
+          node --test tests/chat.test.cjs tests/charts.test.cjs tests/bridge-approval.test.cjs
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

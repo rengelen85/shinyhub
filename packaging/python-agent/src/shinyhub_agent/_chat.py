@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import secrets
 import time
@@ -11,6 +12,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from ._charts import ChartRegistry
 from ._core import ToolError, ToolRegistry
 from ._errors import ProviderError
 from ._runtime import bounded_int
@@ -45,6 +47,7 @@ class ChatSession:
         *,
         approval_timeout: float = 30,
         followups: int = 0,
+        charts: bool = False,
         history_exchanges: int = 6,
         max_answer_chars: int = 8_000,
         usage_metadata: dict[str, str | None] | None = None,
@@ -74,7 +77,10 @@ class ChatSession:
         self.followups = followups
         self.suggestions_suppressed = False
         self.agent = agent
-        self.tools = tools
+        if not isinstance(charts, bool):
+            raise TypeError("charts must be a bool")
+        self.charts = ChartRegistry(tools) if charts else None
+        self.tools = self.charts or tools
         self.send = send
         self.nonce = secrets.token_urlsafe(18)
         self.thread_id = secrets.token_urlsafe(18)
@@ -130,6 +136,8 @@ class ChatSession:
         if raw.get("action") == "reset":
             if not self.lock.locked():
                 self.history.clear()
+                if self.charts:
+                    self.charts.clear()
                 self.thread_id = secrets.token_urlsafe(18)
                 self.last_action = None
                 await emit({"type": "reset"})
@@ -177,6 +185,8 @@ class ChatSession:
                 try:
                     result = await self.tools.undo(action[1], action[2], action[3])
                     self.history.clear()
+                    if self.charts:
+                        self.charts.clear()
                     self.thread_id = secrets.token_urlsafe(18)
                     detail = self._receipt(
                         tool, action[2], result, "Previous view restored"
@@ -243,19 +253,45 @@ class ChatSession:
         self.seen_requests.append(request_id)
         answer = ""
         suggestions: list[str] = []
+        chart_context: list[str] = []
+
+        async def emit_charts():
+            if self.charts:
+                while self.charts.pending:
+                    chart = self.charts.pending.pop(0)
+                    await emit({"type": "chart", "chart": chart})
+                    chart_context.append(
+                        json.dumps(
+                            {
+                                k: v
+                                for k, v in chart.items()
+                                if k not in ("rows", "fields")
+                            }
+                        )
+                    )
+
         applied_actions: list[str] = []
 
         def remember_applied_actions() -> None:
-            if not applied_actions:
+            if not applied_actions and not chart_context:
                 return
             self.history.extend(
                 [
                     {"role": "user", "content": message.strip()},
                     {
                         "role": "assistant",
-                        "content": "Applied app action: "
-                        + ", ".join(applied_actions)
-                        + ". The reply was interrupted.",
+                        "content": (
+                            "Applied app action: " + ", ".join(applied_actions) + ". "
+                            if applied_actions
+                            else ""
+                        )
+                        + "The reply was interrupted."
+                        + (
+                            "\n\nChart snapshots (dataset IDs may expire):\n"
+                            + "\n".join(chart_context)
+                            if chart_context
+                            else ""
+                        ),
                     },
                 ]
             )
@@ -264,6 +300,8 @@ class ChatSession:
         async with self.lock:
             self.task = asyncio.current_task()
             self.suggestions_suppressed = False
+            if self.charts:
+                self.charts.begin_turn()
             usage_token = usage_context.set(
                 {**self.usage_metadata, "turn_id": secrets.token_urlsafe(16)}
             )
@@ -276,6 +314,9 @@ class ChatSession:
                     self.approve,
                     thread_id=self.thread_id,
                 ):
+                    await emit_charts()
+                    if event.get("type") == "chart":
+                        continue  # Only server-resolved chart tool results are displayed.
                     if event.get("type") == "suggestions":
                         suggestions = clean_followups(
                             event.get("questions"), self.followups
@@ -310,12 +351,25 @@ class ChatSession:
                             if tool and tool.undo is not None:
                                 event["actionId"] = action[0]
                     await emit(event)
+                await emit_charts()
+                if not answer.strip() and chart_context:
+                    answer = "Chart shown below."
+                    await emit({"type": "delta", "text": answer})
                 if not answer.strip():
                     raise ToolError("empty_answer", "The assistant returned no answer.")
                 self.history.extend(
                     [
                         {"role": "user", "content": message.strip()},
-                        {"role": "assistant", "content": answer},
+                        {
+                            "role": "assistant",
+                            "content": answer
+                            + (
+                                "\n\nChart snapshots (dataset IDs may expire):\n"
+                                + "\n".join(chart_context)
+                                if chart_context
+                                else ""
+                            ),
+                        },
                     ]
                 )
                 self.history = self.history[-2 * self.history_exchanges :]

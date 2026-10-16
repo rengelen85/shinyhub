@@ -123,7 +123,7 @@ test-py-agent:
 	cd packaging/python-agent && PYTHONPATH=src uv run --python '$(PYTHON_VERSION)' --with pytest --with jsonschema --with 'shiny>=1.8,<2' --with httpx --no-project python -m pytest tests/ -q
 	node packaging/python-agent/tests/bridge.test.cjs
 	@if [ ! -d node_modules/jsdom ]; then npm install --no-audit --no-fund --silent; fi
-	node --test packaging/python-agent/tests/chat.test.cjs packaging/python-agent/tests/bridge-approval.test.cjs
+	node --test packaging/python-agent/tests/chat.test.cjs packaging/python-agent/tests/charts.test.cjs packaging/python-agent/tests/bridge-approval.test.cjs
 
 .PHONY: test-py-runtime benchmark-python-runtime
 
@@ -660,3 +660,12 @@ test-load-mixed: ## Validate the mixed-load verdicts and database telemetry with
 test-browser-announcements-e2e: build
 	@if [ ! -d loadtest/render/driver/node_modules/playwright ]; then cd loadtest/render/driver && npm ci --no-audit --no-fund; fi
 	SHINYHUB_E2E_BINARY=$(CURDIR)/bin/shinyhub node scripts/announcements-browser-e2e.mjs
+
+.PHONY: test-browser-agent-charts-e2e
+
+# Locally bundled renderer, keyboard actions, failures and accessibility.
+test-browser-agent-charts-e2e:
+	@command -v node >/dev/null 2>&1 || { echo "node not found (Node 20+ required)"; exit 1; }
+	@if [ ! -d node_modules/axe-core ]; then npm install --no-audit --no-fund --silent; fi
+	@if [ ! -d loadtest/render/driver/node_modules/playwright ]; then cd loadtest/render/driver && npm install --no-audit --no-fund --silent; fi
+	node scripts/agent-charts-browser-e2e.mjs

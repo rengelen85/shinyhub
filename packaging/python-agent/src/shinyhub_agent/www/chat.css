@@ -532,3 +532,44 @@ body.sh-agent-native-chat .sh-agent-expand { display: none; }
 .sh-agent-suggestion { max-width: 100%; overflow-wrap: anywhere; text-align: start; }
 .sh-agent-suggestion:disabled { opacity: .55; cursor: default; }
 .sh-agent-followup-hint { margin: 0; font-size: 12px; color: inherit; }
+
+/* Chart values and controls share the conversation's visual language. */
+.sh-agent-chart {
+  margin: 16px 0 4px;
+  padding: 16px 0 0;
+  border-top: 1px solid #dbe2ee;
+  min-width: 0;
+  color: #16203a;
+  font: 13px/1.5 "Manrope", ui-sans-serif, system-ui, sans-serif;
+}
+.sh-agent-chart-header { display: flex; flex-wrap: wrap; align-items: start; gap: 10px; margin-bottom: 12px; }
+.sh-agent-chart-title { flex: 1 1 150px; font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+.sh-agent-chart-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+.sh-agent-chart-button {
+  min-height: 36px; padding: 6px 10px; border: 1px solid #c6d0e0; border-radius: 6px;
+  background: #fff; color: #0369a1; font: inherit; cursor: pointer;
+}
+.sh-agent-chart-button:hover { background: #e9eef7; }
+.sh-agent-chart-button:disabled { color: #5b6784; cursor: default; }
+.sh-agent-chart :focus-visible { outline: 3px solid #0369a1; outline-offset: 3px; }
+.sh-agent-chart-plot { width: 100%; min-height: 240px; background: #fff; border-radius: 8px; }
+.sh-agent-chart-plot.vega-embed { display: block; padding: 0; }
+.sh-agent-chart-plot svg { display: block; max-width: 100%; height: auto; }
+.sh-agent-chart-meta, .sh-agent-chart-status { color: #45526e; margin: 10px 0; font-size: 12px; overflow-wrap: anywhere; }
+.sh-agent-chart [hidden] { display: none !important; }
+.sh-agent-chart-data summary { cursor: pointer; color: #0369a1; padding: 6px 0; }
+.sh-agent-chart-table { max-height: 280px; overflow: auto; margin-top: 6px; }
+.sh-agent-chart-table table { width: 100%; border-collapse: collapse; font: inherit; text-align: left; }
+.sh-agent-chart-table caption { text-align: left; padding-bottom: 8px; color: #45526e; }
+.sh-agent-chart-table th, .sh-agent-chart-table td { padding: 8px 12px; border-bottom: 1px solid #dbe2ee; text-align: left; max-width: 260px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.sh-agent-chart-table th { background: #e8edf6; position: sticky; top: 0; }
+.sh-agent-chart-dialog { width: min(1100px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); border: 0; border-radius: 16px; padding: 24px; background: #f4f7fc; box-shadow: 0 24px 64px rgba(3,5,16,.23); }
+.sh-agent-chart-dialog::backdrop { background: rgba(3,5,16,.65); }
+.sh-agent-chart-expanded { margin: 0; padding: 0; border: 0; }
+.sh-agent-chart-expanded .sh-agent-chart-plot { min-height: 300px; }
+@media (max-width: 480px) {
+  .sh-agent-chart-dialog { padding: 16px; }
+  .sh-agent-chart-tools { width: 100%; }
+}
+
+.sh-agent-chart-pages { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }

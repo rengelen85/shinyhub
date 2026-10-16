@@ -43,7 +43,13 @@ def chat_dependency():
         "shinyhub-agent-chat",
         "0.4.1",
         source={"package": "shinyhub_agent", "subdir": "www"},
-        script={"src": "chat.js", "defer": "defer"},
+        script=[
+            {"src": src, "defer": "defer"}
+            for src in (
+                "charts.js",
+                "chat.js",
+            )
+        ],
         stylesheet={"href": "chat.css"},
     )
 
@@ -57,6 +63,7 @@ def register(
     notice: str | None = None,
     starters: Sequence[str] | None = None,
     followups: int = 0,
+    charts: bool = False,
     approval_timeout: float = 30,
     history_exchanges: int = 6,
     max_answer_chars: int = 8_000,
@@ -71,7 +78,8 @@ def register(
     characters. Optional starters replace the built-in empty-state questions
     (None preserves defaults; an empty sequence hides them). followups enables
     up to three experimental, editable, never auto-submitted suggestions on supporting
-    chat agents. Both settings leave existing apps unchanged by default.
+    chat agents. charts enables experimental chat-only rendering of ChartData results.
+    These settings leave existing apps unchanged by default.
     """
     from shiny import reactive
     from shiny.session import session_context
@@ -104,6 +112,10 @@ def register(
     bounded_int("followups", followups, 0, 3)
     if followups and chat is None:
         raise ValueError("followups requires a chat agent")
+    if not isinstance(charts, bool):
+        raise TypeError("charts must be a bool")
+    if charts and chat is None:
+        raise ValueError("charts requires a chat agent")
     registry = ToolRegistry(tools, executor=execute)
     dispatcher = SessionTools(registry, allow_browser_writes=allow_browser_writes)
     chat_session = (
@@ -115,6 +127,7 @@ def register(
             history_exchanges=history_exchanges,
             max_answer_chars=max_answer_chars,
             followups=followups,
+            charts=charts,
             usage_metadata={
                 "app": os.environ.get("SHINYHUB_APP_SLUG"),
                 **(usage_metadata or {}),

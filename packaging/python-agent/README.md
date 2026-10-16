@@ -628,3 +628,103 @@ Run this for each intended model. A passing probe establishes basic compatibilit
 not suggestion quality or a latency improvement. Application evaluations should
 also check relevance, self-contained wording, injected-data handling, and latency
 against the same prompts with follow-ups disabled.
+
+## Inline charts (experimental)
+
+Charts are experimental and disabled by default. Enable them per viewer with
+`register(..., charts=True)`. A read-only app tool
+can return `ChartData` instead of an ordinary JSON result:
+
+```python
+from shinyhub_agent import AgentTool, ChartData, register
+
+async def revenue_data(args):
+    # Apply the same authorization and filters as the dashboard before returning.
+    return ChartData(
+        rows=[
+            {"month": "2026-01-01", "revenue_eur": 12000},
+            {"month": "2026-02-01", "revenue_eur": 19000},
+        ],
+        fields={"month": "temporal", "revenue_eur": "quantitative"},
+        title="Illustrative monthly revenue (EUR)",
+    )
+
+# Inside server(), with chat_dependency() included in the UI:
+register(session=session, input=input, chat=chat, charts=True, tools=[
+    AgentTool("get_revenue", "Read monthly revenue for questions and charts", {
+        "type": "object", "properties": {}, "additionalProperties": False,
+    }, revenue_data),
+])
+```
+
+The chat agent receives an opaque dataset ID, field types, row count, up to three
+sample rows, and numeric minima/maxima. The full dataset stays in the app's
+Shiny session until sent to that viewer's browser for display. Use an ordinary
+read tool for additional analysis or exact aggregates: a preview is not the
+whole dataset. Existing tool-result disclosure rules apply to the samples and
+statistics sent to the model or hoster-owned endpoint.
+
+The chat-only `render_chart` tool accepts a dataset ID, `kind` (`bar`, `line`,
+`area`, `scatter`), `x`, `y`, optional categorical `color`, and `title`. It works
+with ResponsesChat, BedrockChat, AGUIChat, and custom agents that execute the
+provided tool registry. It is not exposed through WebMCP. Rendering a chart
+needs no write approval and does not change dashboard filters. Registered
+write tools keep their existing approval and Undo behavior.
+
+Each card supports hover details, **Expand** (Escape closes it), **Download SVG**,
+and **View data** with the complete source table, loaded on demand in 50-row
+pages. Failed or stalled assets offer **Retry chart** and preserve source data;
+asset loads time out after 10 seconds and render attempts after 20 seconds.
+The browser retains the latest eight interactive charts, releasing older views
+and replacing them with a message inviting the viewer to recreate the chart. Charts are snapshots; subsequent dashboard changes do not
+rewrite old answers. The agent receives chart metadata in conversation history
+so it can reuse a dataset for follow-up chart requests. New data requires a new
+app read. Dataset IDs are session-local, limited to eight snapshots; evicted IDs
+return a safe error instructing the agent to read again. New chat and successful
+Undo clear dataset storage. Historical charts remain labeled snapshots after Undo.
+
+Datasets accept 1–2,000 rows, 1–16 explicitly typed fields, and at most 256 KiB
+of row JSON. Types are `nominal` (strings), `quantitative` (finite numbers), and
+`temporal` (ISO calendar dates or timestamps using `T`); values may be null.
+Zone-free timestamps are interpreted as UTC. Charts with no complete x/y points
+are rejected, as are duplicate timestamps representing the same instant.
+Integers must fit the browser safe range (±9,007,199,254,740,991). Preview rows
+are omitted as needed to keep model tool results within the existing 32 KiB limit. Rows must exactly match
+the declared fields. Aggregate larger datasets in app-owned code first. Chart
+requests allow four cards per answer and twelve color groups. Non-scatter charts
+require a single row per x value and group: the helper rejects ambiguous duplicate
+points rather than silently aggregating them. Line/area charts require a numeric
+or temporal x axis; scatter needs two numeric axes; y is always numeric. Bar/area
+series are not stacked. Choose meaningful units in field names and chart titles.
+Existing tool-call budgets and argument limits still apply.
+
+The renderer constructs a fixed Vega-Lite specification from validated options.
+Models cannot provide JavaScript, raw Vega specs, expressions, HTML, data URLs,
+external data sources, or renderer settings. Pinned Vega libraries ship with the
+package and load from the app's own asset path only when the first chart arrives;
+no CDN or external chart service is used. Dependencies use an isolated namespace
+and bypass host AMD/CommonJS loaders, preserving the app's own Vega libraries.
+The default Vega runtime needs a CSP that permits its expression compilation;
+when deployment CSP blocks rendering, source data remains available. The browser
+checks verify this fallback without changing the deployment's security policy.
+See `www/vendor/README.md` for versions and licenses. Without `charts=True`, existing tool behavior is retained; a
+`ChartData` result becomes ordinary JSON subject to the usual 32 KiB result limit.
+
+Chart verification:
+
+```sh
+# Real renderer, desktop/mobile, native/fallback, accessibility including contrast.
+# Run each engine: chromium (Chrome), firefox, webkit (Safari engine).
+SHINYHUB_E2E_BROWSER=chromium node scripts/agent-charts-browser-e2e.mjs
+
+# Opt-in, billable model acceptance with synthetic values only.
+# responses: OPENAI_API_KEY, SHINYHUB_AGENT_OPENAI_MODEL, optional SHINYHUB_AGENT_OPENAI_BASE_URL
+# openrouter: OPENROUTER_API_KEY, OPENROUTER_MODEL; use SHINYHUB_AGENT_LIVE_CHARTS=openrouter
+# bedrock: AWS credentials, AWS_REGION, SHINYHUB_AGENT_BEDROCK_MODEL
+# agui: SHINYHUB_AGENT_AGUI_URL, optional SHINYHUB_AGENT_AGUI_TOKEN
+SHINYHUB_AGENT_LIVE_CHARTS=responses pytest packaging/python-agent/tests/test_charts_live.py -q
+```
+
+The live probe checks data reads, chart creation, follow-up dataset reuse, and
+reset. Run it against the intended deployment model before rollout. AG-UI
+endpoints must themselves follow the chart tools supplied in each request.

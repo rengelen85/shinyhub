@@ -1069,6 +1069,7 @@
           typeof message.session !== "string") return;
       if (chatSession && chatSession !== message.session) {
         clearSuggestions();
+        if (window.shinyhubAgentCharts) window.shinyhubAgentCharts.dispose(log);
         log.replaceChildren(empty);
         finish("App session reconnected. Start a new question.");
       }
@@ -1100,6 +1101,7 @@
         answerSource = "";
         pendingTools = [];
         clearApproval();
+        if (window.shinyhubAgentCharts) window.shinyhubAgentCharts.dispose(log);
         log.replaceChildren(empty);
         announcer.textContent = "";
         lastApprovalCard = null;
@@ -1132,6 +1134,15 @@
       if (event.type === "status") setStatus(event.text);
       else if (event.type === "tool_started") showTool(event);
       else if (event.type === "tool_finished") finishTool(event);
+      else if (event.type === "chart") {
+        if (!activeAnswer || !window.shinyhubAgentCharts) return;
+        var chart = window.shinyhubAgentCharts.create(event.chart);
+        if (chart) {
+          var follow = nearBottom();
+          activeAnswer.parentNode.append(chart);
+          scrollAfterChange(follow);
+        }
+      }
       else if (event.type === "delta") {
         if (!activeAnswer || typeof event.text !== "string") return;
         answerSource += event.text;

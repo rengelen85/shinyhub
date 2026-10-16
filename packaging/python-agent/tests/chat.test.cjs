@@ -723,3 +723,22 @@ test("question limits count Unicode characters consistently with the server", (t
   send({ type: "done" });
   assert.equal(doc.querySelector(".sh-agent-followups button")?.textContent, question);
 });
+
+test("chart cards survive streamed Markdown and stale chart events are ignored", (t) => {
+  const { window, doc, send } = ask(t);
+  let disposed = 0;
+  window.shinyhubAgentCharts = {
+    create(chart) { const figure = doc.createElement('figure'); figure.className = 'sh-agent-chart'; figure.textContent = chart.title; return figure; },
+    dispose() { disposed++; }
+  };
+  send({ type: 'chart', chart: {title:'Sales by month'} });
+  send({ type: 'delta', text: '**Sales** rose.' });
+  send({ type: 'done' });
+  assert.equal(doc.querySelector('.sh-agent-chart').textContent, 'Sales by month');
+  assert.equal(doc.querySelector('.sh-agent-assistant strong:not(.sh-agent-speaker)').textContent,'Sales');
+  send({ type: 'chart', chart: {title:'Stale chart'} });
+  assert.equal(doc.querySelectorAll('.sh-agent-chart').length,1);
+  send({ type: 'reset' });
+  assert.equal(doc.querySelectorAll('.sh-agent-chart').length,0);
+  assert.equal(disposed,1);
+});

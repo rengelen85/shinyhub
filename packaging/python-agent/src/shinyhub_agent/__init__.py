@@ -2,6 +2,7 @@
 
 from ._agui import AGUIChat
 from ._bedrock import BedrockChat
+from ._charts import ChartData
 from ._chat import ChatAgent
 from ._core import AgentTool, ToolError, ToolRegistry
 from ._openai import OpenAIChat
@@ -16,6 +17,7 @@ __all__ = [
     "AGUIChat",
     "AgentTool",
     "BedrockChat",
+    "ChartData",
     "ChatAgent",
     "OpenAIChat",
     "ResponsesChat",
