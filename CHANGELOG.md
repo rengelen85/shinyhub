@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.21.1](https://github.com/rvben/shinyhub/compare/v0.21.0...v0.21.1) - 2026-10-16
+
+### Added
+
+- **agent**: add experimental opt-in inline charts ([eb86fca](https://github.com/rvben/shinyhub/commit/eb86fcaa41bf58355e87e7faf9e8c894d5ce0ea0))
+
+### Fixed
+
+- **autoscale**: retire warm-parked replicas while idle ([b35a337](https://github.com/rvben/shinyhub/commit/b35a337bd94a1e8d6d9b31024f9988a665408baf))
+- **dev**: hide internal runtime startup URLs ([cfe77ba](https://github.com/rvben/shinyhub/commit/cfe77ba180f342df001f856524c76317246bdff2))
+
 ## [0.21.0](https://github.com/rvben/shinyhub/compare/v0.20.9...v0.21.0) - 2026-10-15
 
 ### Added
