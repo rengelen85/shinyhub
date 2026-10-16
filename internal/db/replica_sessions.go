@@ -87,6 +87,18 @@ const NoFleetActivity = int64(math.MaxInt64)
 // on the database clock. If there are no fresh rows, NoFleetActivity is
 // returned so callers treat "no live peer data" as idle.
 func (s *Store) AppFleetLoad(appID int64, staleWindowSec int64, excludeInstanceID string) (active []int64, idleSinceSec int64, err error) {
+	return s.appFleetLoad(appID, staleWindowSec, excludeInstanceID, 0)
+}
+
+// AppFleetSessionCounts returns the autoscale signal. Unreported interior slots
+// are -1 (unknown), matching the local proxy, rather than zero (known idle).
+// Trailing unreported slots are omitted; no fresh reports returns an empty slice.
+func (s *Store) AppFleetSessionCounts(appID int64, staleWindowSec int64) ([]int64, error) {
+	counts, _, err := s.appFleetLoad(appID, staleWindowSec, "", -1)
+	return counts, err
+}
+
+func (s *Store) appFleetLoad(appID int64, staleWindowSec int64, excludeInstanceID string, missing int64) (active []int64, idleSinceSec int64, err error) {
 	dbNow := s.d.nowEpoch()
 	q := `
 		SELECT idx, SUM(active), ` + dbNow + ` - MAX(last_activity)
@@ -134,6 +146,9 @@ func (s *Store) AppFleetLoad(appID int64, staleWindowSec int64, excludeInstanceI
 
 	maxIdx := results[len(results)-1].idx
 	out := make([]int64, maxIdx+1)
+	for i := range out {
+		out[i] = missing
+	}
 	for _, r := range results {
 		out[r.idx] = r.sumActive
 	}

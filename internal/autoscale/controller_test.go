@@ -12,7 +12,15 @@ import (
 	"github.com/rvben/shinyhub/internal/proxy"
 )
 
-type fakeLister struct{ apps []*db.App }
+type fakeLister struct {
+	apps       []*db.App
+	replicas   []*db.Replica
+	replicaErr error
+}
+
+func (f *fakeLister) ListReplicas(_ int64) ([]*db.Replica, error) {
+	return f.replicas, f.replicaErr
+}
 
 func (f *fakeLister) ListAutoscaleApps() ([]*db.App, error) { return f.apps, nil }
 
@@ -27,8 +35,9 @@ func (f *fakeSignal) RejectsByReason(slug string, _ time.Duration) map[proxy.Rej
 }
 
 type fakeScaler struct {
-	ups   map[string]int
-	downs map[string]int
+	ups         map[string]int
+	downs       map[string]int
+	retirements int
 	// upNoOp / downNoOp make the primitive return (false, nil) - the benign
 	// no-op the real primitives return at a ceiling/floor or for a non-running
 	// app - so tests can assert the controller does not arm a cooldown on it.
@@ -52,6 +61,11 @@ func (f *fakeScaler) ScaleUp(slug string) (bool, error) {
 func (f *fakeScaler) ScaleDown(slug string, _ time.Duration) (bool, error) {
 	f.downs[slug]++
 	return !f.downNoOp, nil
+}
+
+func (f *fakeScaler) RetireWarmReplica(slug string, _ int) (bool, error) {
+	f.retirements++
+	return f.ScaleDown(slug, 0)
 }
 
 // fakeCooldownStore is an in-memory CooldownStore. When seeded over the lister's
@@ -581,4 +595,41 @@ func TestController_NoMetricWhenMetricsNotSet(t *testing.T) {
 	c := newTestController(lister, signal, scaler, &fakeAuditor{})
 	// No SetMetrics call.
 	c.reconcile(time.Now()) // must not panic
+}
+
+func TestController_WarmParkedScaleDown(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		counts   []int64
+		rows     []*db.Replica
+		err      error
+		wantDown bool
+	}{
+		{name: "local stopped", counts: []int64{0, -1}, rows: []*db.Replica{{Index: 1, Status: "stopped", DesiredState: db.ReplicaDesiredWarm}}, wantDown: true},
+		{name: "local suspended", counts: []int64{0, -1}, rows: []*db.Replica{{Index: 1, Status: "suspended", DesiredState: db.ReplicaDesiredWarm}}, wantDown: true},
+		{name: "fleet omitted trailing slot", counts: []int64{0}, rows: []*db.Replica{{Index: 1, Status: "stopped", DesiredState: db.ReplicaDesiredWarm}}, wantDown: true},
+		{name: "missing healthy slot", counts: []int64{-1, -1}, rows: []*db.Replica{{Index: 1, Status: "stopped", DesiredState: db.ReplicaDesiredWarm}}},
+		{name: "wrong index parked", counts: []int64{0}, rows: []*db.Replica{{Index: 2, Status: "stopped", DesiredState: db.ReplicaDesiredWarm}}},
+		{name: "manual stop", counts: []int64{0, -1}, rows: []*db.Replica{{Index: 1, Status: "stopped", DesiredState: "stopped"}}},
+		{name: "warm intent still running", counts: []int64{0, -1}, rows: []*db.Replica{{Index: 1, Status: "running", DesiredState: db.ReplicaDesiredWarm}}},
+		{name: "read failure", counts: []int64{0, -1}, err: errors.New("database unavailable")},
+		{name: "no signal", rows: []*db.Replica{{Index: 1, Status: "stopped", DesiredState: db.ReplicaDesiredWarm}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			lister := &fakeLister{apps: []*db.App{app("demo", 2, 1, 4)}, replicas: tt.rows, replicaErr: tt.err}
+			signal := &fakeSignal{counts: map[string][]int64{"demo": tt.counts}}
+			scaler := newFakeScaler()
+			c, cd := newTestControllerCD(lister, signal, scaler, &fakeAuditor{})
+			c.reconcile(time.Now())
+			if got := scaler.downs["demo"] > 0; got != tt.wantDown {
+				t.Fatalf("scale down = %v; want %v", got, tt.wantDown)
+			}
+			if got := scaler.retirements > 0; got != tt.wantDown {
+				t.Fatalf("warm retirement = %v; want %v", got, tt.wantDown)
+			}
+			if got := cd.writes > 0; got != tt.wantDown {
+				t.Fatalf("cooldown armed = %v; want %v", got, tt.wantDown)
+			}
+		})
+	}
 }

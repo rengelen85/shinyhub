@@ -16,9 +16,10 @@ import (
 	"github.com/rvben/shinyhub/internal/proxy"
 )
 
-// Lister returns the apps that have opted into autoscaling and are actionable.
+// Lister returns actionable autoscale apps and their replica lifecycle intent.
 type Lister interface {
 	ListAutoscaleApps() ([]*db.App, error)
+	ListReplicas(appID int64) ([]*db.Replica, error)
 }
 
 // Signal is the proxy-level saturation signal: per-replica active session
@@ -29,11 +30,15 @@ type Signal interface {
 }
 
 // Scaler drives the incremental scale primitives. ScaleUp grows the pool by one
-// replica; ScaleDown gracefully removes one. Both return (false, nil) for the
-// benign no-op cases (ceiling reached, floor reached, app not running).
+// replica; ScaleDown gracefully removes one, and RetireWarmReplica removes a
+// still-parked trailing slot. They return (false, nil) for benign no-op cases
+// (ceiling/floor reached, app not running, retirement decision invalidated).
 type Scaler interface {
 	ScaleUp(slug string) (bool, error)
 	ScaleDown(slug string, grace time.Duration) (bool, error)
+	// RetireWarmReplica rechecks the expected count and parked victim under the
+	// scale lock; it must not remove a replica that has since been expanded.
+	RetireWarmReplica(slug string, expectedReplicas int) (bool, error)
 }
 
 // Config holds the controller's resolved runtime settings.
@@ -163,7 +168,7 @@ func (c *Controller) reconcileApp(a *db.App, now time.Time) {
 		return
 	}
 	// A nil slot (-1) or fewer registered slots than the desired count means the
-	// pool is degraded and the self-healer is restoring it. Track this so we can
+	// pool may be degraded, or intentionally warm-parked. Track this so we can
 	// withhold scale-down: ScaleDown removes the highest index and could stop the
 	// last healthy replica before the missing slot heals.
 	poolDegraded := len(counts) < a.Replicas
@@ -190,9 +195,9 @@ func (c *Controller) reconcileApp(a *db.App, now time.Time) {
 		activeSessions: total,
 		// a.Replicas is a best-effort snapshot from the list query and is not
 		// held under the per-slug scale lock. The scale primitives re-read the
-		// live count under that lock and no-op when it already matches, so a
-		// single decision can never be double-applied even if this snapshot is
-		// momentarily stale against a concurrent API-driven scale.
+		// live count under that lock and re-enforce floors and ceilings. Warm
+		// retirement also checks the expected count and the victim's warm state
+		// so a concurrent resize or expansion invalidates that decision.
 		current:    a.Replicas,
 		cap:        sessionCap,
 		target:     target,
@@ -234,13 +239,20 @@ func (c *Controller) reconcileApp(a *db.App, now time.Time) {
 	} else {
 		// Never remove capacity from a degraded pool: defer to the self-healer,
 		// which is restoring the missing slot, and let autoscale resume scaling
-		// down only once the pool reports a full, healthy set.
-		if poolDegraded {
+		// down only once the pool reports a full, healthy set. Warm-parked
+		// slots are intentionally absent and can be retired without waking them.
+		if poolDegraded && !c.missingSlotsAreWarm(a, counts) {
 			return
 		}
 		// Scale down conservatively: one replica per tick, so a graceful drain
 		// completes and the signal is re-measured before removing the next.
-		ok, err := c.scaler.ScaleDown(a.Slug, c.cfg.DrainGrace)
+		var ok bool
+		var err error
+		if poolDegraded {
+			ok, err = c.scaler.RetireWarmReplica(a.Slug, a.Replicas)
+		} else {
+			ok, err = c.scaler.ScaleDown(a.Slug, c.cfg.DrainGrace)
+		}
 		if err != nil {
 			c.log.Error("autoscale: scale down", "slug", a.Slug, "err", err)
 			return
@@ -280,6 +292,39 @@ func (c *Controller) reconcileApp(a *db.App, now time.Time) {
 			c.metrics.RecordAutoscaleScale(dir)
 		}
 	}
+}
+
+// missingSlotsAreWarm distinguishes intentional parking from missing capacity.
+// Only stopped/suspended rows with warm intent excuse an absent signal; warm
+// intent alone cannot hide an in-progress or failed lifecycle transition.
+func (c *Controller) missingSlotsAreWarm(a *db.App, counts []int64) bool {
+	rows, err := c.lister.ListReplicas(a.ID)
+	if err != nil {
+		c.log.Warn("autoscale: read warm replica state", "slug", a.Slug, "err", err)
+		return false
+	}
+	return PoolReadyForScaleDown(counts, a.Replicas, rows)
+}
+
+// PoolReadyForScaleDown requires a usable signal for every desired slot, except
+// replicas confirmed stopped or suspended with warm intent. Callers must recheck
+// under the scale lock before retiring a parked replica.
+func PoolReadyForScaleDown(counts []int64, replicas int, rows []*db.Replica) bool {
+	if len(counts) == 0 {
+		return false
+	}
+	parked := make(map[int]bool, len(rows))
+	for _, r := range rows {
+		if r.DesiredState == db.ReplicaDesiredWarm && (r.Status == "stopped" || r.Status == "suspended") {
+			parked[r.Index] = true
+		}
+	}
+	for i := 0; i < max(replicas, len(counts)); i++ {
+		if (i >= len(counts) || counts[i] < 0) && !parked[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // scaleUp jumps toward the desired count in one tick, since adding capacity

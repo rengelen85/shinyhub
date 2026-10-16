@@ -10,10 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rvben/shinyhub/internal/autoscale"
 	"github.com/rvben/shinyhub/internal/config"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/deploy"
 	"github.com/rvben/shinyhub/internal/process"
+	"github.com/rvben/shinyhub/internal/proxy"
 )
 
 // recordingRuntime wraps any Runtime and records the PID of every SIGTERM
@@ -794,5 +796,83 @@ func TestWarmExpand_HoldsDeployLock(t *testing.T) {
 		t.Error("TryLock failed after WarmExpand completed; lock was not released")
 	} else {
 		mu.Unlock()
+	}
+}
+
+// A shrink between autoscale ticks must not strand configured capacity until
+// the next visit. Exercise the real controller, store, shrink, and expand paths.
+func TestWarmShrink_AutoscaleRetiresParkedReplicasBeforeExpand(t *testing.T) {
+	for _, clustered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("clustered=%v", clustered), func(t *testing.T) {
+			srv, app, rt := newWarmExpandServer(t, "demo", 3, nil, nil)
+			if err := srv.store.SetAppAutoscale(db.SetAppAutoscaleParams{
+				AppID: app.ID, Enabled: true, MinReplicas: 1, MaxReplicas: 4, Target: 0.6,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := srv.store.UpdateAppMinWarmReplicas(app.ID, 1); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 3; i++ {
+				if err := srv.proxy.RegisterReplica("demo", i, fmt.Sprintf("http://127.0.0.1:%d", 9000+i), nil, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if changed, err := srv.WarmShrink("demo", 1, time.Millisecond); err != nil || !changed {
+				t.Fatalf("WarmShrink = %v, %v; want true, nil", changed, err)
+			}
+			stored, err := srv.store.GetAppBySlug("demo")
+			if err != nil || stored.Replicas != 3 {
+				t.Fatalf("after parking: app = %+v, err = %v; want 3 configured replicas", stored, err)
+			}
+
+			var signal autoscale.Signal = srv.proxy
+			if clustered {
+				srv.SetCluster("owner")
+				srv.proxy.SetPoolAppID("demo", app.ID)
+				if err := srv.store.UpsertReplicaSessions("owner", []db.ReplicaSessionRow{{AppID: app.ID, Idx: 0, Active: 0}}); err != nil {
+					t.Fatal(err)
+				}
+				signal = proxy.NewFleetSignal(srv.proxy, srv.store, nil)
+			}
+			controller := autoscale.New(autoscale.Config{
+				ScanInterval: time.Millisecond, DrainGrace: time.Millisecond,
+				DefaultCap: 75, DefaultTarget: 0.6, RuntimeMax: 4,
+			}, srv.store, signal, srv, srv.store, srv.store, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				controller.Run(ctx)
+			}()
+			defer func() { cancel(); <-done }()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				stored, err = srv.store.GetAppBySlug("demo")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if stored.Replicas == 1 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("autoscale left %d configured replicas after warm shrink; want 1", stored.Replicas)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+			<-done
+
+			rows, err := srv.store.ListReplicas(app.ID)
+			if err != nil || len(rows) != 1 || rows[0].Index != 0 || rows[0].Status != "running" {
+				t.Fatalf("after retirement: rows = %+v, err = %v; want only running slot 0", rows, err)
+			}
+			if changed, err := srv.WarmExpand("demo"); err != nil || changed {
+				t.Fatalf("WarmExpand = %v, %v; want false, nil after autoscale retirement", changed, err)
+			}
+			if booted := rt.boosted(); len(booted) != 0 {
+				t.Fatalf("booted %v; parked replicas should have been retired without starting", booted)
+			}
+		})
 	}
 }

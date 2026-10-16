@@ -8,7 +8,7 @@ import (
 // fleetStore is the subset of *db.Store that FleetSignal needs.
 // A narrow interface keeps FleetSignal unit-testable without a real database.
 type fleetStore interface {
-	AppFleetLoad(appID int64, staleWindowSec int64, excludeInstanceID string) (active []int64, idleSinceSec int64, err error)
+	AppFleetSessionCounts(appID int64, staleWindowSec int64) ([]int64, error)
 }
 
 // FleetSignal is an autoscale.Signal adapter that overrides ReplicaSessionCounts
@@ -36,7 +36,8 @@ func NewFleetSignal(prx *Proxy, store fleetStore, log *slog.Logger) *FleetSignal
 }
 
 // ReplicaSessionCounts returns the per-index fleet-wide sum of active
-// sessions for slug from the replica_sessions table.
+// sessions for slug from the replica_sessions table. Unreported interior slots
+// return -1 so the controller can distinguish unknown capacity from idle capacity.
 //
 // It resolves slug's numeric app ID from the proxy pool. If the pool is not
 // registered or has no app ID set, or if no non-stale rows exist, it returns
@@ -48,12 +49,12 @@ func (f *FleetSignal) ReplicaSessionCounts(slug string) []int64 {
 		return nil
 	}
 	staleWindowSec := int64(ReplicaSessionStaleCutoff.Seconds())
-	active, _, err := f.store.AppFleetLoad(appID, staleWindowSec, "")
+	active, err := f.store.AppFleetSessionCounts(appID, staleWindowSec)
 	if err != nil {
 		// DB errors are transient; treat as no signal (no action) rather than
 		// crashing or mis-scaling. Log at warn so a persistent failure is
 		// visible to operators without flooding normal operation logs.
-		f.log.Warn("fleet session signal: AppFleetLoad failed", "slug", slug, "err", err)
+		f.log.Warn("fleet session signal: AppFleetSessionCounts failed", "slug", slug, "err", err)
 		return nil
 	}
 	return active

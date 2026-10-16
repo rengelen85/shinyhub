@@ -120,7 +120,7 @@ func TestFleetSignal_StaleRows(t *testing.T) {
 
 	counts := sig.ReplicaSessionCounts("fs-stale-app")
 
-	// AppFleetLoad returns an empty (non-nil, zero-length) slice when no rows
+	// AppFleetSessionCounts returns an empty slice when no rows
 	// pass the staleness filter. ReplicaSessionCounts must return it as-is:
 	// len==0 triggers the autoscaler's existing early-return (no action).
 	if len(counts) != 0 {
@@ -161,17 +161,17 @@ func TestFleetSignal_UnsetAppID(t *testing.T) {
 	}
 }
 
-// errFleetStore is a stub fleetStore whose AppFleetLoad always returns an error.
+// errFleetStore is a stub whose AppFleetSessionCounts always returns an error.
 // Used to assert the DB-error path: ReplicaSessionCounts must return len==0
 // (autoscaler holds) and must not panic.
 type errFleetStore struct{ err error }
 
-func (e *errFleetStore) AppFleetLoad(_ int64, _ int64, _ string) (active []int64, idleSinceSec int64, err error) {
-	return nil, 0, e.err
+func (e *errFleetStore) AppFleetSessionCounts(_ int64, _ int64) ([]int64, error) {
+	return nil, e.err
 }
 
 // TestFleetSignal_DBErrorReturnsEmpty verifies that a transient DB failure in
-// AppFleetLoad causes ReplicaSessionCounts to return an empty/nil slice
+// AppFleetSessionCounts causes ReplicaSessionCounts to return an empty/nil slice
 // (autoscaler holds, no panic) rather than crashing or mis-scaling.
 func TestFleetSignal_DBErrorReturnsEmpty(t *testing.T) {
 	p := proxy.New()
@@ -187,3 +187,40 @@ func TestFleetSignal_DBErrorReturnsEmpty(t *testing.T) {
 }
 
 var _ autoscale.Signal = (*proxy.FleetSignal)(nil)
+
+func TestFleetSignal_UnreportedInteriorSlotIsUnknown(t *testing.T) {
+	s := dbtest.New(t)
+	owner := mustCreateUserFleet(t, s, "sparse-owner", "developer")
+	app := mustCreateAppFleet(t, s, "sparse-app", owner.ID)
+	if err := s.UpsertReplicaSessions("instance-A", []db.ReplicaSessionRow{
+		{AppID: app.ID, Idx: 0, Active: 0},
+		{AppID: app.ID, Idx: 2, Active: 3},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := proxy.New()
+	p.SetPoolAppID(app.Slug, app.ID)
+	counts := proxy.NewFleetSignal(p, s, nil).ReplicaSessionCounts(app.Slug)
+	if len(counts) != 3 || counts[0] != 0 || counts[1] != -1 || counts[2] != 3 {
+		t.Fatalf("fleet signal=%v; want [0 -1 3]", counts)
+	}
+	// Lifecycle aggregation retains its zero-filled contract.
+	load, _, err := s.AppFleetLoad(app.ID, 15, "")
+	if err != nil || len(load) != 3 || load[1] != 0 {
+		t.Fatalf("lifecycle load=%v err=%v", load, err)
+	}
+	if err := s.UpsertReplicaSessions("instance-B", []db.ReplicaSessionRow{{AppID: app.ID, Idx: 1, Active: 0}}); err != nil {
+		t.Fatal(err)
+	}
+	counts = proxy.NewFleetSignal(p, s, nil).ReplicaSessionCounts(app.Slug)
+	if counts[1] != 0 {
+		t.Fatalf("reported idle slot=%d; want 0", counts[1])
+	}
+	if _, err := s.DB().Exec(`UPDATE replica_sessions SET updated_at = updated_at - 1000 WHERE idx = 1`); err != nil {
+		t.Fatal(err)
+	}
+	counts = proxy.NewFleetSignal(p, s, nil).ReplicaSessionCounts(app.Slug)
+	if counts[1] != -1 {
+		t.Fatalf("stale interior slot=%d; want -1", counts[1])
+	}
+}

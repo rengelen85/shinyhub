@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/rvben/shinyhub/internal/autoscale"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/deploy"
 	"github.com/rvben/shinyhub/internal/process"
@@ -277,6 +278,19 @@ func (s *Server) scaleUpLocked(app *db.App, persistSize bool) (bool, error) {
 // lock. When grace elapses with sessions still active the replica is stopped
 // anyway: the operation is deadline-bounded so the controller never stalls.
 func (s *Server) ScaleDown(slug string, grace time.Duration) (bool, error) {
+	return s.scaleDown(slug, grace, 0)
+}
+
+// RetireWarmReplica is the autoscaler's parked-capacity path. A concurrent
+// expansion or resize invalidates the decision instead of removing live capacity.
+func (s *Server) RetireWarmReplica(slug string, expectedReplicas int) (bool, error) {
+	if expectedReplicas < 1 {
+		return false, nil
+	}
+	return s.scaleDown(slug, 0, expectedReplicas)
+}
+
+func (s *Server) scaleDown(slug string, grace time.Duration, expectedWarm int) (bool, error) {
 	release := s.acquireDeployLock(slug)
 	defer release()
 	if s.isRedeployInFlight(slug) {
@@ -319,13 +333,43 @@ func (s *Server) ScaleDown(slug string, grace time.Duration) (bool, error) {
 	if !s.replicaRowsMatchTarget(app, rows) {
 		return false, nil
 	}
-	return s.scaleDownLocked(app, grace, true)
+	if expectedWarm > 0 {
+		if !app.AutoscaleEnabled || app.Replicas != expectedWarm {
+			return false, nil
+		}
+		parkedVictim := false
+		for _, row := range rows {
+			if row.Index == app.Replicas-1 && row.DesiredState == db.ReplicaDesiredWarm && (row.Status == "stopped" || row.Status == "suspended") {
+				parkedVictim = true
+			}
+		}
+		if !parkedVictim || s.proxy == nil {
+			return false, nil
+		}
+		counts := s.proxy.ReplicaSessionCounts(slug)
+		if s.clustered {
+			counts, err = s.store.AppFleetSessionCounts(app.ID, int64(proxy.ReplicaSessionStaleCutoff.Seconds()))
+			if err != nil {
+				return false, err
+			}
+		}
+		if !autoscale.PoolReadyForScaleDown(counts, app.Replicas, rows) {
+			return false, nil
+		}
+	}
+	return s.scaleDownLocked(app, rows, grace, true)
 }
 
 // scaleDownLocked drains only the trailing slot with the operation lock held.
-func (s *Server) scaleDownLocked(app *db.App, grace time.Duration, persistSize bool) (bool, error) {
+func (s *Server) scaleDownLocked(app *db.App, rows []*db.Replica, grace time.Duration, persistSize bool) (bool, error) {
 	slug := app.Slug
 	victim := app.Replicas - 1
+	originalDesired := "running"
+	for _, row := range rows {
+		if row.Index == victim && row.DesiredState == db.ReplicaDesiredWarm {
+			originalDesired = db.ReplicaDesiredWarm
+		}
+	}
 
 	if s.proxy != nil {
 		s.proxy.DrainReplica(slug, victim)
@@ -352,13 +396,13 @@ func (s *Server) scaleDownLocked(app *db.App, grace time.Duration, persistSize b
 				// remote worker rejected the SIGTERM). Shrinking the proxy and
 				// deleting the row now would orphan a live replica while the
 				// control plane believes capacity was removed. Roll back both the
-				// local drain mark and, in clustered mode, the desired_state row
-				// so the still-running replica resumes full service everywhere.
+				// local drain mark and the original desired_state. Preserve warm
+				// intent so a failed parked retirement does not invite a restart.
 				if s.proxy != nil {
 					s.proxy.UndrainReplica(slug, victim)
 				}
-				if rerr := s.store.SetReplicaDesiredState(app.ID, victim, "running"); rerr != nil {
-					slog.Warn("scale down: revert desired_state running", "slug", slug, "index", victim, "err", rerr)
+				if rerr := s.store.SetReplicaDesiredState(app.ID, victim, originalDesired); rerr != nil {
+					slog.Warn("scale down: revert desired_state", "slug", slug, "index", victim, "err", rerr)
 				}
 				return false, fmt.Errorf("scale down %s: stop replica %d: %w", slug, victim, err)
 			}
@@ -487,7 +531,7 @@ func (s *Server) resizeAppLocked(slug string) (outcome, reason string, err error
 		if actual < target {
 			changed, err = s.scaleUpLocked(app, false)
 		} else {
-			changed, err = s.scaleDownLocked(app, grace, false)
+			changed, err = s.scaleDownLocked(app, rows, grace, false)
 		}
 		if err != nil {
 			return "", "", err
