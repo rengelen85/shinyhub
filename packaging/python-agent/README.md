@@ -728,3 +728,26 @@ SHINYHUB_AGENT_LIVE_CHARTS=responses pytest packaging/python-agent/tests/test_ch
 The live probe checks data reads, chart creation, follow-up dataset reuse, and
 reset. Run it against the intended deployment model before rollout. AG-UI
 endpoints must themselves follow the chart tools supplied in each request.
+## Releasing this package
+
+Use a vership build with independent project support. The repository root
+registers `agent`; its configuration lives beside this package's `pyproject.toml`.
+From the repository root:
+
+```sh
+vership --project agent status
+vership --project agent changelog patch
+vership --project agent bump patch --dry-run
+vership --project agent bump patch --prepare
+```
+
+Review the prepared commit and authorize publication before running
+`vership --project agent release`. Wait for the `publish shinyhub-agent` workflow
+to finish, then run `vership --project agent verify`. This checks the
+`shinyhub-agent-v<version>` tag and the `shinyhub-agent` PyPI distribution.
+
+The manifest and `shinyhub_agent.__version__` move together. This release does
+not bump the ShinyHub server or its companion packages. If HEAD changes after
+preparation, review the new content and run
+`vership --project agent release --prepare` to refresh the same version before
+releasing; do not bump it again.

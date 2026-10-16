@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.4.2](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.4.1...shinyhub-agent-v0.4.2) - 2026-10-16
+
+### Added
+
+- Experimental inline charts, enabled explicitly with `register(..., charts=True)`.
+  App-owned read tools return validated `ChartData`; the agent can create bar,
+  line, area and scatter charts and reuse session-local datasets for follow-ups.
+- Interactive chart cards with hover details, expansion, SVG download and paged
+  source data. Pinned chart libraries and licenses ship in the package and load
+  from the app only when needed.
+- Bounded datasets, fixed renderer specifications, safe failure and retry behavior,
+  session isolation and reset handling. Existing write approvals remain in force.
+- Independent agent releases through `vership --project agent`, with package-local
+  version files, changelog, checks, tag namespace and PyPI verification.
+
+Charts remain disabled by default. Deployments must permit the renderer's CSP
+requirements; source data remains available when rendering is blocked. Validate
+model tool behavior against the intended deployment before enabling charts.
+
+- **agent**: add experimental opt-in inline charts ([eb86fca](https://github.com/rvben/shinyhub/commit/eb86fcaa41bf58355e87e7faf9e8c894d5ce0ea0))
+
 ## 0.4.1 — 2026-10-16
 
 - Recover answers when Bedrock or Responses-compatible models return only
