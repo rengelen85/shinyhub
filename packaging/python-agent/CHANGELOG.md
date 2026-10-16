@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 — 2026-10-16
+
+- Add optional app-defined starter questions through `register(..., starters=...)`.
+  Keep the built-in questions by default, or hide them with an empty list.
+- Add experimental, opt-in follow-up suggestions through
+  `register(..., followups=1..3)` for Bedrock and Responses-compatible adapters.
+  Suggestions fill the composer for editing and require an explicit send.
+- Validate and isolate suggestions per session, show them only after successful
+  answers, and preserve app-tool budgets, write approvals, and usage attribution.
+  Add deterministic protocol, browser, and opt-in real-model compatibility tests.
+- Raise minimum dependencies to `jsonschema>=4.26`, `httpx>=0.28`, and optional
+  `boto3>=1.43`. Existing apps can leave follow-ups disabled (the default).
+
 ## 0.3.0 — 2026-10-15
 
 - Export `ResponsesChat` as a protocol-oriented name for `OpenAIChat`, preserving

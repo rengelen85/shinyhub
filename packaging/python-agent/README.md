@@ -1,6 +1,6 @@
 # ShinyHub agent tools for Python Shiny
 
-`0.3.0` is a regular release of the session-scoped Python helper. The API is
+`0.4.0` is a regular release of the session-scoped Python helper. The API is
 still below `1.0`; pin the package and review migration notes before upgrading.
 Browser WebMCP availability depends on the browser. The app remains responsible
 for tool permissions and for checking consequential results.

@@ -28,7 +28,7 @@ def agent_dependency():
 
     return HTMLDependency(
         "shinyhub-agent",
-        "0.3.0",
+        "0.4.0",
         source={"package": "shinyhub_agent", "subdir": "www"},
         script={"src": "bridge.js", "defer": "defer"},
         stylesheet={"href": "bridge.css"},
@@ -41,7 +41,7 @@ def chat_dependency():
 
     return HTMLDependency(
         "shinyhub-agent-chat",
-        "0.3.0",
+        "0.4.0",
         source={"package": "shinyhub_agent", "subdir": "www"},
         script={"src": "chat.js", "defer": "defer"},
         stylesheet={"href": "chat.css"},
