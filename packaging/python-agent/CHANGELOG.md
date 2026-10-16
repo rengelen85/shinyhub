@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — 2026-10-16
+
+- Recover answers when Bedrock or Responses-compatible models return only
+  follow-up suggestions, using at most one additional model request. Preserve
+  native tool-result transcripts, validate metadata before replay, and never
+  execute app tools during recovery.
+- Show saved suggestions only after a complete, nonempty answer. Preserve the
+  existing one-request path for answers that already include suggestions, and
+  keep cancellation, error, and expired-approval suppression intact.
+- Add recovery and lifecycle regression coverage and correct the opt-in
+  compatibility probes' usage outcome and request-count checks.
+
 ## 0.4.0 — 2026-10-16
 
 - Add optional app-defined starter questions through `register(..., starters=...)`.

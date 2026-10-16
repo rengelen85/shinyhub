@@ -11,7 +11,7 @@ from ._usage import UsageRecord
 # Protocol-oriented public name; retain the original class identity and API.
 ResponsesChat = OpenAIChat
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 __all__ = [
     "AGUIChat",
     "AgentTool",
