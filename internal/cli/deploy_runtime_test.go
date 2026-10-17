@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,15 +41,18 @@ func TestServerRuntimeAvailable(t *testing.T) {
 		_, _ = w.Write([]byte(`{"version":"dev","runtimes":{"python":true,"r":false}}`))
 	}))
 	defer srv.Close()
-	cfg := &cliConfig{Host: srv.URL}
+	info, err := readServerInfo(context.Background(), &cliConfig{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	if avail, known := serverRuntimeAvailable(cfg, "r"); !known || avail {
+	if avail, known := info.runtimeAvailable("r"); !known || avail {
 		t.Errorf("r: got (avail=%v, known=%v), want (false, true)", avail, known)
 	}
-	if avail, known := serverRuntimeAvailable(cfg, "python"); !known || !avail {
+	if avail, known := info.runtimeAvailable("python"); !known || !avail {
 		t.Errorf("python: got (avail=%v, known=%v), want (true, true)", avail, known)
 	}
-	if _, known := serverRuntimeAvailable(cfg, "go"); known {
+	if _, known := info.runtimeAvailable("go"); known {
 		t.Errorf("go: unknown runtime should report known=false")
 	}
 
@@ -57,7 +61,11 @@ func TestServerRuntimeAvailable(t *testing.T) {
 		_, _ = w.Write([]byte(`{"version":"dev"}`))
 	}))
 	defer old.Close()
-	if _, known := serverRuntimeAvailable(&cliConfig{Host: old.URL}, "r"); known {
+	info, err = readServerInfo(context.Background(), &cliConfig{Host: old.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, known := info.runtimeAvailable("r"); known {
 		t.Errorf("server without runtimes should report known=false")
 	}
 }

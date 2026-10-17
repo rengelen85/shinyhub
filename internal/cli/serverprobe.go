@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,8 +59,27 @@ func (e *serverNotReadyError) Error() string {
 //   - a genuine transport failure (DNS, refused connection, TLS): the raw
 //     error, unwrapped, so the caller keeps treating it as transport/auth.
 func probeServer(cfg *cliConfig) (serverInfo, error) {
+	info, err := readServerInfo(context.Background(), cfg)
+	return requireServerInfo(cfg, info, err)
+}
+
+// requireServerInfo applies the shinyhub signature check capability gates require.
+func requireServerInfo(cfg *cliConfig, info serverInfo, err error) (serverInfo, error) {
+	if err != nil {
+		return info, err
+	}
+	if !info.looksLikeShinyhub() {
+		return serverInfo{}, &serverNotReadyError{host: cfg.Host, detail: "/api/server-info did not return a shinyhub response"}
+	}
+	return info, nil
+}
+
+// readServerInfo performs the unauthenticated GET and parses any 200 response
+// without requiring a shinyhub signature. Runtime warnings accept legacy
+// runtimes-only responses; capability checks additionally use requireServerInfo.
+func readServerInfo(ctx context.Context, cfg *cliConfig) (serverInfo, error) {
 	var info serverInfo
-	req, err := http.NewRequest("GET", cfg.Host+"/api/server-info", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", cfg.Host+"/api/server-info", nil)
 	if err != nil {
 		return info, err
 	}
@@ -68,6 +88,8 @@ func probeServer(cfg *cliConfig) (serverInfo, error) {
 		return info, err
 	}
 	defer resp.Body.Close()
+	// Preserve legacy handling: classify the received JSON even if the body
+	// ended early, rather than turning a reachable host into a transport error.
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return info, &serverNotReadyError{
@@ -76,13 +98,35 @@ func probeServer(cfg *cliConfig) (serverInfo, error) {
 			status: resp.StatusCode,
 		}
 	}
-	if err := json.Unmarshal(body, &info); err != nil || !info.looksLikeShinyhub() {
+	if err := json.Unmarshal(body, &info); err != nil {
 		return serverInfo{}, &serverNotReadyError{
 			host:   cfg.Host,
 			detail: "/api/server-info did not return a shinyhub response",
 		}
 	}
 	return info, nil
+}
+
+// serverInfoProbe overlaps one read-only request with bundle preparation.
+// Closing done publishes the result to subsequent checks in the same deploy.
+type serverInfoProbe struct {
+	done chan struct{}
+	info serverInfo
+	err  error
+}
+
+func prefetchServerInfo(ctx context.Context, cfg *cliConfig) *serverInfoProbe {
+	p := &serverInfoProbe{done: make(chan struct{})}
+	go func() {
+		p.info, p.err = readServerInfo(ctx, cfg)
+		close(p.done)
+	}()
+	return p
+}
+
+func (p *serverInfoProbe) wait() (serverInfo, error) {
+	<-p.done
+	return p.info, p.err
 }
 
 // serverReadinessProblem probes the server and returns a *serverNotReadyError

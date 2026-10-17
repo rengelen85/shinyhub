@@ -1,13 +1,11 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -102,25 +100,12 @@ func deployAppBundleFromSpecWithDowntime(cfg *cliConfig, slug string, spec bundl
 	}
 
 	updateFleetProgress(out, "Deploying bundle", summary, time.Time{}, false)
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("bundle", "bundle.zip")
-	if err != nil {
-		return "", false, nil, deployfail.ZipError, err
-	}
-	if _, err := io.Copy(part, buf); err != nil {
-		return "", false, nil, deployfail.ZipError, err
-	}
-	if err := writer.Close(); err != nil {
-		return "", false, nil, deployfail.ZipError, err
-	}
-	req, err := http.NewRequest("POST", cfg.Host+"/api/apps/"+slug+"/deploy", &body)
+	req, err := newBundleUploadRequest(context.Background(), cfg.Host+"/api/apps/"+slug+"/deploy", buf.Bytes())
 	if err != nil {
 		// A malformed URL/method, not a packaging failure.
 		return "", false, nil, deployfail.Unknown, err
 	}
 	req.Header.Set("Authorization", authHeader(cfg.Token))
-	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Accept", deployevent.MediaType)
 	if allowDowntime {
 		req.Header.Set("X-ShinyHub-Allow-Downtime", "1")

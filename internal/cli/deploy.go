@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
@@ -262,6 +261,24 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 	}
 	errW := cmd.ErrOrStderr()
 	stdOut := cmd.OutOrStdout()
+	// Read enough policy to start a needed GET while the local ZIP is built.
+	// Leave bundle validation/error reporting ahead of server validation.
+	manifest, manifestErr := loadFleetSourceManifest(abs)
+	needsEnvCaps := manifest != nil && (len(manifest.App.Env) > 0 || manifest.Sparse)
+	needsProducerCaps := manifestUsesProducerInputs(manifest)
+	isRApp := looksLikeRApp(abs)
+	// An unchanged watch bundle returns before runtime warnings. Keep those
+	// checks lazy so unchanged R apps do not generate speculative traffic.
+	prefetchRuntime := isRApp && !f.watchMode
+	var serverProbe *serverInfoProbe
+	if needsEnvCaps || needsProducerCaps || prefetchRuntime {
+		ctx, cancel := context.WithCancel(cmd.Context())
+		serverProbe = prefetchServerInfo(ctx, cfg)
+		defer func() {
+			cancel()
+			serverProbe.wait()
+		}()
+	}
 
 	if !quietFlag && format != formatNDJSON {
 		fmt.Fprintf(errW, "Bundling %s...\n", abs)
@@ -282,12 +299,12 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 		}
 		return err
 	}
-	manifest, err := loadFleetSourceManifest(abs)
-	if err != nil {
-		return err
+	if manifestErr != nil {
+		return manifestErr
 	}
-	if manifest != nil && (len(manifest.App.Env) > 0 || manifest.Sparse) {
-		info, err := probeServer(cfg)
+	if needsEnvCaps {
+		info, err := serverProbe.wait()
+		info, err = requireServerInfo(cfg, info, err)
 		if err != nil {
 			return fmt.Errorf("verify bundle env support: %w", err)
 		}
@@ -295,8 +312,9 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 			return validationErr("server does not support versioned bundle env; no deployment was requested", "Upgrade to a server advertising bundle_env.")
 		}
 	}
-	if manifestUsesProducerInputs(manifest) {
-		info, err := probeServer(cfg)
+	if needsProducerCaps {
+		info, err := serverProbe.wait()
+		info, err = requireServerInfo(cfg, info, err)
 		if err != nil {
 			return fmt.Errorf("verify producer input scope support: %w", err)
 		}
@@ -339,8 +357,15 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 	// Best-effort pre-flight: an R bundle on a server with no R runtime will
 	// fail server-side. Warn early so the developer knows it is a host setup
 	// issue, not their bundle. Silent when the server is older or unreachable.
-	if looksLikeRApp(abs) {
-		if available, known := serverRuntimeAvailable(cfg, "r"); known && !available {
+	if isRApp {
+		var info serverInfo
+		var probeErr error
+		if prefetchRuntime {
+			info, probeErr = serverProbe.wait()
+		} else {
+			info, probeErr = readServerInfo(cmd.Context(), cfg)
+		}
+		if available, known := info.runtimeAvailable("r"); probeErr == nil && known && !available {
 			fmt.Fprintln(errW, "Warning: this looks like an R app, but the server reports no R runtime (Rscript). "+
 				"The deploy will likely fail - ask your administrator to install R or use a container runtime.")
 		}
@@ -364,25 +389,11 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 	if format != formatNDJSON && !quietFlag {
 		deploying = newProgress(errW, fmt.Sprintf("Uploading and deploying %s to %s...", slug, cfg.Host))
 	}
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("bundle", "bundle.zip")
-	if err != nil {
-		return fmt.Errorf("build upload: %w", err)
-	}
-	if _, err := io.Copy(part, bundleBuf); err != nil {
-		return fmt.Errorf("build upload: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("build upload: %w", err)
-	}
-	uploadBytes := int64(body.Len())
-
 	deployURL := cfg.Host + "/api/apps/" + slug + "/deploy"
 	if f.start {
 		deployURL += "?start=true"
 	}
-	req, err := http.NewRequestWithContext(cmd.Context(), "POST", deployURL, &body)
+	req, err := newBundleUploadRequest(cmd.Context(), deployURL, bundleBuf.Bytes())
 	if err != nil {
 		if deploying != nil {
 			deploying.stop()
@@ -390,7 +401,6 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", authHeader(cfg.Token))
-	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Accept", deployevent.MediaType)
 	if f.allowDowntime {
 		req.Header.Set("X-ShinyHub-Allow-Downtime", "1")
@@ -409,7 +419,7 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 	// Use the untimed client to match the SSE logs command.
 	if format == formatNDJSON {
 		upload := deployevent.Phase("upload", deployevent.StatusStarted, "Uploading and validating bundle")
-		upload.Bytes = uploadBytes
+		upload.Bytes = req.ContentLength
 		if err := writeDeployEvent(stdOut, upload); err != nil {
 			return err
 		}
@@ -436,7 +446,7 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 	streamed := isDeployEventResponse(resp)
 	if format == formatNDJSON && resp.StatusCode < http.StatusBadRequest {
 		upload := deployevent.Phase("upload", deployevent.StatusCompleted, "Bundle uploaded and validated")
-		upload.Bytes = uploadBytes
+		upload.Bytes = req.ContentLength
 		if err := writeDeployEvent(stdOut, upload); err != nil {
 			return err
 		}

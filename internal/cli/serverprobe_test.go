@@ -178,3 +178,57 @@ func TestServerReadinessProblem(t *testing.T) {
 		t.Error("a healthy shinyhub must not be flagged not-ready")
 	}
 }
+
+// A truncated front-proxy response still identifies a reachable, unready host;
+// body read errors must not erase the HTTP status or the older-server 404 rule.
+func TestProbeServer_Non200TruncatedBodyPreservesStatus(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusBadGateway, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "100")
+				w.WriteHeader(status)
+				io.WriteString(w, "truncated")
+			}))
+			defer srv.Close()
+			cfg := &cliConfig{Host: srv.URL}
+			_, err := probeServer(cfg)
+			var nr *serverNotReadyError
+			if !errors.As(err, &nr) || nr.status != status {
+				t.Fatalf("status=%d err=%v", status, err)
+			}
+			problem := serverReadinessProblem(cfg)
+			if (problem == nil) != (status == http.StatusNotFound) {
+				t.Fatalf("status=%d readiness problem=%v", status, problem)
+			}
+		})
+	}
+}
+
+func TestProbeServer_Truncated200PreservesJSONClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		ready      bool
+	}{
+		{"complete JSON prefix", `{"version":"dev"}`, true},
+		{"incomplete JSON", `{"version":`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "100")
+				io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			_, err := probeServer(&cliConfig{Host: srv.URL})
+			if tc.ready {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			var nr *serverNotReadyError
+			if !errors.As(err, &nr) || nr.status != 0 {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
