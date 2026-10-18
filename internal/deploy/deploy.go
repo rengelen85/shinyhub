@@ -1762,7 +1762,7 @@ func bootReplicaAttempt(p Params, idx int, tier, targetWorker string, baseCmd []
 	if p.HealthCheck != nil {
 		healthErr = hc(info.EndpointURL, timeout, transport)
 	} else {
-		healthErr = waitHealthyOrExit(info.EndpointURL, timeout, transport, func() bool {
+		healthErr = waitHealthyContract(info.EndpointURL, plan.ReadyPath, plan.ReadyStatus, timeout, transport, func() bool {
 			i, ok := getDeployReplica(p, idx)
 			return ok && i.Status == process.StatusRunning
 		})
