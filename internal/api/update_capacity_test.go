@@ -151,7 +151,7 @@ func TestDeployCapacityLostDuringPreparationPreservesWorkingVersion(t *testing.T
 		t.Fatalf("working worker lost: %+v", info)
 	}
 	history, err := store.ListDeploymentsBySlug(app.Slug)
-	if err != nil || !strings.HasPrefix(history[0].FailureReason, "capacity-blocked/cpu:") {
+	if err != nil || history[0].Status != db.DeploymentBlocked || !strings.HasPrefix(history[0].FailureReason, "capacity-blocked/cpu:") {
 		t.Fatalf("late blocker invisible in history: %+v %v", history, err)
 	}
 }
@@ -420,6 +420,9 @@ func TestCapacityAfterProducerBarrierIsNotPreservedRefusal(t *testing.T) {
 		t.Fatalf("mutating capacity outcome: %d %s", rec.Code, rec.Body)
 	}
 	latest, _ := store.ListDeploymentsBySlug(app.Slug)
+	if len(latest) != 1 || latest[0].Status != db.DeploymentFailed {
+		t.Fatalf("mutating capacity failure must remain failed, not blocked or pending: %+v", latest)
+	}
 	var barrier int
 	if err := store.DB().QueryRow("SELECT producer_barrier_entered FROM deployments WHERE id=?", latest[0].ID).Scan(&barrier); err != nil || barrier != 1 {
 		t.Fatalf("test did not enter physical producer barrier: %d %v", barrier, err)

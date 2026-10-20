@@ -18,6 +18,31 @@ import {
 
 const NOW = Date.UTC(2026, 5, 14, 12, 0, 0); // fixed clock for relativeTime
 
+test('capacity-blocked attempts preserve the current release and cannot roll back', () => {
+  const rows = deploymentListModels([
+    { id: 2, version: '2', status: 'blocked', failure_reason: 'capacity-blocked/cpu: budget' },
+    { id: 1, version: '1', status: 'succeeded', release_number: 1 },
+  ], NOW);
+  assert.equal(rows[0].status, 'blocked');
+  assert.equal(rows[0].canRollback, false);
+  assert.equal(rows[0].releaseLabel, '');
+  assert.equal(rows[1].isCurrent, true);
+});
+
+test('a development session with only blocked attempts is neither pending nor released', () => {
+  const [session] = deploymentTimelineModels([{
+    id: 1, version: '1', status: 'blocked',
+    provenance: { development_session: { id: 'dev-1', status: 'ended' } },
+  }], NOW);
+  assert.equal(session.kind, 'development-session');
+  assert.equal(session.attemptCount, 1);
+  assert.equal(session.pendingCount, 0);
+  assert.equal(session.failedCount, 0);
+  assert.equal(session.isCurrent, false);
+  assert.equal(session.latestReleaseLabel, '');
+  assert.equal(session.attempts[0].status, 'blocked');
+});
+
 test('relativeTime renders compact buckets and tolerates bad input', () => {
   assert.equal(relativeTime(new Date(NOW - 30 * 1000), NOW), '30s ago');
   assert.equal(relativeTime(new Date(NOW - 5 * 60 * 1000), NOW), '5m ago');

@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **capacity**: let fleet apply wait for CPU and surge slots held by draining
+  predecessors; release idle predecessors' static CPU requests while preserving
+  active sessions and grouped bindings. Record preserved capacity refusals as
+  blocked attempts instead of failed deployments, including historical badges.
+- **config**: accept `worker_cpu_request_cores: 0` to disable static CPU
+  accounting while retaining sampled CPU pressure and memory admission.
+
 ## [0.21.1](https://github.com/rvben/shinyhub/compare/v0.21.0...v0.21.1) - 2026-10-16
 
 ### Added

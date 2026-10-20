@@ -253,7 +253,11 @@ func TestGenerationHandoffKeepsOpenWebSocketWhileNewWorkUsesActive(t *testing.T)
 			for _, old := range []struct {
 				id      int64
 				grouped bool
-			}{{101, grouped}, {202, targetGrouped}} {
+				index   int
+			}{{101, grouped, 0}, {202, targetGrouped, slot}} {
+				if retained := p.DrainingReplicaHasRetainedWork("dashboard", old.id, old.index); retained != old.grouped {
+					t.Fatalf("generation %d retained work = %t, want grouped binding = %t", old.id, retained, old.grouped)
+				}
 				retired := p.TryRetireGeneration("dashboard", old.id)
 				if old.grouped && retired {
 					t.Fatalf("retired grouped generation %d before reconnect grace", old.id)

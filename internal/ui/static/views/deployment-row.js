@@ -216,7 +216,7 @@ export function deploymentTimelineModels(rows, now = Date.now()) {
     emitted.add(rawSession.id);
     const attempts = sessions.get(rawSession.id);
     const failed = attempts.filter(a => a.status === 'failed').length;
-    const pending = attempts.filter(a => a.status !== 'succeeded' && a.status !== 'failed').length;
+    const pending = attempts.filter(a => a.status === 'pending').length;
     const latestRelease = attempts.find(a => a.releaseNumber != null);
     const actor = rows[i].provenance.origin && rows[i].provenance.origin.actor || '';
     const targetLabels = { existing: 'Existing app', created: 'New persistent app', ephemeral: 'Temporary app' };

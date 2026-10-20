@@ -2407,6 +2407,29 @@ func (p *Proxy) GenerationDrainingSessions(slug string, deploymentID int64) (int
 	return total, true
 }
 
+// DrainingReplicaHasRetainedWork includes grouped client bindings and reload-relayed
+// sessions, which can own a draining worker even between open HTTP requests.
+// A retired route has no remaining work. Callers must independently establish
+// that the generation is retiring, rather than an unpublished candidate.
+func (p *Proxy) DrainingReplicaHasRetainedWork(slug string, deploymentID int64, index int) bool {
+	if p.RetiringParentAlive() {
+		return true
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	pool := p.pools[slug]
+	if pool == nil {
+		return false
+	}
+	for _, replica := range pool.drainingGenerations[deploymentID] {
+		if replica != nil && replica.index == index && (replica.activeConns.Load()+p.relaySessions(slug, deploymentID, replica.index, replica.targetURL) > 0 ||
+			(pool.generationPolicies[deploymentID].Mode == config.IsolationGrouped && replica.assignedClients > 0)) {
+			return true
+		}
+	}
+	return false
+}
+
 // AbortGeneration removes an unpublished candidate. Active and draining
 // generations are never affected, so failed readiness cannot cause downtime.
 func (p *Proxy) AbortGeneration(slug string, deploymentID int64) bool {

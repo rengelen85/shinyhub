@@ -1071,7 +1071,7 @@ type App struct {
 	// deploymentSummarySQL; pending/failed deployments are never reflected.
 	ContentDigest string `json:"content_digest,omitempty"`
 	// LastDeploymentStatus is the status of the app's most-recent deployment row
-	// ("succeeded"/"failed"/"pending"), or "" if it has never been deployed. It
+	// ("succeeded"/"failed"/"pending"/"blocked"), or "" if it has never been deployed. It
 	// lets a consumer tell a failed-only deploy from a never-deployed app, which
 	// deploy_count (incremented on success only) cannot.
 	LastDeploymentStatus string `json:"last_deployment_status,omitempty"`
@@ -2390,12 +2390,14 @@ type Deployment struct {
 
 // Deployment status lifecycle. A deploy records DeploymentPending before any
 // pool swap, then either DeploymentSucceeded once the new pool is serving or
-// DeploymentFailed if the attempt aborts. The authoritative "live bundle"
-// pointer is the newest row that is neither pending nor failed.
+// DeploymentFailed if the attempt aborts, or DeploymentBlocked for a preserved
+// capacity refusal. Only succeeded rows belong to the release history.
 const (
 	DeploymentPending   = "pending"
 	DeploymentSucceeded = "succeeded"
 	DeploymentFailed    = "failed"
+	// Blocked attempts never became serving releases and are not queued.
+	DeploymentBlocked = "blocked"
 
 	DeploymentOriginFleet    = "fleet"
 	DeploymentOriginDirect   = "direct"
@@ -2996,6 +2998,25 @@ func (s *Store) FailDeploymentWithReason(id int64, reason string) error {
 	return nil
 }
 
+// BlockDeploymentWithReason records an admission refusal that preserved the
+// working version. A blocked attempt is terminal, but is not an app failure.
+func (s *Store) BlockDeploymentWithReason(id int64, reason string) error {
+	res, err := s.db.Exec(
+		`UPDATE deployments SET status = ?, failure_reason = ? WHERE id = ? AND status = ? AND producer_barrier_entered = 0`,
+		DeploymentBlocked, reason, id, DeploymentPending)
+	if err != nil {
+		return fmt.Errorf("block deployment %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("block deployment %d: rows affected: %w", id, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("block deployment %d: pending deployment without a producer barrier not found", id)
+	}
+	return nil
+}
+
 // QuarantineAndFailDeployment atomically makes an interrupted compatibility
 // boundary non-runnable and terminalizes its pending deployment. The ordering
 // cannot be split: a crash after failing the row but before failing the app
@@ -3336,7 +3357,7 @@ func (s *Store) CurrentRelease(appID int64) (number int, releasedAt time.Time, v
 }
 
 // ListDeployments returns an app's deployments newest-first, excluding
-// in-flight ('pending') and aborted ('failed') rows. Callers treat the result
+// in-flight, blocked and failed rows. Callers treat the result
 // as the authoritative live-bundle history: index 0 is the current bundle,
 // index 1 the rollback target. An interrupted deploy therefore never shifts
 // this pointer until PromoteDeployment confirms the new pool.
@@ -3344,7 +3365,7 @@ func (s *Store) ListDeployments(appID int64) ([]*Deployment, error) {
 	rows, err := s.db.Query(`
 		SELECT id, app_id, version, bundle_dir, status, content_digest, created_at, prepared
 		FROM deployments
-		WHERE app_id = ? AND status NOT IN ('pending', 'failed') AND serving_activation_id IS NULL
+		WHERE app_id = ? AND status = 'succeeded' AND serving_activation_id IS NULL
 		ORDER BY id DESC`, appID)
 	if err != nil {
 		return nil, err
@@ -3374,7 +3395,7 @@ func (s *Store) ListRecentDeployments(appID int64, n int) ([]*Deployment, error)
 	rows, err := s.db.Query(`
 		SELECT id, app_id, version, bundle_dir, status, content_digest, created_at, prepared
 		FROM deployments
-		WHERE app_id = ? AND status NOT IN ('pending', 'failed') AND serving_activation_id IS NULL
+		WHERE app_id = ? AND status = 'succeeded' AND serving_activation_id IS NULL
 		ORDER BY id DESC LIMIT ?`, appID, n)
 	if err != nil {
 		return nil, err
@@ -3461,16 +3482,16 @@ func (s *Store) GetDeploymentByID(id int64) (*Deployment, error) {
 	return &dep, nil
 }
 
-// GetDeploymentByDigest returns the newest non-failed deployment whose recorded
+// GetDeploymentByDigest returns the newest pending or succeeded deployment whose recorded
 // content digest matches. The control-plane bundle-fetch endpoint uses it to
 // resolve a worker's pull-by-digest request to a stored bundle artifact. A
 // pending row is eligible (a remote replica may pull before promotion); a
-// failed row is not.
+// failed or blocked row is not.
 func (s *Store) GetDeploymentByDigest(digest string) (*Deployment, error) {
 	row := s.db.QueryRow(`
 		SELECT id, app_id, version, bundle_dir, status, content_digest, created_at, prepared
 		FROM deployments
-		WHERE content_digest = ? AND status != 'failed'
+		WHERE content_digest = ? AND status IN ('pending', 'succeeded')
 		ORDER BY id DESC LIMIT 1`, digest)
 	var d Deployment
 	var dg sql.NullString

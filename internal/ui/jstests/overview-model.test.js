@@ -4,6 +4,14 @@ import { buildOverviewModel, pulseOrder } from '../static/views/overview-model.j
 
 const MIB = 1024 * 1024;
 
+test('capacity-blocked update does not mark a healthy app as needing attention', () => {
+  const model = buildOverviewModel([
+    { slug: 'a', status: 'running', deploy_count: 1, last_deployment_status: 'blocked' },
+  ], ready({ a: { status: 'running', replicas: [replica(0)] } }));
+  assert.equal(model.verdict.tone, 'nominal');
+  assert.equal(model.counts.healthy, 1);
+});
+
 function replica(index, { cpu = 0, rssMB = 0, memMB = 512, cpuQuota = 100,
   metricsAvailable = true, memoryEnforced = true, cpuEnforced = true } = {}) {
   return {

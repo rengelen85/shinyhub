@@ -68,6 +68,23 @@ func TestAppMissStatus(t *testing.T) {
 			wantStatus: "stopped",
 		},
 		{
+			name:       "blocked deployment preserves hibernation on a route miss",
+			app:        App{Status: "hibernated", LastDeploymentStatus: DeploymentBlocked},
+			wantStatus: "hibernated",
+		},
+		{
+			name:       "blocked deployment does not make a missing running route deploying",
+			app:        App{Status: "running", LastDeploymentStatus: DeploymentBlocked},
+			wantStatus: "running",
+		},
+		{
+			name:           "blocked deployment preserves crash reason even while deploy lock is held",
+			app:            App{Status: "crashed", LastError: "boom", LastDeploymentStatus: DeploymentBlocked},
+			deployInFlight: true,
+			wantStatus:     "crashed",
+			wantReason:     "boom",
+		},
+		{
 			name:       "succeeded passes through with the crash reason",
 			app:        App{Status: "crashed", LastError: "boom", LastDeploymentStatus: DeploymentSucceeded},
 			wantStatus: "crashed",

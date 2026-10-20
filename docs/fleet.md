@@ -532,7 +532,7 @@ inputs as well as the app source.
 | `--prune` | Delete fleet-owned apps that are absent from the manifest. **This also removes their persistent data directory and all bundles.** |
 | `-y/--yes` | Skip the interactive destructive-action confirmation. `--prune` in a non-interactive shell requires `--yes`. |
 | `--environment NAME` | Select a declared environment for an unbound host; a conflicting bound host is rejected. Also available on `fleet plan`. |
-| `--capacity-wait DURATION` | Wait up to this duration per app after the first transient CPU-pressure refusal. Default `5m`; `0` disables waiting. Retries use the server retry delay independently of `--retries`. Accounting refusals fail immediately. |
+| `--capacity-wait DURATION` | Wait up to this duration per app for CPU pressure or draining predecessors to clear. Default `5m`; `0` disables waiting. Retries use the server retry delay independently of `--retries`. Permanent accounting shortages fail immediately. |
 | `--retries N` | Retry attempts *after* the first for deploys and transient config PATCH failures. Default 1 (so two attempts total). |
 | `--wait-for-warm` | Ask the server to reconcile every persisted enabled deploy-triggered schedule, including on unchanged apps; wait for each exact durable obligation and require the authoritative producer state to match the current digest and command. |
 | `--warm-timeout DURATION` | Per-app deadline shared by deploy-run waits, bundle-convergence checks, running-producer compatibility waits, and stale-schedule recovery. Default 15 minutes. |
@@ -555,8 +555,15 @@ producers instead of recording an unsupported topology.
 
 A measured CPU-pressure refusal is reported as `blocked [capacity]`. The working
 version and its sessions stay protected while the CLI waits and retries. A
-worker-accounting refusal ("allocated to live workers") also reports capacity,
-but fails immediately because waiting does not change the configured budget.
+worker-accounting refusal ("allocated to live workers") is retried when the
+candidate pool would fit after draining predecessors retire. Surge-ceiling
+refusals caused by retiring generations are also retried. Permanent accounting
+shortages still fail immediately. Set `--capacity-wait` longer than the server's
+drain timeout if retained sessions may use the full drain window, for example
+`--capacity-wait 11m` for a `10m` drain timeout.
+
+Capacity refusals are recorded as `blocked` deployment attempts; healthy apps
+keep their current release without a failed-deployment attention badge.
 Pressure recovery asks for a retry rather than `--allow-downtime`. The server's
 existing launch gate serializes admitted candidate starts; this does not add a
 persistent server-side deployment queue or change CPU sampling windows.

@@ -158,9 +158,11 @@ pool. Admission checks available memory and CPU before preparation and again
 under the host-wide launch reservation immediately before starting workers.
 A scheduled roll budgets one surge worker instead of a complete second pool.
 
-CPU admission first accounts for every local live worker, including starting,
-serving, draining, suspended, and unconfirmed processes. Each owns the configured
-CPU request even when idle. A separate 200 ms pressure check catches contention
+CPU admission first accounts for local starting, serving, suspended, and
+unconfirmed workers, even when idle. Draining predecessors retain their request
+only while sessions or grouped-client bindings remain; reload-relayed sessions
+also count. Session-free predecessors release their static CPU request before
+physical cleanup finishes. A separate 200 ms pressure check catches contention
 from current traffic and other programs; that sample does not reserve CPU.
 
 Configure the accounting policy under `server.update_capacity`:
@@ -178,6 +180,28 @@ Unset CPU requests default to 0.1 core per worker; the unset CPU reserve remains
 startup requirements. Requests differ from `cpu_quota_percent`, which controls
 runtime enforcement; choose requests appropriate to your workers' workload.
 Requests are accounting budgets, not OS reservations against unrelated processes.
+
+An explicit `worker_cpu_request_cores: 0` disables static worker CPU accounting;
+it does **not** mean "use the default". The sampled pressure check still requires
+0.1 core per candidate plus the configured node reserve. Memory admission and
+the surge ceiling remain enabled. This lets single-node operators use memory
+as the primary sizing constraint without reserving CPU for every idle app:
+
+```yaml
+server:
+  update_capacity:
+    worker_cpu_request_cores: 0
+```
+
+If the candidate startup requests plus reserve exceed the node's entire CPU
+capacity, the refusal is permanent even with static accounting disabled.
+Waiting cannot make that pool fit on an idle node.
+
+Memory admission checks available host and cgroup memory against the whole
+candidate pool plus the host floor (`server.min_available_memory_mb`). It uses
+the configured worker memory limit when present; otherwise it uses observed
+startup peak or live RSS with a 25% plus 64 MiB safety margin. Draining workers'
+physical memory remains included until freed.
 
 The default surge ceiling is `0` (no additional replica-count ceiling; resource
 admission still applies). Scheduled rolls use one surge worker. Code handoffs
@@ -197,8 +221,19 @@ cgroup namespace cannot be measured; provision its visible allocation accordingl
 
 A refused upload returns HTTP 409 with `update_state: "blocked_capacity"`, the
 resource, available and required budgets when known, and `automatic_retry: false`.
-The working version keeps serving. App details show the most recent capacity
-block separately from app health, and a successful retry clears it. Free or add
+The working version keeps serving. Deployment history records the attempt as
+`blocked`, with no release number; it does not mark a healthy app as needing
+attention. App details show the most recent capacity block separately from app
+health, and a successful retry clears it. Historical capacity failures that
+preserved the working version are reclassified on upgrade.
+
+`fleet apply` retries measured CPU pressure and CPU-budget shortages that would
+fit once draining predecessors retire, bounded by `--capacity-wait` (default
+`5m` per app). It also retries surge-ceiling shortages caused by retiring
+generations. For a `10m` drain timeout, use `--capacity-wait 11m` to cover that
+window and a retry interval. A permanent worker-budget shortage still fails
+immediately. The CLI owns this wait; an individual API refusal is not a queued
+deployment. Free or add
 capacity, then retry the deployment. `--allow-downtime` explicitly permits
 stop-first replacement when simultaneous pools cannot fit. Independently
 draining generations and reload-relayed sessions must retire first; this flag

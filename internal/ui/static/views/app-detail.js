@@ -701,6 +701,10 @@ function makeDeploymentRow(m, nested = false) {
     const b = makeStatusBadge('deployment-failed-badge', 'Failed');
     if (m.failureReason) b.title = m.failureReason;
     verCell.appendChild(b);
+  } else if (m.status === 'blocked') {
+    const b = makeStatusBadge('deployment-pending-badge', 'Blocked');
+    if (m.failureReason) b.title = m.failureReason;
+    verCell.appendChild(b);
   } else if (m.status !== 'succeeded') {
     verCell.appendChild(makeStatusBadge('deployment-pending-badge', 'Deploying'));
   }
@@ -718,7 +722,7 @@ function makeDeploymentRow(m, nested = false) {
   else sourcePrimary.textContent = m.source.label;
   const sourceDetail = document.createElement('span');
   sourceDetail.className = 'deployment-source-detail';
-  sourceDetail.append(m.failureReason && m.status === 'failed' ? m.failureReason : m.source.detail);
+  sourceDetail.append(m.failureReason && (m.status === 'failed' || m.status === 'blocked') ? m.failureReason : m.source.detail);
   if (m.source.change) {
     sourceDetail.append(' · ');
     sourceDetail.append(m.source.change.url ? externalLink(m.source.change.label, m.source.change.url) : m.source.change.label);

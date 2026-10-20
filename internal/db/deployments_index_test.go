@@ -21,7 +21,7 @@ func TestListRecentDeploymentsQueryAvoidsTemporarySort(t *testing.T) {
 	rows, err := store.DB().Query(`EXPLAIN QUERY PLAN
 		SELECT id, app_id, version, bundle_dir, status, content_digest, created_at, prepared
 		FROM deployments
-		WHERE app_id = ? AND status NOT IN ('pending', 'failed')
+		WHERE app_id = ? AND status = 'succeeded' AND serving_activation_id IS NULL
 		ORDER BY id DESC LIMIT ?`, 1, 2)
 	if err != nil {
 		t.Fatal(err)

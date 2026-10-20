@@ -55,6 +55,9 @@ func TestRetiringParentProtectsIdleBackends(t *testing.T) {
 	p.SetPoolSize("app", 1)
 	done := make(chan struct{})
 	p.SetRetiringParent(done)
+	if !p.DrainingReplicaHasRetainedWork("app", 1, 0) {
+		t.Fatal("unmeasured parent sessions released CPU accounting")
+	}
 	if !p.RetiringParentAlive() || p.BeginHibernate("app", time.Now()) {
 		t.Fatal("successor hibernated a backend with unknown parent sessions")
 	}

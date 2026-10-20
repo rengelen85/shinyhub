@@ -215,8 +215,8 @@ func deployWithRetry(cfg *cliConfig, slug string, spec bundleBuildSpec, visibili
 				if lastWait {
 					delay = remaining
 				}
-				if !updateFleetProgress(out, "Waiting for CPU capacity", "working version preserved", capacityDeadline, false) {
-					fmt.Fprintf(out, "  %s: transient CPU pressure; retrying in %s (working version preserved)\n", slug, delay)
+				if !updateFleetProgress(out, "Waiting for update capacity", "working version preserved", capacityDeadline, false) {
+					fmt.Fprintf(out, "  %s: waiting for update capacity; retrying in %s (working version preserved)\n", slug, delay)
 				}
 				ctx := opt.context
 				if ctx == nil {

@@ -399,9 +399,9 @@ var schemaAnnotations = map[string]cmdAnnotation{
 	"apps deployments": {Mutating: ro, OutputFields: []fieldSpec{
 		{Name: "id", Type: "integer"},
 		{Name: "version", Type: "string"},
-		{Name: "release_number", Type: "integer", Desc: "Human-friendly v1/v2/… rank among succeeded deploys; null for failed/pending"},
-		{Name: "status", Type: "string"},
-		{Name: "failure_reason", Type: "string", Desc: "Why a failed deploy failed; empty for pending/succeeded"},
+		{Name: "release_number", Type: "integer", Desc: "Human-friendly v1/v2/… rank among succeeded deploys; null for failed/pending/blocked"},
+		{Name: "status", Type: "string", Desc: "pending, succeeded, failed, or blocked"},
+		{Name: "failure_reason", Type: "string", Desc: "Why a deployment failed or was blocked; empty for pending/succeeded"},
 		{Name: "created_at", Type: "string"},
 	}, EnvelopeFields: []fieldSpec{
 		{Name: "items", Type: "array"},

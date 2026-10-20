@@ -2888,7 +2888,10 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 			s.metrics.RecordGenerationHandoff("deferred")
 		}
 		if capacityBlock != nil {
-			_ = s.store.FailDeploymentWithReason(pendingDep.ID, capacityFailureReason(capacityBlock))
+			if err := s.recordCapacityBlock(pendingDep.ID, capacityBlock); err != nil {
+				writeError(w, http.StatusInternalServerError, "could not persist capacity refusal; inspect server logs before retrying")
+				return
+			}
 			w.Header().Set("X-ShinyHub-Conflict", "generation-handoff-deferred")
 			writeCapacityConflict(w, capacityBlock)
 			return
@@ -3250,6 +3253,12 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 				// Leave the row pending. Pending deployment admission is itself a
 				// durable fail-closed fence, and startup retries atomic quarantine.
 				slog.Error("deploy: persist compatibility quarantine; leaving deployment pending", "slug", slug, "err", qerr)
+			}
+		} else if preservedCapacityBlock {
+			if persistErr := s.recordCapacityBlock(pendingDep.ID, lateCapacity); persistErr != nil {
+				preservedCapacityBlock = false
+				reason = "could not persist capacity refusal; inspect server logs before retrying"
+				kind = deployfail.ServerError
 			}
 		} else {
 			_ = s.store.FailDeploymentWithReason(pendingDep.ID, reason)
@@ -5434,7 +5443,7 @@ type metricsResponse struct {
 	// to clear the badge with an explicit false.
 	Deploying bool `json:"deploying"`
 	// LastDeploymentStatus mirrors the app's newest deployment-row status
-	// ("succeeded"/"failed"/"pending", "" when never deployed) so the poll
+	// ("succeeded"/"failed"/"pending"/"blocked", "" when never deployed) so the poll
 	// can keep the badge model honest: a first deploy that fails while
 	// watched flips the card to "Failed" instead of quietly reverting to
 	// "Awaiting deploy".

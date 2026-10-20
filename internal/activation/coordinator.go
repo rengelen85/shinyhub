@@ -21,7 +21,7 @@ var (
 )
 
 type CapacityError struct {
-	Transient  bool // measured pressure may clear without changing the worker budget
+	Transient  bool // pressure or retiring generations may clear without configuration changes
 	Resource   string
 	Available  *float64
 	Required   *float64

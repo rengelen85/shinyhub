@@ -19,9 +19,20 @@ func TestUpdateCapacityLoadsExplicitFractionalBudgets(t *testing.T) {
 	}
 }
 
+func TestUpdateCapacityExplicitZeroDisablesOnlyStaticAccounting(t *testing.T) {
+	t.Setenv("SHINYHUB_AUTH_SECRET", testSecret)
+	cfg, err := config.Load(writeYAML(t, "server:\n  update_capacity:\n    worker_cpu_request_cores: 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := cfg.Server.UpdateCapacity
+	if u.CPURequest() != 0 || u.StartupCPURequest() != 0.1 || !u.CPUFits(1, 100, 1) || u.CPUFleetWarning(1, 100) != "" {
+		t.Fatalf("explicit zero did not disable static accounting: %+v", u)
+	}
+}
 func TestUpdateCapacityRejectsInvalidBudgets(t *testing.T) {
 	for _, field := range []string{
-		"worker_cpu_request_cores: 0", "worker_cpu_request_cores: -1", "worker_cpu_request_cores: .nan", "worker_cpu_request_cores: .inf",
+		"worker_cpu_request_cores: -1", "worker_cpu_request_cores: .nan", "worker_cpu_request_cores: .inf",
 		"reserved_cpu_cores: -1", "reserved_cpu_cores: .nan", "reserved_cpu_cores: .inf", "max_surge_replicas: -1",
 	} {
 		t.Run(field, func(t *testing.T) {
@@ -34,6 +45,13 @@ func TestUpdateCapacityRejectsInvalidBudgets(t *testing.T) {
 	}
 }
 
+func TestUpdateCapacityZeroStillWarnsAboutImpossibleStartupReserve(t *testing.T) {
+	zero, reserve := 0.0, 1.0
+	u := config.UpdateCapacityConfig{WorkerCPURequestCores: &zero, ReservedCPUCores: &reserve}
+	if warning := u.CPUFleetWarning(1, 100); !strings.Contains(warning, "cannot admit even one startup worker") {
+		t.Fatalf("impossible startup reserve did not warn: %q", warning)
+	}
+}
 func TestUpdateCapacityMinimumSurgeWarning(t *testing.T) {
 	one := 1.0
 	for _, tc := range []struct {

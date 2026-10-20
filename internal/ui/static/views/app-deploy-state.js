@@ -11,7 +11,7 @@
 // every app payload (internal/db/queries.go deploymentSummarySQL):
 //
 //   last_deployment_status  status of the NEWEST deployments row
-//                           ('succeeded' | 'failed' | 'pending'), omitted only
+//                           ('succeeded' | 'failed' | 'pending' | 'blocked'), omitted only
 //                           when the app has no deployments row at all
 //   last_deployed_at        MAX(created_at) over EVERY deployments row,
 //                           regardless of status

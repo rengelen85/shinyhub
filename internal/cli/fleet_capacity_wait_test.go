@@ -22,15 +22,23 @@ func TestFleetCapacityWait(t *testing.T) {
 		stream, transient, cancel bool
 		wait                      time.Duration
 		want                      int
+		message                   string
 	}{
 		{name: "json recovers independently of retries", transient: true, wait: 2 * time.Second, want: 2},
 		{name: "stream recovers", stream: true, transient: true, wait: 2 * time.Second, want: 2},
+		{name: "draining budget recovers", transient: true, wait: 2 * time.Second, want: 2, message: "CPU budget: 0.90 cores allocated to live workers; waiting for draining predecessors"},
+		{name: "stream draining budget recovers", stream: true, transient: true, wait: 2 * time.Second, want: 2, message: "CPU budget: 0.90 cores allocated to live workers; waiting for draining predecessors"},
+		{name: "surge ceiling recovers", transient: true, wait: 2 * time.Second, want: 2, message: "max_surge_replicas=1 cannot fit candidates and existing non-active workers"},
 		{name: "accounting fails fast", wait: 2 * time.Second, want: 1},
 		{name: "disabled", transient: true, want: 1},
 		{name: "deadline", transient: true, wait: 10 * time.Millisecond, want: 2},
 		{name: "cancelled", transient: true, cancel: true, wait: 2 * time.Second, want: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			message := "working version preserved"
+			if tc.message != "" {
+				message += ": " + tc.message
+			}
 			hits := 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -42,12 +50,12 @@ func TestFleetCapacityWait(t *testing.T) {
 					}
 					if tc.stream {
 						w.Header().Set("Content-Type", deployevent.MediaType)
-						json.NewEncoder(w).Encode(deployevent.Event{Type: deployevent.TypeError, Phase: "capacity", StatusCode: 409, FailureKind: "capacity", Message: "working version preserved", CapacityRetryable: tc.transient, RetryAfterSeconds: 1})
+						json.NewEncoder(w).Encode(deployevent.Event{Type: deployevent.TypeError, Phase: "capacity", StatusCode: 409, FailureKind: "capacity", Message: message, CapacityRetryable: tc.transient, RetryAfterSeconds: 1})
 						return
 					}
 					w.Header().Set("X-ShinyHub-Conflict", "generation-handoff-deferred")
 					w.WriteHeader(409)
-					json.NewEncoder(w).Encode(map[string]any{"update_state": "blocked_capacity", "failure_kind": "capacity", "error": "working version preserved", "capacity_retryable": tc.transient, "retry_after_seconds": 1})
+					json.NewEncoder(w).Encode(map[string]any{"update_state": "blocked_capacity", "failure_kind": "capacity", "error": message, "capacity_retryable": tc.transient, "retry_after_seconds": 1})
 				case "/api/apps/demo":
 					io.WriteString(w, `{"app":{"slug":"demo","status":"running"}}`)
 				case "/api/apps":

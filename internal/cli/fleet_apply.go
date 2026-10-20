@@ -81,7 +81,7 @@ func newFleetApplyCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.allowDowntime, "allow-downtime", false,
 		"Permit stop-first deploys when safe version handoff is unavailable (disconnects active sessions for affected apps)")
 	cmd.Flags().BoolVar(&f.jsonOutput, "json", false, "Emit the machine-readable JSON envelope")
-	cmd.Flags().DurationVar(&f.capacityWait, "capacity-wait", 5*time.Minute, "Maximum time per app to retry transient CPU pressure (0 disables waiting)")
+	cmd.Flags().DurationVar(&f.capacityWait, "capacity-wait", 5*time.Minute, "Maximum time per app to wait for CPU pressure or draining predecessors (0 disables waiting)")
 	cmd.Flags().IntVar(&f.retries, "retries", 1, "Retry attempts after the first for transient deploy and config failures (deterministic deploy failures are never retried)")
 	cmd.Flags().IntVar(&f.healthTimeout, "health-timeout", 120, "Seconds to wait per app after deploy for a healthy status: running, or idle for an elastic (grouped/per_session) pool that boots workers on demand")
 	cmd.Flags().DurationVar(&f.warmTimeout, "warm-timeout", fleetWarmTimeout, "Maximum total time per app for bundle convergence and stale schedule refreshes")
