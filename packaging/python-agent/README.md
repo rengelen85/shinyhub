@@ -179,6 +179,41 @@ Raise `ToolError("stale_view", "The date range changed again.")` for an expected
 failure; the chat shows that message to the visitor and consumes the undo.
 Unexpected failures show a generic message and are logged with a traceback.
 
+To withdraw Undo as soon as relevant app state changes, add a synchronous,
+read-only `undo_valid(args, result) -> bool` callback to the tool:
+
+```python
+def undo_still_valid(args, result):
+    return selected_period.get() == result["period"]
+```
+
+Pass `undo_valid=undo_still_valid` alongside the tool's `undo` handler.
+The callback runs after the chat receipt is sent, and again whenever a Shiny
+input, reactive value or calculation it reads is invalidated. It runs under
+the reactive lock in the viewer's session, with dependency tracking enabled.
+Returning `False` permanently consumes that undo and removes its button;
+changing the view back does not revive it. A `ToolError` withdraws it with the
+safe message, while an unexpected exception or a non-boolean return withdraws
+it with generic text and logs the failure. The callback receives copies of
+the original arguments and result. Only the most recent action is monitored;
+reset, undo, replacement, configured expiry and session end clean up the monitor.
+Monitoring survives stopping an answer after its receipt appears.
+
+Return a built-in `bool`; wrap comparisons that return NumPy/Pandas boolean
+scalars in `bool(...)`. Reading an unset input or failing Shiny's `req()`
+quietly withdraws Undo, rather than waiting for the input to become available.
+A replacement write can invalidate the previous action while it is applying,
+so its old receipt may show withdrawal before the new receipt arrives. This
+keeps the old Undo accurate even if the replacement write fails after changing
+state.
+
+Use normalized, server-owned state such as `selected_period` for the check.
+A pending `ui.update_*()` can leave browser inputs at their old values during
+the initial check. Do not poll or wait for an input echo inside this callback.
+Keep the stale-state check in `undo` as well: the view can change between
+clicking Undo and execution. The hook is optional and applies to registered
+Shiny chat tools; it is not sent to the model or used by direct browser tools.
+
 An AG-UI agent hosted in Amazon Bedrock AgentCore needs an authenticated
 `InvokeAgentRuntime` client or a hoster-managed HTTPS relay. `AGUIChat` does
 not sign AgentCore requests itself.

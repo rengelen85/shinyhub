@@ -49,6 +49,10 @@ class AgentTool:
     When registered with Shiny, handlers and undo callbacks hold the reactive
     lock. After ui.update_*(), report the normalized values sent: the browser's
     input echo cannot be processed until the callback returns.
+
+    An optional synchronous undo_valid(arguments, result) returns a bool.
+    Shiny tracks its reactive reads and permanently withdraws chat Undo when
+    it returns False. Keep it read-only and retain stale-state checks in undo.
     """
 
     name: str
@@ -61,6 +65,7 @@ class AgentTool:
     undo: Callable[[dict[str, Any], Any], Any] | None = None
     validate: Callable[[dict[str, Any]], Any] | None = None
     describe: Callable[[dict[str, Any]], str] | None = None
+    undo_valid: Callable[[dict[str, Any], Any], bool] | None = None
 
     def __post_init__(self) -> None:
         if not NAME.fullmatch(self.name):
@@ -107,6 +112,13 @@ class AgentTool:
             raise TypeError("Receipt must be a callable")
         if self.undo is not None and not inspect.iscoroutinefunction(self.undo):
             raise TypeError("Undo handler must be an async function")
+        if self.undo_valid is not None:
+            if self.undo is None:
+                raise ValueError("undo_valid requires an undo handler")
+            if not callable(self.undo_valid) or inspect.iscoroutinefunction(
+                self.undo_valid
+            ):
+                raise TypeError("undo_valid must be a synchronous callable")
         if self.validate is not None and not callable(self.validate):
             raise TypeError("Validator must be a callable")
         if self.describe is not None:

@@ -727,6 +727,52 @@ function undoClock(window) {
   };
 }
 
+test("reactive withdrawal removes the matching Undo while preserving the receipt", (t) => {
+  const { window, doc, send } = ask(t);
+  const clock = undoClock(window);
+  send({ type: "action_applied", name: "set_dates", actionId: "a1",
+    receipt: "Date range set to September", undoExpiresIn: 3600 });
+  send({ type: "undo_withdrawn", actionId: "old", message: "Wrong action" });
+  send({ type: "undo_withdrawn", actionId: "a1", session: "old-session" });
+  assert.ok(doc.querySelector(".sh-agent-undo"));
+  send({ type: "undo_withdrawn", actionId: "a1",
+    message: "The date range changed again. <b>Literal text</b>" });
+  assert.equal(doc.querySelector(".sh-agent-undo"), null);
+  assert.equal(doc.querySelector(".sh-agent-receipt-title").textContent, "Date range set to September");
+  assert.equal(doc.querySelector(".sh-agent-receipt-detail").textContent,
+    "The date range changed again. <b>Literal text</b>");
+  assert.equal(doc.querySelector(".sh-agent-receipt-detail b"), null);
+  assert.equal(clock.timers.size, 0);
+  send({ type: "done" });
+  clock.advance(3600000);
+  assert.equal(doc.querySelector(".sh-agent-undo"), null);
+  assert.match(doc.querySelector(".sh-agent-receipt-detail").textContent, /date range changed/);
+});
+
+test("withdrawal after an answer ends works for an unlimited window", (t) => {
+  const { doc, send } = ask(t);
+  send({ type: "action_applied", name: "set_dates", actionId: "a1", undoExpiresIn: null });
+  send({ type: "done" });
+  send({ type: "undo_withdrawn", actionId: "a1", requestId: undefined });
+  assert.equal(doc.querySelector(".sh-agent-undo"), null);
+  assert.equal(doc.querySelector(".sh-agent-receipt-detail").textContent, "Undo no longer available");
+});
+
+test("late withdrawal cannot remove a newer Undo or overwrite an undo result", (t) => {
+  const { doc, send, inputs } = ask(t);
+  send({ type: "action_applied", name: "set_dates", actionId: "a1", undoExpiresIn: null });
+  send({ type: "action_applied", name: "set_dates", actionId: "a2", undoExpiresIn: null });
+  send({ type: "undo_withdrawn", actionId: "a1" });
+  assert.equal(doc.querySelectorAll(".sh-agent-undo").length, 1);
+  send({ type: "done" });
+  doc.querySelector(".sh-agent-undo").click();
+  send({ type: "undo_withdrawn", actionId: "a2" });
+  assert.equal(doc.querySelector(".sh-agent-undo").textContent, "Undoing…");
+  send({ type: "undo_result", actionId: "a2", ok: true, requestId: inputs.at(-1).value.requestId });
+  send({ type: "undo_withdrawn", actionId: "a2" });
+  assert.equal(doc.querySelectorAll(".sh-agent-receipt-title")[1].textContent, "Change undone");
+});
+
 test("Undo expires while the answer is streaming and cannot be revived by done", (t) => {
   const { window, doc, send } = ask(t);
   const clock = undoClock(window);

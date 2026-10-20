@@ -828,10 +828,10 @@
     activeUndo = null;
   }
 
-  function expireUndo() {
+  function expireUndo(message) {
     if (!activeUndo) return;
     activeUndo.receipt.dataset.result = "unavailable";
-    activeUndo.detail.textContent = "Undo no longer available";
+    activeUndo.detail.textContent = message || "Undo no longer available";
     activeUndo.detail.hidden = false;
     clearUndo();
   }
@@ -880,7 +880,7 @@
           action: "undo", actionId: event.actionId });
       });
       receipt.append(undo);
-      activeUndo = { receipt: receipt, detail: detail, button: undo };
+      activeUndo = { actionId: event.actionId, receipt: receipt, detail: detail, button: undo };
       if (expiresAt !== null) {
         function tick() {
           var remaining = Math.ceil((expiresAt - Date.now()) / 1000);
@@ -1127,6 +1127,12 @@
     window.Shiny.addCustomMessageHandler("shinyhub-agent-chat-event", function (event) {
       if (!event || event.version !== VERSION || event.session !== chatSession) return;
       if (event.type === "approval_required") { if (activeRequest) showApproval(event); return; }
+      if (event.type === "undo_withdrawn") {
+        if (activeUndo && event.actionId === activeUndo.actionId) {
+          expireUndo(typeof event.message === "string" ? event.message : null);
+        }
+        return;
+      }
       if (event.type === "approval_expired") {
         if (approval && approval.dataset.approvalId === event.approvalId) {
           suggestionsSuppressed = true;

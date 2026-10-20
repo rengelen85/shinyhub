@@ -64,6 +64,29 @@ def test_write_tool_needs_confirmation_text():
         AgentTool("change", "Change", SCHEMA, noop, read_only=False)
 
 
+async def undo_noop(args, result):
+    return None
+
+
+@pytest.mark.parametrize("hook", [True, "valid", undo_noop])
+def test_undo_valid_requires_a_synchronous_callable(hook):
+    with pytest.raises(TypeError, match="undo_valid"):
+        AgentTool(
+            "change", "Change", SCHEMA, noop, read_only=False,
+            confirmation="Change?", undo=undo_noop, undo_valid=hook,
+        )
+
+
+def test_undo_valid_requires_undo_and_is_not_exposed_to_agents():
+    with pytest.raises(ValueError, match="undo_valid requires"):
+        AgentTool("read", "Read", SCHEMA, noop, undo_valid=lambda args, result: True)
+    registered = AgentTool(
+        "change", "Change", SCHEMA, noop, read_only=False,
+        confirmation="Change?", undo=undo_noop, undo_valid=lambda args, result: True,
+    )
+    assert "undo_valid" not in registered.public_spec()
+
+
 def test_exception_is_sanitized():
     async def broken(_):
         raise RuntimeError("private database detail")

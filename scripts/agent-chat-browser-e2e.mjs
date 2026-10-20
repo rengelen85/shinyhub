@@ -184,6 +184,20 @@ try {
     assert.ok(await tab.locator('.sh-agent-panel').evaluate((p) => p.scrollWidth <= p.clientWidth + 1));
     if (screenshots) await tab.screenshot({ path: resolve(screenshots, `undo-expired-${width}.png`) });
     console.log(`PASS undo expiry at ${width}px: button removed and receipt explains availability`);
+    await start(tab);
+    await tab.evaluate(() => {
+      chatEvent({ type: 'action_applied', name: 'set_dates', actionId: 'undo-validity',
+        receipt: 'Date range set to October', undoExpiresIn: null });
+      chatEvent({ type: 'delta', text: 'Showing October.' });
+      chatEvent({ type: 'done' });
+      chatEvent({ type: 'undo_withdrawn', actionId: 'undo-validity',
+        message: 'The date range changed again.' });
+    });
+    assert.equal(await tab.locator('.sh-agent-undo').count(), 0);
+    assert.equal(await tab.locator('.sh-agent-receipt-title').last().textContent(), 'Date range set to October');
+    assert.equal(await tab.locator('.sh-agent-receipt-detail').last().textContent(), 'The date range changed again.');
+    assert.ok(await tab.locator('.sh-agent-receipt-detail').last().isVisible());
+    console.log(`PASS reactive undo withdrawal at ${width}px: matching receipt updated after the answer`);
     await tab.close();
   }
   // The public hook must work against the actual closed shadow root, with no

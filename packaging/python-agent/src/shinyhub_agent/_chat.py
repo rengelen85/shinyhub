@@ -98,6 +98,7 @@ class ChatSession:
         self.lock = asyncio.Lock()
         self.pending_approval: tuple[str, asyncio.Future[bool]] | None = None
         self.last_action: tuple[str, str, dict[str, Any], Any, float] | None = None
+        self._on_undo_change: Callable[[], asyncio.Task[None] | None] | None = None
         self.task: asyncio.Task[Any] | None = None
         self.approval_timeout = approval_timeout
         self.undo_timeout = undo_timeout
@@ -148,6 +149,7 @@ class ChatSession:
                     self.charts.clear()
                 self.thread_id = secrets.token_urlsafe(18)
                 self.last_action = None
+                self._notify_undo_change()
                 await emit({"type": "reset"})
             return
         if raw.get("action") == "cancel":
@@ -194,6 +196,7 @@ class ChatSession:
                     return
                 self.last_action = None
                 try:
+                    self._notify_undo_change()
                     result = await self.tools.undo(action[1], action[2], action[3])
                     self.history.clear()
                     if self.charts:
@@ -374,7 +377,18 @@ class ChatSession:
                                         self.undo_timeout - (time.monotonic() - action[4]),
                                     )
                                 )
-                    await emit(event)
+                    if event.get("type") == "action_applied":
+                        # A send can be cancelled after delivering the receipt.
+                        # Always schedule monitoring, without delaying Stop on
+                        # a contended graph lock when the send was cancelled.
+                        try:
+                            await emit(event)
+                        finally:
+                            update = self._notify_undo_change()
+                        if update is not None:
+                            await asyncio.shield(update)
+                    else:
+                        await emit(event)
                 await emit_charts()
                 if not answer.strip() and chart_context:
                     answer = "Chart shown below."
@@ -493,6 +507,11 @@ class ChatSession:
             time.monotonic(),
         )
         return result
+
+    def _notify_undo_change(self) -> asyncio.Task[None] | None:
+        if self._on_undo_change is not None:
+            return self._on_undo_change()
+        return None
 
     @staticmethod
     def _receipt_text(value: Any) -> str:

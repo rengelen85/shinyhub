@@ -133,6 +133,16 @@ either `detail` or a visitor-safe `message`. An expected `ToolError` includes
 its `code` and message; unexpected exceptions are not serialized. An attempted
 handler consumes the undo even when it fails.
 
+An optional app `undo_valid` callback can withdraw undo on reactive state
+changes. The server consumes the action and emits `undo_withdrawn` with
+`version`, the chat `session`, `actionId`, and a plain-text `message`. This
+notification is independent of a chat request and has no `requestId`. It is
+sent after the corresponding receipt; clients remove only the matching
+available Undo and show the message without replacing the receipt title.
+Stale session/action notifications must not affect a newer receipt or an
+undo already in flight. Withdrawal is permanent, even if the state becomes
+valid again; the server rejects subsequent undo requests for that action.
+
 The browser helper also announces `shinyhub:chat:capabilities` with
 `{version: 1, enabled: true, panel: <Element>, title: <string>}`. A compatible
 ShinyHub host slots that element into its own overlay and responds with
