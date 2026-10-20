@@ -5,6 +5,8 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { readFile, mkdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 const require = createRequire(import.meta.url);
 const driverRequire = createRequire(new URL('../loadtest/render/driver/package.json', import.meta.url));
 const engines = driverRequire('playwright');
@@ -30,7 +32,7 @@ const server = createServer((req, res) => {
 });
 server.listen(0, '127.0.0.1'); await once(server, 'listening');
 const origin = `http://127.0.0.1:${server.address().port}`;
-const qa = process.env.SHINYHUB_CHART_QA_DIR || '/private/tmp/shinyhub-chart-qa'; await mkdir(qa, {recursive:true});
+const qa = process.env.SHINYHUB_CHART_QA_DIR || join(tmpdir(), 'shinyhub-chart-qa'); await mkdir(qa, {recursive:true});
 let browser;
 const rows = [
   {Month:'2026-01-01', Revenue:120, Region:'North'}, {Month:'2026-02-01', Revenue:190, Region:'North'},

@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Upgrade notice
+
+This release migrates preserved capacity refusals from `failed` to `blocked`,
+clearing historical failure badges without changing the serving release. Back up
+the database before upgrading: older binaries refuse the newer database schema,
+so a downgrade requires restoring the pre-upgrade database.
+
+Set `server.update_capacity.worker_cpu_request_cores: 0` to disable static CPU
+accounting while keeping sampled CPU pressure and memory admission enabled.
+Fleet capacity waiting remains bounded by `--capacity-wait` (5m by default);
+use a longer wait, such as `11m`, with a custom `drain_timeout: 10m`.
+
 ### Fixed
 
 - **capacity**: let fleet apply wait for CPU and surge slots held by draining
