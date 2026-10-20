@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.4.2...shinyhub-agent-v0.5.0) - 2026-10-20
+
+### Added
+
+- Optional `AgentTool.undo_valid(arguments, result)` callback withdraws Undo
+  when reactive app state makes the action stale. The synchronous, read-only
+  callback tracks its reactive dependencies; returning `False` permanently
+  removes the action's Undo button. Keep the stale-state check in the undo
+  handler as well.
+
+### Changed
+
+- `register(..., undo_timeout=None)` now keeps Undo available without a time
+  limit, until the next write, chat/session reset, or reactive withdrawal.
+  Set `undo_timeout=300` to retain the previous five-minute window, or choose
+  another finite duration of at least one second.
+
+### Fixed
+
+- Configured undo deadlines now reach the browser. Expired receipts remove
+  the button and show "Undo no longer available", including when background
+  timers are delayed.
+- Expected `ToolError` failures from undo show the app's message and log at
+  info level. Unexpected failures retain generic text and exception logging.
+- Document that tool and undo callbacks run under the reactive lock:
+  report values sent through `ui.update_*()` instead of waiting for an input
+  echo, which cannot arrive until the callback returns.
+
 ## [0.4.2](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.4.1...shinyhub-agent-v0.4.2) - 2026-10-16
 
 ### Added
