@@ -163,6 +163,29 @@ try {
       await tab.close();
     }
   }
+  for (const width of [1280, 375]) {
+    const tab = await context.newPage();
+    await tab.setViewportSize({ width, height: 900 });
+    await tab.goto(origin);
+    await tab.locator('.sh-agent-launcher').click();
+    await start(tab);
+    await tab.clock.install();
+    await tab.evaluate(() => {
+      chatEvent({ type: 'action_applied', name: 'set_dates', actionId: 'undo-expiry',
+        receipt: 'Date range set to September', undoExpiresIn: 2 });
+      chatEvent({ type: 'delta', text: 'Showing September.' });
+      chatEvent({ type: 'done' });
+    });
+    assert.equal(await tab.locator('.sh-agent-undo').isEnabled(), true);
+    await tab.clock.fastForward(2000);
+    assert.equal(await tab.locator('.sh-agent-undo').count(), 0);
+    assert.equal(await tab.locator('.sh-agent-receipt-detail').textContent(), 'Undo no longer available');
+    assert.ok(await tab.locator('.sh-agent-receipt-detail').isVisible());
+    assert.ok(await tab.locator('.sh-agent-panel').evaluate((p) => p.scrollWidth <= p.clientWidth + 1));
+    if (screenshots) await tab.screenshot({ path: resolve(screenshots, `undo-expired-${width}.png`) });
+    console.log(`PASS undo expiry at ${width}px: button removed and receipt explains availability`);
+    await tab.close();
+  }
   // The public hook must work against the actual closed shadow root, with no
   // attachShadow wrapper. The later layout tests capture it only to inspect chrome.
   for (const width of [1280, 375]) {

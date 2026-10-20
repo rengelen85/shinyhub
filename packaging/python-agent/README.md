@@ -167,10 +167,17 @@ validated again by the app. A write pauses for visitor approval in the chat
 panel, then runs the handler and returns its applied result to the agent.
 For a clear action result, a write tool may provide `receipt=lambda args,
 result: f"View set to {result['period']}"`. A tool may also provide an async
-`undo(args, result)` handler. The chat then offers Undo for five minutes. Undo
+`undo(args, result)` handler. By default, `undo_timeout=None` keeps Undo
+available until the next write or chat/session reset.
+Set `register(..., undo_timeout=3600)` to limit the window to an hour.
+When a configured window ends, the button is removed and the receipt says
+"Undo no longer available". Undo
 runs in the same viewer's Shiny session without asking the model; the handler
 must verify the app is still in the state created by that action before
 restoring the previous state. Only the most recent write remains undoable.
+Raise `ToolError("stale_view", "The date range changed again.")` for an expected
+failure; the chat shows that message to the visitor and consumes the undo.
+Unexpected failures show a generic message and are logged with a traceback.
 
 An AG-UI agent hosted in Amazon Bedrock AgentCore needs an authenticated
 `InvokeAgentRuntime` client or a hoster-managed HTTPS relay. `AGUIChat` does
@@ -459,7 +466,10 @@ Keep callbacks short: the graph lock is shared across sessions in the process.
 Do not wait inside a callback for browser input updates or unrelated slow I/O.
 
 `ui.update_*()` sends a client update; it does not synchronously change
-`input.x()`. Return normalized, server-owned view state, as `selected_period`
+`input.x()`. The incoming input echo needs the same reactive lock and cannot
+be processed until the callback returns. Report the normalized values you
+sent rather than polling for the echo, including in undo results and baselines.
+Return normalized, server-owned view state, as `selected_period`
 does above. Route manual input changes through the same normalization function,
 including clamping dates and clearing incompatible filters. Use that state for
 subsequent reads and outputs. A browser acknowledgment cannot guarantee that
@@ -493,6 +503,7 @@ and distinct from this budget fallback; recovery failures propagate as errors.
 | `max_tool_rounds` | Any backend | 4 | 1–8, plus one final call |
 | `max_output_tokens` | OpenAI/Bedrock | 500 | 100–8192; provider limits also apply |
 | `approval_timeout` | `register()` | 30 s | 1–300 s |
+| `undo_timeout` | `register()` | `None` | Finite seconds ≥1, or `None` for no time limit |
 | `history_exchanges` | `register()` | 6 | 1–32 complete exchanges |
 | `max_answer_chars` | `register()` | 8000 | 1000–32768 characters |
 
@@ -510,7 +521,7 @@ characters, 10 per minute and 40 per session; reset does not reset those budgets
 Browser dispatch allows 20 requests per minute, with write preflight and
 execution each consuming one request. Browser confirmation expires after 30
 seconds; each dispatch waits up to 10 seconds. Only the last chat write is
-undoable, for five minutes.
+undoable, with no time limit by default; set `undo_timeout` to limit its duration.
 
 ## Usage attribution
 

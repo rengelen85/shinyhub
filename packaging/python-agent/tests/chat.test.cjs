@@ -712,6 +712,104 @@ test("successful Undo removes suggestions for the previous view", (t) => {
   assert.equal(doc.querySelector(".sh-agent-followups"), null);
 });
 
+function undoClock(window) {
+  let now = 1000, id = 0;
+  const timers = new Map();
+  window.Date.now = () => now;
+  window.setInterval = (callback) => { timers.set(++id, callback); return id; };
+  window.clearInterval = (id) => timers.delete(id);
+  return {
+    timers,
+    advance(ms, tick = true) {
+      now += ms;
+      if (tick) Array.from(timers.values()).forEach((callback) => callback());
+    },
+  };
+}
+
+test("Undo expires while the answer is streaming and cannot be revived by done", (t) => {
+  const { window, doc, send } = ask(t);
+  const clock = undoClock(window);
+  send({ type: "action_applied", name: "set_year", actionId: "a1", receipt: "Showing year", undoExpiresIn: 2 });
+  const button = doc.querySelector(".sh-agent-undo");
+  assert.equal(button.disabled, true);
+  assert.match(button.title, /2 more seconds/);
+  clock.advance(1000);
+  assert.match(button.title, /1 more second$/);
+  clock.advance(1000);
+  assert.equal(doc.querySelector(".sh-agent-undo"), null);
+  assert.equal(doc.querySelector(".sh-agent-receipt-title").textContent, "Showing year");
+  assert.equal(doc.querySelector(".sh-agent-receipt-detail").textContent, "Undo no longer available");
+  assert.equal(doc.querySelector(".sh-agent-receipt-detail").hidden, false);
+  assert.equal(clock.timers.size, 0);
+  send({ type: "done" });
+  assert.equal(doc.querySelector(".sh-agent-undo"), null);
+});
+
+test("Undo checks the deadline on click even if background timers have not run", (t) => {
+  const { window, doc, send, inputs } = ask(t);
+  const clock = undoClock(window);
+  send({ type: "action_applied", name: "set_year", actionId: "a1", undoExpiresIn: 1 });
+  send({ type: "done" });
+  clock.advance(1000, false);
+  doc.querySelector(".sh-agent-undo").click();
+  assert.equal(inputs.some((entry) => entry.value.action === "undo"), false);
+  assert.equal(doc.querySelector(".sh-agent-undo"), null);
+});
+
+for (const seconds of [0, 3600, null, undefined]) {
+  test("Undo deadline supports " + String(seconds) + " seconds", (t) => {
+    const { window, doc, send } = ask(t);
+    const clock = undoClock(window);
+    send({ type: "action_applied", name: "set_year", actionId: "a1", undoExpiresIn: seconds });
+    send({ type: "done" });
+    if (seconds === 0) {
+      assert.equal(doc.querySelector(".sh-agent-undo"), null);
+      assert.equal(clock.timers.size, 0);
+      return;
+    }
+    clock.advance(300000);
+    assert.equal(!!doc.querySelector(".sh-agent-undo"), seconds !== undefined);
+    clock.advance(3300000);
+    assert.equal(!!doc.querySelector(".sh-agent-undo"), seconds === null);
+    assert.equal(clock.timers.size, 0);
+  });
+}
+
+for (const outcome of ["success", "failure", "reset", "reconnect", "replacement", "non-undoable"]) {
+  test("Undo timer cleanup on " + outcome + " preserves the final receipt", (t) => {
+    const { window, doc, send, inputs, reconnect } = ask(t);
+    const clock = undoClock(window);
+    send({ type: "action_applied", name: "set_year", actionId: "a1", undoExpiresIn: 2 });
+    if (outcome === "replacement" || outcome === "non-undoable") {
+      send({ type: "action_applied", name: "set_month", receipt: "Showing month",
+        ...(outcome === "replacement" ? { actionId: "a2", undoExpiresIn: null } : {}) });
+    }
+    send({ type: "done" });
+    if (outcome === "success" || outcome === "failure") {
+      doc.querySelector(".sh-agent-undo").click();
+      assert.equal(clock.timers.size, 0);
+      clock.advance(3000);
+      assert.equal(doc.querySelector(".sh-agent-undo").textContent, "Undoing…");
+      send({ type: "undo_result", requestId: inputs.at(-1).value.requestId, actionId: "a1",
+        ok: outcome === "success", message: "The date range changed again." });
+    }
+    if (outcome === "reset") send({ type: "reset" });
+    if (outcome === "reconnect") reconnect("s2");
+    assert.equal(clock.timers.size, 0);
+    clock.advance(300000);
+    assert.equal(doc.body.textContent.includes("Undo no longer available"), false);
+    if (outcome === "replacement") {
+      assert.equal(doc.querySelectorAll(".sh-agent-undo").length, 1);
+    } else {
+      assert.equal(doc.querySelector(".sh-agent-undo"), null);
+    }
+    if (outcome === "failure") {
+      assert.equal(doc.querySelector(".sh-agent-receipt-detail").textContent, "The date range changed again.");
+    }
+  });
+}
+
 test("question limits count Unicode characters consistently with the server", (t) => {
   const starter = "💸".repeat(119) + "?";
   const { doc, send, submit } = ask(t, { initialQuestion: false, starters: [starter], followups: 1 });

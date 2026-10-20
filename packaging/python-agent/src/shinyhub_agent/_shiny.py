@@ -65,6 +65,7 @@ def register(
     followups: int = 0,
     charts: bool = False,
     approval_timeout: float = 30,
+    undo_timeout: float | None = None,
     history_exchanges: int = 6,
     max_answer_chars: int = 8_000,
     usage_metadata: dict[str, str | None] | None = None,
@@ -80,6 +81,12 @@ def register(
     up to three experimental, editable, never auto-submitted suggestions on supporting
     chat agents. charts enables experimental chat-only rendering of ChartData results.
     These settings leave existing apps unchanged by default.
+
+    undo_timeout defaults to None, keeping undo until the next write or
+    chat/session reset. Set finite seconds (at least 1) to limit the window.
+    Tool and undo callbacks hold the reactive lock. Inputs changed with
+    ui.update_*() cannot reflect the browser update until the callback returns;
+    report the normalized values sent instead of waiting for an input echo.
     """
     from shiny import reactive
     from shiny.session import session_context
@@ -124,6 +131,7 @@ def register(
             registry,
             lambda event: session.send_custom_message(CHAT_EVENT_MESSAGE, event),
             approval_timeout=approval_timeout,
+            undo_timeout=undo_timeout,
             history_exchanges=history_exchanges,
             max_answer_chars=max_answer_chars,
             followups=followups,

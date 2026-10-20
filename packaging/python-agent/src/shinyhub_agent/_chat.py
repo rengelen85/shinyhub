@@ -13,7 +13,7 @@ from typing import Any, Protocol
 import httpx
 
 from ._charts import ChartRegistry
-from ._core import ToolError, ToolRegistry
+from ._core import ToolError, ToolRegistry, _UnexpectedToolError
 from ._errors import ProviderError
 from ._runtime import bounded_int
 from ._session import REQUEST_ID, VERSION
@@ -46,6 +46,7 @@ class ChatSession:
         send: Send,
         *,
         approval_timeout: float = 30,
+        undo_timeout: float | None = None,
         followups: int = 0,
         charts: bool = False,
         history_exchanges: int = 6,
@@ -58,6 +59,12 @@ class ChatSession:
             or not 1 <= approval_timeout <= 300
         ):
             raise ValueError("approval_timeout must be between 1 and 300 seconds")
+        if undo_timeout is not None and (
+            isinstance(undo_timeout, bool)
+            or not isinstance(undo_timeout, (int, float))
+            or not 1 <= undo_timeout < float("inf")
+        ):
+            raise ValueError("undo_timeout must be finite and at least 1 second, or None")
         bounded_int("history_exchanges", history_exchanges, 1, 32)
         bounded_int("max_answer_chars", max_answer_chars, 1_000, 32_768)
         bounded_int("followups", followups, 0, 3)
@@ -93,6 +100,7 @@ class ChatSession:
         self.last_action: tuple[str, str, dict[str, Any], Any, float] | None = None
         self.task: asyncio.Task[Any] | None = None
         self.approval_timeout = approval_timeout
+        self.undo_timeout = undo_timeout
         self.history_exchanges = history_exchanges
         self.max_answer_chars = max_answer_chars
         self.usage_metadata = dict(usage_metadata or {})
@@ -161,7 +169,10 @@ class ChatSession:
                 if (
                     action is None
                     or raw.get("actionId") != action[0]
-                    or time.monotonic() - action[4] > 300
+                    or (
+                        self.undo_timeout is not None
+                        and time.monotonic() - action[4] >= self.undo_timeout
+                    )
                 ):
                     await emit(
                         {
@@ -199,16 +210,21 @@ class ChatSession:
                             "detail": detail,
                         }
                     )
-                except Exception:
-                    logger.exception("Agent chat undo failed")
-                    await emit(
-                        {
-                            "type": "undo_result",
-                            "ok": False,
-                            "actionId": action[0],
-                            "message": "Undo could not finish. Check the current view.",
-                        }
-                    )
+                except Exception as error:
+                    failure = {
+                        "type": "undo_result",
+                        "ok": False,
+                        "actionId": action[0],
+                    }
+                    if isinstance(error, ToolError) and not isinstance(
+                        error, _UnexpectedToolError
+                    ):
+                        logger.info("Agent chat undo unavailable: %s", error.code)
+                        failure.update(code=error.code, message=str(error))
+                    else:
+                        logger.exception("Agent chat undo failed")
+                        failure["message"] = "Undo could not finish. Check the current view."
+                    await emit(failure)
             return
         if request_id in self.seen_requests:
             await emit(
@@ -350,6 +366,14 @@ class ChatSession:
                             }
                             if tool and tool.undo is not None:
                                 event["actionId"] = action[0]
+                                event["undoExpiresIn"] = (
+                                    None
+                                    if self.undo_timeout is None
+                                    else max(
+                                        0,
+                                        self.undo_timeout - (time.monotonic() - action[4]),
+                                    )
+                                )
                     await emit(event)
                 await emit_charts()
                 if not answer.strip() and chart_context:

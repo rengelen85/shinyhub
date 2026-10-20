@@ -1,8 +1,11 @@
 import asyncio
 import json
+import logging
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from shinyhub_agent import AgentTool, OpenAIChat, ToolError, ToolRegistry
 from shinyhub_agent._chat import ChatSession
@@ -177,7 +180,15 @@ def test_declined_action_does_not_run_handler():
     assert any(item.get("text") == "Change cancelled." for item in events)
 
 
-def test_action_receipt_can_undo_once_and_reject_stale_view():
+@pytest.mark.parametrize("undo_timeout", [300, 3600, None])
+def test_action_receipt_can_undo_once_and_reject_stale_view(
+    undo_timeout, monkeypatch, caplog,
+):
+    now = 1000
+    monkeypatch.setattr(
+        "shinyhub_agent._chat.time", SimpleNamespace(monotonic=lambda: now)
+    )
+    caplog.set_level(logging.INFO, logger="shinyhub_agent._chat")
     state = {"period": "week"}
     events = []
 
@@ -200,7 +211,9 @@ def test_action_receipt_can_undo_once_and_reject_stale_view():
 
     class StubAgent:
         async def run(self, message, history, tools, approve, *, thread_id):
+            nonlocal now
             result = await approve("set_period", {"period": "year"})
+            now += 2  # Time between execution and forwarding the receipt counts.
             yield {"type": "action_applied", "name": "set_period", "result": result}
             yield {"type": "delta", "text": "Showing year."}
 
@@ -211,7 +224,9 @@ def test_action_receipt_can_undo_once_and_reject_stale_view():
             events.append(item)
             if item["type"] == "approval_required":
                 approvals.put_nowait(item)
-        chat = ChatSession(StubAgent(), tools, send)
+        nonlocal now
+        options = {} if undo_timeout is None else {"undo_timeout": undo_timeout}
+        chat = ChatSession(StubAgent(), tools, send, **options)
 
         async def change_with_approval(request_id):
             task = asyncio.create_task(chat.handle({
@@ -227,6 +242,11 @@ def test_action_receipt_can_undo_once_and_reject_stale_view():
         action = await change_with_approval("request_12345678")
         assert action["receipt"] == "View set to year"
         assert isinstance(action["actionId"], str)
+        assert action["undoExpiresIn"] == (
+            None if undo_timeout is None else undo_timeout - 2
+        )
+        # A custom window and None both permit undo after the old five-minute limit.
+        now += 301 if undo_timeout != 300 else 1
         await chat.handle({"version": 1, "session": chat.nonce, "requestId": "request_87654321",
                            "action": "undo", "actionId": action["actionId"]})
         assert state["period"] == "week"
@@ -243,6 +263,63 @@ def test_action_receipt_can_undo_once_and_reject_stale_view():
         await chat.handle({"version": 1, "session": chat.nonce, "requestId": "request_87654323",
                            "action": "undo", "actionId": action["actionId"]})
         assert events[-1]["ok"] is False
+        assert events[-1]["code"] == "stale_view"
+        assert events[-1]["message"] == "The view changed again."
         assert state["period"] == "week"
+        assert chat.last_action is None
+
+        if undo_timeout is not None:
+            action = await change_with_approval("request_12345680")
+            now += undo_timeout - 2  # Exactly at the deadline is expired.
+            await chat.handle({"version": 1, "session": chat.nonce, "requestId": "request_87654324",
+                               "action": "undo", "actionId": action["actionId"]})
+            assert events[-1]["ok"] is False
+            assert events[-1]["message"] == "This change can no longer be undone."
+            assert state["period"] == "year"
 
     asyncio.run(run())
+    records = [record for record in caplog.records if "undo unavailable" in record.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert records[0].exc_info is None
+
+
+@pytest.mark.parametrize("timeout", [True, False, 0, -1, 0.5, "300", float("nan"), float("inf"), -float("inf")])
+def test_invalid_undo_timeout(timeout):
+    with pytest.raises(ValueError, match="undo_timeout"):
+        ChatSession(object(), registry(), None, undo_timeout=timeout)
+
+
+def test_default_undo_timeout():
+    assert ChatSession(object(), registry(), None).undo_timeout is None
+
+
+def test_unexpected_undo_error_is_generic_and_logged(caplog):
+    async def undo(args, result):
+        raise RuntimeError("private failure detail")
+
+    tools = ToolRegistry([AgentTool(
+        "write_view", "Change view",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+        read, read_only=False, confirmation="Change view?", undo=undo,
+    )])
+    events = []
+
+    async def run():
+        async def send(event):
+            events.append(event)
+
+        chat = ChatSession(object(), tools, send, undo_timeout=None)
+        chat.last_action = ("action1", "write_view", {}, {}, 0)
+        await chat.handle({
+            "version": 1, "session": chat.nonce, "requestId": "request_12345678",
+            "action": "undo", "actionId": "action1",
+        })
+        assert chat.last_action is None
+
+    asyncio.run(run())
+    assert events[-1]["message"] == "Undo could not finish. Check the current view."
+    assert "private failure detail" not in json.dumps(events)
+    record = next(record for record in caplog.records if record.message == "Agent chat undo failed")
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None

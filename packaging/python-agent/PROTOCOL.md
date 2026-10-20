@@ -117,6 +117,22 @@ the handler. Timeout emits `approval_expired` with the matching `approvalId`;
 late decisions cannot revive that approval. The chat panel's **Stop** and
 **New chat** controls send `action: "cancel"` and `action: "reset"` requests.
 
+For an undoable write, `action_applied` includes a plain-text `receipt`,
+`actionId`, and `undoExpiresIn`: the remaining undo window in seconds when the
+event is sent, or `null` when time-based expiry is disabled (the default).
+A configured window starts when the write completes; delayed receipts may carry
+zero remaining seconds. Clients remove expired Undo buttons and show
+"Undo no longer available". A missing field from an older server uses the
+legacy 300-second window. Each new write replaces the previous undo, even if
+the new write has no undo handler. Reset and session changes also clear undo.
+
+To undo, send `.shinyhub_agent_chat_request` with `action: "undo"`, `actionId`,
+and the usual version, session and request ID. The server checks the current
+action and deadline independently, then sends `undo_result` with `ok` and
+either `detail` or a visitor-safe `message`. An expected `ToolError` includes
+its `code` and message; unexpected exceptions are not serialized. An attempted
+handler consumes the undo even when it fails.
+
 The browser helper also announces `shinyhub:chat:capabilities` with
 `{version: 1, enabled: true, panel: <Element>, title: <string>}`. A compatible
 ShinyHub host slots that element into its own overlay and responds with

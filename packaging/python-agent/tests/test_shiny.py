@@ -108,10 +108,21 @@ def test_registered_callbacks_read_update_flush_and_undo_without_app_plumbing(
     asyncio.run(run())
 
 
-def test_session_end_cancels_model_work_without_holding_reactive_lock(monkeypatch):
+@pytest.mark.parametrize("undo_timeout", [1.5, 3600, None, "default"])
+def test_session_end_cancels_model_work_without_holding_reactive_lock(monkeypatch, undo_timeout):
+    from shinyhub_agent import _shiny
     from shiny.reactive._core import _reactive_environment
 
     monkeypatch.setattr(_reactive_environment, "_lock", None)
+    chat_sessions = []
+    original = _shiny.ChatSession
+
+    def capture_chat(*args, **kwargs):
+        chat = original(*args, **kwargs)
+        chat_sessions.append(chat)
+        return chat
+
+    monkeypatch.setattr(_shiny, "ChatSession", capture_chat)
 
     async def run():
         session = Session()
@@ -137,6 +148,10 @@ def test_session_end_cancels_model_work_without_holding_reactive_lock(monkeypatc
             input=inputs,
             tools=[AgentTool("read_view", "Read view", SCHEMA, read)],
             chat=Agent(),
+            **({} if undo_timeout == "default" else {"undo_timeout": undo_timeout}),
+        )
+        assert chat_sessions[0].undo_timeout == (
+            None if undo_timeout == "default" else undo_timeout
         )
         await session.flushed[0]()
         nonce = next(

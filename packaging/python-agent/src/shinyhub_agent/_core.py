@@ -27,6 +27,10 @@ class ToolError(Exception):
         self.code = code
 
 
+class _UnexpectedToolError(ToolError):
+    """A sanitized unexpected failure, retaining its cause for server logging."""
+
+
 def _reject_references(value: Any) -> None:
     if isinstance(value, Mapping):
         if "$ref" in value or "$dynamicRef" in value:
@@ -40,6 +44,13 @@ def _reject_references(value: Any) -> None:
 
 @dataclass(frozen=True)
 class AgentTool:
+    """An app tool with optional approval, receipt and undo callbacks.
+
+    When registered with Shiny, handlers and undo callbacks hold the reactive
+    lock. After ui.update_*(), report the normalized values sent: the browser's
+    input echo cannot be processed until the callback returns.
+    """
+
     name: str
     description: str
     input_schema: Mapping[str, Any]
@@ -182,7 +193,7 @@ class ToolRegistry:
         except ToolError:
             raise
         except Exception as error:
-            raise ToolError(
+            raise _UnexpectedToolError(
                 "tool_failed", "The app could not finish this action."
             ) from error
 

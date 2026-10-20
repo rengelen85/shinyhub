@@ -14,6 +14,8 @@
   var previousFocus = null;
   var pendingTools = [];
   var undoRequests = new Map();
+  var activeUndo = null;
+  var undoTimer = null;
   var toolbarAvailable = false;
   var toolbarSuspended = false;
   var nativeChat = false;
@@ -819,6 +821,21 @@
     setStatus("Waiting for your approval");
   }
 
+  function clearUndo() {
+    clearInterval(undoTimer);
+    undoTimer = null;
+    if (activeUndo) activeUndo.button.remove();
+    activeUndo = null;
+  }
+
+  function expireUndo() {
+    if (!activeUndo) return;
+    activeUndo.receipt.dataset.result = "unavailable";
+    activeUndo.detail.textContent = "Undo no longer available";
+    activeUndo.detail.hidden = false;
+    clearUndo();
+  }
+
   function showReceipt(event) {
     var follow = nearBottom();
     var receipt = lastApprovalCard && lastApprovalCard.dataset.result === "applying"
@@ -835,13 +852,25 @@
     receipt.replaceChildren(mark, copy);
     var toolIndex = pendingTools.findIndex(function (entry) { return entry.name === event.name; });
     if (toolIndex >= 0) pendingTools.splice(toolIndex, 1)[0].item.remove();
+    clearUndo();
     panel.querySelectorAll(".sh-agent-undo").forEach(function (button) { button.remove(); });
     if (typeof event.actionId === "string") {
+      // Missing deadlines come from older servers with the fixed five-minute
+      // window. An explicit null means the app disabled time-based expiry.
+      var seconds = event.undoExpiresIn === null ? null :
+        typeof event.undoExpiresIn === "number" && Number.isFinite(event.undoExpiresIn) &&
+        event.undoExpiresIn >= 0 ? event.undoExpiresIn : 300;
+      var expiresAt = seconds === null ? null : Date.now() + seconds * 1000;
       var undo = make("button", "sh-agent-undo", "Undo");
       undo.type = "button";
       undo.disabled = !!activeRequest;
       undo.setAttribute("aria-label", "Undo: " + title.textContent);
       undo.addEventListener("click", function () {
+        if (!activeUndo || activeUndo.button !== undo || undo.disabled) return;
+        if (expiresAt !== null && Date.now() >= expiresAt) { expireUndo(); return; }
+        clearInterval(undoTimer);
+        undoTimer = null;
+        activeUndo = null;
         var requestId = crypto.randomUUID();
         undo.disabled = true;
         undo.dataset.pending = "true";
@@ -851,6 +880,17 @@
           action: "undo", actionId: event.actionId });
       });
       receipt.append(undo);
+      activeUndo = { receipt: receipt, detail: detail, button: undo };
+      if (expiresAt !== null) {
+        function tick() {
+          var remaining = Math.ceil((expiresAt - Date.now()) / 1000);
+          if (remaining <= 0) expireUndo();
+          else undo.title = "Undo available for " + remaining + " more " +
+            (remaining === 1 ? "second" : "seconds");
+        }
+        undoTimer = setInterval(tick, 1000);
+        tick();
+      }
     }
     if (!receipt.isConnected && activeAnswer) activeAnswer.parentNode.before(receipt);
     lastApprovalCard = null;
@@ -1068,6 +1108,8 @@
       if (!message || message.version !== VERSION || !message.enabled ||
           typeof message.session !== "string") return;
       if (chatSession && chatSession !== message.session) {
+        clearUndo();
+        undoRequests.clear();
         clearSuggestions();
         if (window.shinyhubAgentCharts) window.shinyhubAgentCharts.dispose(log);
         log.replaceChildren(empty);
@@ -1094,6 +1136,7 @@
         return;
       }
       if (event.type === "reset") {
+        clearUndo();
         clearSuggestions();
         cancelAnswerFrame();
         activeAnswer = null;
