@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.21.2](https://github.com/rvben/shinyhub/compare/v0.21.1...v0.21.2) - 2026-10-20
+
 ### Upgrade notice
 
 This release migrates preserved capacity refusals from `failed` to `blocked`,
@@ -18,6 +20,9 @@ accounting while keeping sampled CPU pressure and memory admission enabled.
 Fleet capacity waiting remains bounded by `--capacity-wait` (5m by default);
 use a longer wait, such as `11m`, with a custom `drain_timeout: 10m`.
 
+The agent changes below belong to the separately versioned `shinyhub-agent`
+package. Upgrading the ShinyHub server does not upgrade that package.
+
 ### Fixed
 
 - **capacity**: let fleet apply wait for CPU and surge slots held by draining
@@ -26,6 +31,18 @@ use a longer wait, such as `11m`, with a custom `drain_timeout: 10m`.
   blocked attempts instead of failed deployments, including historical badges.
 - **config**: accept `worker_cpu_request_cores: 0` to disable static CPU
   accounting while retaining sampled CPU pressure and memory admission.
+
+- **ci**: use portable temporary directory for chart checks ([2258bfd](https://github.com/rvben/shinyhub/commit/2258bfd148a7347554a8e4ab7c805ad42c24d59a))
+- **agent**: make undo expiry opt-in and surface stale-view errors ([54330c5](https://github.com/rvben/shinyhub/commit/54330c56a3ef543b36d7f9abf61a5fa2b6b4c5a7))
+- **deploy**: honor readiness contract during replica startup ([cecb818](https://github.com/rvben/shinyhub/commit/cecb818cae2c161f38af7a2cd42cd1080870036b))
+
+### Added
+
+- **agent**: withdraw stale undo actions reactively ([9d18bc7](https://github.com/rvben/shinyhub/commit/9d18bc7f2db3cc2fa36af0cc2935e581ab13fd23))
+
+### Performance
+
+- **cli**: overlap deploy checks and stream bundle uploads ([6a7a153](https://github.com/rvben/shinyhub/commit/6a7a153cebdb5b8598197f7c8da1f8a2fdf061d3))
 
 ## [0.21.1](https://github.com/rvben/shinyhub/compare/v0.21.0...v0.21.1) - 2026-10-16
 
