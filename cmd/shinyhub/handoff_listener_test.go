@@ -7,9 +7,50 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func TestHandoffWaitsForHandlerRatherThanActiveState(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	type contextKey struct{}
+	stateCalls := 0
+	srv := &http.Server{
+		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(ctx, contextKey{}, "preserved")
+		},
+		ConnState: func(net.Conn, http.ConnState) { stateCalls++ },
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Context().Value(contextKey{}) != "preserved" {
+				t.Error("existing connection context lost")
+			}
+			fmt.Fprint(w, "served")
+		}),
+	}
+	ln := newHandoffListener(nil, srv)
+	ln.pending[conn] = struct{}{}
+	srv.ConnState(conn, http.StateActive)
+	if len(ln.pending) != 1 {
+		t.Fatal("active state released connection before the server's shutdown check")
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(srv.ConnContext(req.Context(), conn))
+	response := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(response, req)
+	if len(ln.pending) != 0 || response.Body.String() != "served" || stateCalls != 1 {
+		t.Fatalf("handler handoff failed: pending=%d body=%q state calls=%d", len(ln.pending), response.Body.String(), stateCalls)
+	}
+	for _, state := range []http.ConnState{http.StateClosed, http.StateHijacked, http.StateIdle} {
+		ln.pending[conn] = struct{}{}
+		srv.ConnState(conn, state)
+		if len(ln.pending) != 0 {
+			t.Fatalf("terminal state %v left a pending connection", state)
+		}
+	}
+}
 
 func TestHandoffQuiesceCompletesAlreadyAcceptedRequest(t *testing.T) {
 	raw, err := net.Listen("tcp", "127.0.0.1:0")

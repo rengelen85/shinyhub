@@ -9,8 +9,8 @@ import (
 
 // A standard Server.Shutdown can close a connection accepted just before it
 // enters shutdown, before c.serve reads that client's first request. Stop the
-// accept loop first, then let already-accepted connections reach their first
-// request (or their header timeout) before setting the server shutdown flag.
+// accept loop first, then let already-accepted connections enter their first
+// handler (or reach their header timeout) before setting the shutdown flag.
 type handoffListener struct {
 	net.Listener
 	mu        sync.Mutex
@@ -21,24 +21,48 @@ type handoffListener struct {
 	closed    bool
 }
 
+type handoffConnKey struct{}
+
 func newHandoffListener(ln net.Listener, srv *http.Server) *handoffListener {
 	h := &handoffListener{Listener: ln, pending: make(map[net.Conn]struct{}), changed: make(chan struct{}, 1), done: make(chan struct{})}
+	previousContext := srv.ConnContext
+	srv.ConnContext = func(ctx context.Context, conn net.Conn) context.Context {
+		if previousContext != nil {
+			ctx = previousContext(ctx, conn)
+		}
+		return context.WithValue(ctx, handoffConnKey{}, conn)
+	}
+	handler := srv.Handler
+	if handler == nil {
+		handler = http.DefaultServeMux
+	}
+	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if conn, ok := r.Context().Value(handoffConnKey{}).(net.Conn); ok {
+			h.release(conn)
+		}
+		handler.ServeHTTP(w, r)
+	})
 	previous := srv.ConnState
 	srv.ConnState = func(conn net.Conn, state http.ConnState) {
 		if previous != nil {
 			previous(conn, state)
 		}
-		if state != http.StateNew {
-			h.mu.Lock()
-			delete(h.pending, conn)
-			h.mu.Unlock()
-			select {
-			case h.changed <- struct{}{}:
-			default:
-			}
+		// StateActive runs before net/http's shutdown check. Releasing here
+		// could let Shutdown discard the request before its handler starts.
+		if state != http.StateNew && state != http.StateActive {
+			h.release(conn)
 		}
 	}
 	return h
+}
+func (h *handoffListener) release(conn net.Conn) {
+	h.mu.Lock()
+	delete(h.pending, conn)
+	h.mu.Unlock()
+	select {
+	case h.changed <- struct{}{}:
+	default:
+	}
 }
 func (h *handoffListener) Accept() (net.Conn, error) {
 	conn, err := h.Listener.Accept()
