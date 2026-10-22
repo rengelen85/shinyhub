@@ -383,8 +383,22 @@ http.server.HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H).serve_forever(
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
+	ready := make(chan struct{}, 16)
+	waitForPromotion := func() {
+		t.Helper()
+		select {
+		case <-ready:
+		case <-time.After(6 * time.Second):
+			t.Fatal("candidate never completed promotion")
+		}
+	}
 	go func() {
 		done <- Run(ctx, Options{
+			OnEvent: func(event Event) {
+				if event.Type == "phase" && event.Phase == "ready" {
+					ready <- struct{}{}
+				}
+			},
 			BundleDir: source, ManifestPath: filepath.Join(root, "fleet.toml"),
 			BundleInputs: []bundle.FileInputSpec{{From: "_shared/version.txt", To: "helpers/version.txt"}},
 			StateDir:     t.TempDir(), Slug: "fleet-input-reload", Port: port, NoSync: true,
@@ -392,11 +406,15 @@ http.server.HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H).serve_forever(
 	}()
 	url := fmt.Sprintf("http://127.0.0.1:%d/app/fleet-input-reload/", port)
 	waitForBody(t, url, "v1", 5*time.Second)
+	waitForPromotion()
 
 	if err := os.WriteFile(shared, []byte("v2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	waitForBody(t, url, "v2", 6*time.Second)
+	// The public readiness probe routes provisionally before promotion. Wait
+	// for the ready event before a new save can cancel that candidate.
+	waitForPromotion()
 	if err := os.MkdirAll(filepath.Join(source, "helpers"), 0o755); err != nil {
 		t.Fatal(err)
 	}
