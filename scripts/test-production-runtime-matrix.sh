@@ -69,7 +69,7 @@ else
   docker run --rm --init --user "$(id -u):$(id -g)" --cpus=2 --memory=4g \
     --mount "type=bind,src=$root,dst=/work" --mount "type=bind,src=$task,dst=/task" \
     -w /work -e GOWORK=off -e CGO_ENABLED=0 -e GOCACHE=/task/cache -e GOMODCACHE=/task/modules \
-    golang:1.26.9-alpine go build -o /task/shinyhub ./cmd/shinyhub
+    golang:1.26.10-alpine go build -o /task/shinyhub ./cmd/shinyhub
 fi
 mkdir -p "$root/loadtest/results"
 export MATRIX_TOOLS="$task/tools" MATRIX_BINARY="$task/shinyhub"
