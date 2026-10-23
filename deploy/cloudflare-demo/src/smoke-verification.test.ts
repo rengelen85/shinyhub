@@ -22,6 +22,85 @@ const trace = (path: string, extra = {}) => ({
   ...extra,
 });
 
+const probe = (kind: string, path: string, outcome: string, status?: number, eventTimestamp = 1) => ({
+  outcome, exceptions: [], logs: [], eventTimestamp,
+  event: { request: { method: "GET", url: `https://demo.test${path}`, headers: {
+    "x-shinyhub-demo-smoke": id, "x-shinyhub-demo-smoke-probe": kind,
+  } }, response: status === undefined ? undefined : { status } },
+});
+
+test("a canceled retry probe requires a later successful probe of the same kind", () => {
+  for (const [kind, path, status] of [
+    ["wake", "/", 200], ["readiness", "/__demo/ready", 204], ["version", "/api/server-info", 200],
+  ] as const) {
+    const inspector = smokeInspector(id);
+    for (const path of websocketPaths) inspector.ingest(trace(path));
+    inspector.ingest(probe(kind, path, "canceled"));
+    assert.equal(inspector.check(), false);
+    inspector.ingest(probe(kind, path, "ok", status, 2));
+    assert.equal(inspector.check(), true);
+  }
+});
+
+test("late delivery of a canceled probe cannot undo a newer successful retry", () => {
+  const inspector = smokeInspector(id);
+  for (const path of websocketPaths) inspector.ingest(trace(path));
+  inspector.ingest(probe("readiness", "/__demo/ready", "ok", 204, 2));
+  inspector.ingest(probe("readiness", "/__demo/ready", "canceled", undefined, 1));
+  assert.equal(inspector.check(), true);
+  inspector.ingest(probe("readiness", "/__demo/ready", "canceled", undefined, 3));
+  assert.equal(inspector.check(), false);
+});
+
+test("probe markers cannot suppress ordinary cancellations, exceptions or server errors", () => {
+  for (const record of [
+    probe("readiness", "/app/operations-dashboard/websocket/", "canceled"),
+    probe("unknown", "/__demo/ready", "canceled"),
+    { ...probe("readiness", "/__demo/ready", "canceled"), eventTimestamp: undefined },
+    { ...probe("readiness", "/__demo/ready", "canceled"), event: {
+      request: { method: "POST", url: "https://demo.test/__demo/ready", headers: {
+        "x-shinyhub-demo-smoke": id, "x-shinyhub-demo-smoke-probe": "readiness",
+      } },
+    } },
+    { ...probe("readiness", "/__demo/ready", "canceled"), exceptions: [{ message: "private exception" }] },
+    probe("readiness", "/__demo/ready", "canceled", 500),
+    { ...probe("readiness", "/__demo/ready", "canceled"), logs: [{ level: "error", message: ["private log"] }] },
+  ]) {
+    const inspector = smokeInspector(id);
+    inspector.ingest(record);
+    inspector.ingest(probe("readiness", "/__demo/ready", "ok", 204, 2));
+    for (const path of websocketPaths) inspector.ingest(trace(path));
+    assert.throws(() => inspector.check(), /server-side|unsuccessful|5xx/);
+  }
+});
+
+test("invocation diagnostics identify safe paths and outcomes without exposing request or exception data", () => {
+  const inspector = smokeInspector(id);
+  inspector.ingest({ outcome: "exception", exceptions: [{ message: "private exception" }],
+    event: { request: { url: `https://demo.test/__demo/ready?token=private-token`,
+      headers: { "x-shinyhub-demo-smoke": id, cookie: "private-cookie" } } },
+  });
+  assert.throws(() => inspector.check(), error => {
+    assert.match(error.message, /path=\/__demo\/ready, outcome=exception, exceptions=1/);
+    assert.doesNotMatch(error.message, /private|token|cookie|demo\.test/);
+    return true;
+  });
+});
+
+test("a different probe or unsuccessful retry cannot confirm recovery", () => {
+  for (const retry of [
+    probe("version", "/api/server-info", "ok", 200, 2),
+    probe("readiness", "/__demo/ready", "ok", 503, 2),
+    probe("readiness", "/__demo/ready", "ok", 200, 2),
+  ]) {
+    const inspector = smokeInspector(id);
+    for (const path of websocketPaths) inspector.ingest(trace(path));
+    inspector.ingest(probe("readiness", "/__demo/ready", "canceled"));
+    inspector.ingest(retry);
+    assert.equal(inspector.check(), false);
+  }
+});
+
 test("verification requires distinct two-sided closes for every app", () => {
   const inspector = smokeInspector(id);
   assert.equal(inspector.check(), false);

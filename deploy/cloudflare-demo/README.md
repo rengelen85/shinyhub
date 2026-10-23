@@ -63,7 +63,11 @@ persisted Cloudflare Workers Logs for the deployed version and marked smoke URLs
 A passing client or tail check alone is insufficient.
 Successful streamed HTTP responses may have a `canceled` invocation outcome;
 these require the client HTTP checks to pass and never substitute for WebSocket
-close evidence. Synthetic WebSocket clients send a correlation header because
+close evidence. The smoke script marks its retryable wake, readiness, and version
+probes. A canceled probe without a completed response is tolerated only after
+telemetry confirms a later successful probe of the same kind; exceptions and
+error logs still fail the run. Event timestamps preserve this ordering even when
+tail records arrive late. Synthetic WebSocket clients send a correlation header because
 query values are redacted in tail events. Marked passive status probes publish
 the DO's bounded synthetic close records through the tail, so verification
 checks the actual container relay rather than relying on missing DO tail logs.

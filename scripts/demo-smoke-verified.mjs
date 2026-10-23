@@ -22,11 +22,20 @@ export const websocketPaths = [
   "/app/streamlit-demo/_stcore/stream",
 ];
 
+// Only these explicitly marked, retried GETs can recover from cancellation.
+const retryProbes = new Map([
+  ["wake", { path: "/", statuses: [200, 302, 303] }],
+  ["readiness", { path: "/__demo/ready", statuses: [204] }],
+  ["version", { path: "/api/server-info", statuses: [200] }],
+]);
+
 // Consume only this smoke run's records. Never print/store raw tail payloads:
 // unrelated visitors' request headers can include session cookies.
 export function smokeInspector(id) {
   const closed = new Set();
   const connections = new Set();
+  const canceledProbes = new Map();
+  const confirmedProbes = new Map();
   let observed = false;
   let failure;
   return {
@@ -34,6 +43,7 @@ export function smokeInspector(id) {
       if (record.type === "tail-info" || (record.event?.type && record.event?.message)) { failure = "Tail stream reported incomplete telemetry"; return; }
       const request = record.event?.request;
       const headers = request?.headers ?? {};
+      const header = name => Object.entries(headers).find(([key]) => key.toLowerCase() === name)?.[1];
       const logMessages = (record.logs ?? []).flatMap(log => log.message ?? []).flatMap(message => {
         if (typeof message !== "string") return [message];
         try { return [JSON.parse(message)]; } catch { return []; }
@@ -51,14 +61,29 @@ export function smokeInspector(id) {
       // that response separately; upgrades still require clean server closes.
       const completedHTTP = record.outcome === "canceled"
         && record.event?.response?.status >= 200 && record.event.response.status < 400;
+      const probeKind = header("x-shinyhub-demo-smoke-probe");
+      const probe = retryProbes.get(probeKind);
+      const markedProbe = probe !== undefined && probe.path === url?.pathname && request?.method === "GET"
+        && Number.isFinite(record.eventTimestamp);
+      const canceledProbe = markedProbe && record.outcome === "canceled" && !completedHTTP;
+      if (canceledProbe) {
+        canceledProbes.set(probeKind, Math.max(canceledProbes.get(probeKind) ?? -Infinity, record.eventTimestamp));
+      }
+      if (markedProbe && record.outcome === "ok" && probe.statuses.includes(record.event?.response?.status)) {
+        confirmedProbes.set(probeKind, Math.max(confirmedProbes.get(probeKind) ?? -Infinity, record.eventTimestamp));
+      }
       // A transparent upgrade can end with this platform outcome even when
       // its client and container relay both completed normal close handshakes.
       // It cannot pass check() until independent DO evidence covers every app.
       const disconnectedUpgrade = record.outcome === "responseStreamDisconnected"
         && websocketPaths.includes(url?.pathname)
         && Object.entries(headers).some(([key, value]) => key.toLowerCase() === "upgrade" && value?.toLowerCase() === "websocket");
-      if ((record.exceptions?.length ?? 0) > 0 || (record.outcome && record.outcome !== "ok" && !completedHTTP && !disconnectedUpgrade)) {
-        failure = "Smoke request produced a server-side exception or unsuccessful invocation";
+      if ((record.exceptions?.length ?? 0) > 0 || (record.outcome && record.outcome !== "ok" && !completedHTTP && !disconnectedUpgrade && !canceledProbe)) {
+        // Do not expose URLs, headers, exception messages or unrelated logs.
+        const path = [...websocketPaths, ...Array.from(retryProbes.values(), p => p.path)].includes(url?.pathname)
+          ? url.pathname : "<other>";
+        const outcome = /^[a-zA-Z]+$/.test(record.outcome ?? "") ? record.outcome : "unknown";
+        failure = `Smoke request produced a server-side exception or unsuccessful invocation (path=${path}, outcome=${outcome}, exceptions=${record.exceptions?.length ?? 0})`;
       }
       if (record.event?.response?.status >= 500 && record.event.response.status !== 503) {
         failure = "Smoke request returned HTTP 5xx";
@@ -80,6 +105,11 @@ export function smokeInspector(id) {
     },
     check() {
       if (failure) throw new Error(failure);
+      // Tail records can arrive out of order. A successful earlier request
+      // cannot clear a later cancellation, nor can another probe's response.
+      for (const [kind, timestamp] of canceledProbes) {
+        if ((confirmedProbes.get(kind) ?? -Infinity) <= timestamp) return false;
+      }
       return observed && websocketPaths.every(path => closed.has(path)) && connections.size >= websocketPaths.length;
     },
     get observed() { return observed; },

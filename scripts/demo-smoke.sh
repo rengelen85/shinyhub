@@ -33,6 +33,7 @@ curl() {
 nudge() {
   curl --silent --show-error --output /dev/null \
     --connect-timeout 10 --max-time 30 \
+    --header 'X-ShinyHub-Demo-Smoke-Probe: wake' \
     --header 'Sec-Fetch-Dest: document' \
     --header 'Sec-Fetch-Mode: navigate' \
     --header 'Accept: text/html,application/xhtml+xml' \
@@ -113,6 +114,7 @@ wake() {
     nudge
     if code=$(curl --silent --show-error --output /dev/null \
       --connect-timeout 10 --max-time 30 --write-out '%{http_code}' \
+      --header 'X-ShinyHub-Demo-Smoke-Probe: readiness' \
       "$base_url/__demo/ready"); then
       if [ "$code" = "204" ]; then
         printf '%s -> awake\n' "$base_url/"
@@ -156,7 +158,8 @@ if [ -n "${SHINYHUB_DEMO_EXPECTED_VERSION:-}" ]; then
   server_info=
   while [ "$attempt" -le "$max_attempts" ]; do
     if server_info=$(curl --silent --show-error --fail \
-      --connect-timeout 10 --max-time 30 "$base_url/api/server-info"); then
+      --connect-timeout 10 --max-time 30 \
+      --header 'X-ShinyHub-Demo-Smoke-Probe: version' "$base_url/api/server-info"); then
       case "$server_info" in
         *'"version":"'"$SHINYHUB_DEMO_EXPECTED_VERSION"'"'*)
           printf '%s -> version %s\n' "$base_url/api/server-info" "$SHINYHUB_DEMO_EXPECTED_VERSION"
