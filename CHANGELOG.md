@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.21.3](https://github.com/rvben/shinyhub/compare/v0.21.2...v0.21.3) - 2026-10-23
+
+### Fixed
+
+- **agent**: allow selecting chat text in the toolbar ([37a8e84](https://github.com/rvben/shinyhub/commit/37a8e84fd63dae7b0191f84dab08ef2778cdfee3))
+- **server**: retain accepted requests during handoff ([a61c95b](https://github.com/rvben/shinyhub/commit/a61c95b605cddbe9ad620d676e0f3817c23a2afa))
+- **security**: require patched Go 1.26.10 toolchain ([8ed126a](https://github.com/rvben/shinyhub/commit/8ed126a49510f69fcd67b970768ca0796ee752cb))
+- **docs**: retire AI search and retain keyword search ([b253b38](https://github.com/rvben/shinyhub/commit/b253b38024a088fbeecb4862dd4aedcbffff5b7f))
+
 ## [0.21.2](https://github.com/rvben/shinyhub/compare/v0.21.1...v0.21.2) - 2026-10-20
 
 ### Upgrade notice
