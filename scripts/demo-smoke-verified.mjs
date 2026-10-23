@@ -72,10 +72,11 @@ export function smokeInspector(id) {
       if (markedProbe && record.outcome === "ok" && probe.statuses.includes(record.event?.response?.status)) {
         confirmedProbes.set(probeKind, Math.max(confirmedProbes.get(probeKind) ?? -Infinity, record.eventTimestamp));
       }
-      // A transparent upgrade can end with this platform outcome even when
+      // A transparent upgrade can end with either disconnect outcome even when
       // its client and container relay both completed normal close handshakes.
       // It cannot pass check() until independent DO evidence covers every app.
-      const disconnectedUpgrade = record.outcome === "responseStreamDisconnected"
+      const disconnectedUpgrade = ["responseStreamDisconnected", "canceled"].includes(record.outcome)
+        && request?.method === "GET"
         && websocketPaths.includes(url?.pathname)
         && Object.entries(headers).some(([key, value]) => key.toLowerCase() === "upgrade" && value?.toLowerCase() === "websocket");
       if ((record.exceptions?.length ?? 0) > 0 || (record.outcome && record.outcome !== "ok" && !completedHTTP && !disconnectedUpgrade && !canceledProbe)) {

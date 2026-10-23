@@ -71,7 +71,7 @@ tail records arrive late. Synthetic WebSocket clients send a correlation header 
 query values are redacted in tail events. Marked passive status probes publish
 the DO's bounded synthetic close records through the tail, so verification
 checks the actual container relay rather than relying on missing DO tail logs.
-Cloudflare may report `responseStreamDisconnected` for an otherwise successful
+Cloudflare may report `responseStreamDisconnected` or `canceled` for an otherwise successful
 transparent upgrade; this is accepted only for marked WebSocket paths, with
 normal close evidence from every actual container relay. Exceptions and error
 logs remain fatal regardless of close evidence. Install the demo Worker's npm dependencies
