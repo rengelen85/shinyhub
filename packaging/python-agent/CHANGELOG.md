@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.5.0...shinyhub-agent-v0.5.1) - 2026-10-23
+
 ### Fixed
 
 - Bedrock retries a failed final answer once with completed tool results and
@@ -12,6 +14,9 @@
   Failure logs include bounded exception messages, exception types, and turn IDs.
 - Action-limit fallbacks across backends suggest asking again when reads or
   writes succeeded, and acknowledge actions that are already applied.
+
+- **agent**: allow selecting chat text in the toolbar ([37a8e84](https://github.com/rvben/shinyhub/commit/37a8e84fd63dae7b0191f84dab08ef2778cdfee3))
+- **ci**: use portable temporary directory for chart checks ([2258bfd](https://github.com/rvben/shinyhub/commit/2258bfd148a7347554a8e4ab7c805ad42c24d59a))
 
 ## [0.5.0](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.4.2...shinyhub-agent-v0.5.0) - 2026-10-20
 
