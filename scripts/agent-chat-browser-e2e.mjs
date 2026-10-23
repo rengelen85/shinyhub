@@ -133,6 +133,11 @@ try {
       ] }));
       assert.equal(await tab.locator('.sh-agent-followups').count(), 0);
       await done(tab);
+      const answer = tab.getByText('Spend rose 12% compared with the previous period.', { exact: true });
+      await answer.dblclick();
+      assert.ok(await tab.evaluate(() => window.getSelection().toString().length > 0),
+        'agent answers support mouse text selection');
+      await tab.evaluate(() => window.getSelection().removeAllRanges());
       const group = tab.getByRole('group', { name: 'Suggested follow-up questions' });
       assert.equal(await group.getByRole('button').count(), 2);
       await group.getByRole('button').first().focus();

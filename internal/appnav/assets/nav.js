@@ -488,7 +488,8 @@
     ".chat-resize:hover::after, .chat-resize:focus-visible::after, .chat-resizing .chat-resize::after { background: var(--sh-signal); }",
     ".chat-resize:focus-visible { outline: 2px solid var(--sh-signal); outline-offset: -3px; }",
     ".chat-resizing { user-select: none; cursor: ew-resize; }",
-    ".chat-content { position: relative; z-index: 0; display: block; flex: 1; min-height: 0; overflow: hidden; }",
+    ".chat-content { position: relative; z-index: 0; display: block; flex: 1; min-height: 0; overflow: hidden; user-select: text; -webkit-user-select: text; }",
+    ".chat-resizing .chat-content { user-select: none; -webkit-user-select: none; }",
     ".scrim {" +
       "  position: absolute; inset: 0; background: var(--sh-deep); opacity: 0;" +
       "  pointer-events: none; transition: opacity 160ms ease;" +
