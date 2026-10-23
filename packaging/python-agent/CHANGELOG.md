@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bedrock retries a failed final answer once with completed tool results and
+  tools disabled, except for permanent validation, access, and missing-model
+  errors. Failed attempts do not leak partial answers or repeat app actions.
+  Each attempt has its own usage record and sequential call round number.
+- Final Bedrock answers and fallbacks start a new paragraph after streamed text.
+  Failure logs include bounded exception messages, exception types, and turn IDs.
+- Action-limit fallbacks across backends suggest asking again when reads or
+  writes succeeded, and acknowledge actions that are already applied.
+
 ## [0.5.0](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.4.2...shinyhub-agent-v0.5.0) - 2026-10-20
 
 ### Added

@@ -94,7 +94,12 @@ class Turn:
             )
         if self.errors:
             parts.append(" ".join(list(dict.fromkeys(self.errors))[-2:]))
-        parts.append("Ask a narrower question to continue.")
+        if self.writes:
+            parts.append("Ask again to continue; those actions are already applied.")
+        elif self.reads:
+            parts.append("Ask again to continue from the current view.")
+        else:
+            parts.append("Ask a narrower question to continue.")
         return "\n\n".join(parts)
 
     async def execute(

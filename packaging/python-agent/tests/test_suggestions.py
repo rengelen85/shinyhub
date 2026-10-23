@@ -371,6 +371,11 @@ def test_final_budget_response_cannot_offer_suggestions(backend):
                     "text": "Answer.",
                     "calls": [("suggest_followups", {"questions": ["Cost?"]})],
                 },
+                *(
+                    [{"calls": [("suggest_followups", {"questions": ["Cost?"]})]}]
+                    if backend == "bedrock"
+                    else []
+                ),
             ],
             registry([]),
             no_approval,
@@ -378,7 +383,7 @@ def test_final_budget_response_cannot_offer_suggestions(backend):
             max_tool_rounds=1,
         )
     )
-    assert len(requests) == 2
+    assert len(requests) == (3 if backend == "bedrock" else 2)
     assert not any(e["type"] == "suggestions" for e in events)
     assert "action limit" in events[-1]["text"]
     if backend == "bedrock":

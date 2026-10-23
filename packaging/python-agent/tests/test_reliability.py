@@ -196,7 +196,11 @@ async def run_backend(
         class Client:
             def converse_stream(self, **request):
                 requests.append(deepcopy(request))
-                return {"stream": iter(model_reply(backend, next(remaining)))}
+                reply = next(remaining, None)
+                assert reply is not None, "Unexpected extra model request"
+                if isinstance(reply, Exception):
+                    raise reply
+                return {"stream": iter(model_reply(backend, reply))}
 
         agent = BedrockChat(
             "test-model", "Use app facts", "eu-west-1", client=Client(), **options
@@ -219,6 +223,9 @@ async def run_backend(
         )
         with patch("httpx.AsyncClient", side_effect=factory):
             events = await collect(agent)
+    # Check outside provider calls: the adapter may catch their exceptions.
+    assert len(requests) == len(replies), "Unexpected or unused scripted model reply"
+    assert next(remaining, None) is None, "Unused scripted model reply"
     return events, requests
 
 
@@ -331,6 +338,11 @@ def test_final_failure_discards_partial_text_and_retains_applied_actions(backend
             [
                 {"calls": [("write_view", {})]},
                 {"text": "Unverified partial answer", "fail": True},
+                *(
+                    [{"text": "Unverified retry", "fail": True}]
+                    if backend == "bedrock"
+                    else []
+                ),
             ],
             tools,
             approve,
@@ -357,6 +369,7 @@ def test_final_call_cannot_apply_a_write_even_if_provider_ignores_contract(backe
             [
                 {"calls": [("read_view", {})]},
                 {"calls": [("write_view", {})]},
+                *([{"calls": [("write_view", {})]}] if backend == "bedrock" else []),
             ],
             tools,
             approve,
@@ -469,3 +482,221 @@ def test_limits_reject_unbounded_or_noninteger_configuration(backend, name, valu
             OpenAIChat("key", "Instructions", **{name: value})
         else:
             AGUIChat("https://agent.example/run", **{name: value})
+
+
+@pytest.mark.parametrize("budget", ["round", "call"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("provider rejected request"),
+        {"text": "Discard this partial answer", "fail": True},
+        {"calls": [("write_view", {})]},
+    ],
+)
+def test_bedrock_retries_final_answer_once_with_completed_results(
+    budget, failure, caplog
+):
+    seen = []
+    records = []
+
+    async def approve(*_):
+        raise AssertionError("Final attempts must not execute writes")
+
+    options = (
+        {"max_tool_rounds": 1} if budget == "round" else {"max_tool_calls_per_turn": 1}
+    )
+    events, requests = asyncio.run(
+        run_backend(
+            "bedrock",
+            [{"calls": [("read_view", {})]}, failure, {"text": "The total is 123."}],
+            registry(seen),
+            approve,
+            on_usage=records.append,
+            **options,
+        )
+    )
+    assert seen == ["read"]
+    assert len(requests) == 3
+    assert requests[1] == requests[2]
+    assert "toolConfig" not in requests[2]
+    assert "123" in json.dumps(requests[2])
+    assert [e["text"] for e in events if e["type"] == "delta"] == ["The total is 123."]
+    assert [r.outcome for r in records] == ["completed", "error", "completed"]
+    assert [r.round for r in records] == [1, 2, 3]
+    assert [r.final for r in records] == [False, True, True]
+    assert len([r for r in caplog.records if "final answer attempt" in r.message]) == 1
+    expected = "RuntimeError)" if isinstance(failure, Exception) else "ToolError)"
+    assert expected in caplog.text
+    assert records[1].turn_id in caplog.text
+    if isinstance(failure, Exception):
+        assert str(failure) in caplog.text
+    assert sum(e == {"type": "status", "text": "Using app tools"} for e in events) == 1
+
+
+@pytest.mark.parametrize("earlier_text", ["", "Fetching daily values."])
+@pytest.mark.parametrize("write", [False, True])
+def test_bedrock_final_retry_failure_logs_and_separates_fallback(
+    earlier_text, write, caplog
+):
+    seen = []
+    tools = registry(seen)
+
+    async def approve(name, args):
+        return await tools.execute(name, args)
+
+    calls = ([("write_view", {})] if write else []) + [("read_view", {})]
+    events, requests = asyncio.run(
+        run_backend(
+            "bedrock",
+            [
+                {"text": earlier_text, "calls": calls},
+                {"text": "Discard first partial", "fail": True},
+                {"text": "Discard retry partial", "fail": True},
+            ],
+            tools,
+            approve,
+            max_tool_rounds=1,
+        )
+    )
+    assert seen == (["write", "read"] if write else ["read"])
+    assert len(requests) == 3
+    deltas = [e["text"] for e in events if e["type"] == "delta"]
+    fallback = deltas[-1]
+    assert fallback.startswith("\n\n" if earlier_text else "I reached")
+    assert "Discard" not in "".join(deltas)
+    assert "Completed reads: read_view." in fallback
+    assert "Ask again" in fallback
+    assert "narrower" not in fallback
+    assert ("those actions are already applied" in fallback) == write
+    assert len([r for r in caplog.records if "final answer attempt" in r.message]) == 2
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_bedrock_successful_final_answer_is_separated_from_earlier_text(retry):
+    async def approve(*_):
+        raise AssertionError("No writes")
+
+    events, _ = asyncio.run(
+        run_backend(
+            "bedrock",
+            [
+                {"text": "Fetching daily values.", "calls": [("read_view", {})]},
+                *([{"text": "Discard partial", "fail": True}] if retry else []),
+                {"text": "The total is 123."},
+            ],
+            registry([]),
+            approve,
+            max_tool_rounds=1,
+        )
+    )
+    # ChatSession concatenates deltas to build the rendered answer.
+    assert "".join(e["text"] for e in events if e["type"] == "delta") == (
+        "Fetching daily values.\n\nThe total is 123."
+    )
+
+
+@pytest.mark.parametrize(
+    "code,retry",
+    [
+        ("ValidationException", False),
+        ("AccessDeniedException", False),
+        ("ResourceNotFoundException", False),
+        ("ThrottlingException", True),
+        ("ModelErrorException", True),
+    ],
+)
+def test_bedrock_final_provider_errors_retry_only_when_recoverable(code, retry, caplog):
+    class ProviderError(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            self.response = {"Error": {"Code": code}}
+
+    async def approve(*_):
+        raise AssertionError("No writes")
+
+    events, requests = asyncio.run(
+        run_backend(
+            "bedrock",
+            [
+                {"calls": [("read_view", {})]},
+                ProviderError("provider details " + "x" * 1000),
+                *([{"text": "The total is 123."}] if retry else []),
+            ],
+            registry([]),
+            approve,
+            max_tool_rounds=1,
+        )
+    )
+    assert len(requests) == (3 if retry else 2)
+    if retry:
+        assert events[-1]["text"] == "The total is 123."
+    else:
+        assert "Completed reads: read_view." in events[-1]["text"]
+    assert "provider details" not in events[-1]["text"]
+    warning = next(
+        r.message for r in caplog.records if "final answer attempt" in r.message
+    )
+    assert "ProviderError" in warning
+    assert len(warning) < 450
+
+
+@pytest.mark.parametrize("cancel_on_retry", [False, True])
+def test_bedrock_final_cancellation_propagates_without_fallback(cancel_on_retry):
+    from shinyhub_agent._runtime import ToolCall
+
+    records = []
+    requests = []
+
+    async def approve(*_):
+        raise AssertionError("No writes")
+
+    class Agent(BedrockChat):
+        async def _response(self, client, request, usage):
+            requests.append(request)
+            if len(requests) == 1:
+                yield {
+                    "type": "model_response",
+                    "content": [{"text": "Reading"}],
+                    "calls": [ToolCall("read", "read_view", {})],
+                }
+            elif cancel_on_retry and len(requests) == 2:
+                raise RuntimeError("retry this")
+            else:
+                raise asyncio.CancelledError()
+
+    async def run():
+        events = []
+        agent = Agent(
+            "model",
+            "instructions",
+            "region",
+            client=object(),
+            max_tool_rounds=1,
+            on_usage=records.append,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            async for event in agent.run(
+                "Question", [], registry([]), approve, thread_id="thread"
+            ):
+                events.append(event)
+        assert not any(e["type"] == "delta" for e in events)
+
+    asyncio.run(run())
+    assert len(requests) == (3 if cancel_on_retry else 2)
+    assert records[-1].outcome == "cancelled"
+    assert records[-1].final
+
+
+@pytest.mark.parametrize(
+    "reads,writes,advice",
+    [
+        ([], [], "Ask a narrower question"),
+        (["read_view"], [], "Ask again to continue from the current view"),
+        ([], ["write_view"], "those actions are already applied"),
+        (["read_view"], ["write_view"], "those actions are already applied"),
+    ],
+)
+def test_shared_fallback_advice_acknowledges_completed_work(reads, writes, advice):
+    from shinyhub_agent._runtime import Turn
+
+    assert advice in Turn(2, 8, reads=reads, writes=writes).fallback()

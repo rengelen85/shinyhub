@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -29,6 +30,8 @@ from ._suggestions import (
     terminal_followups,
 )
 from ._usage import ModelCall, UsageCallback
+
+logger = logging.getLogger(__name__)
 
 _END = object()
 
@@ -321,6 +324,7 @@ class BedrockChat:
         ]
         client = self._runtime()
         turn = Turn(self.max_tool_calls_per_step, self.max_tool_calls_per_turn)
+        text_streamed = False
         for round_index in range(self.max_tool_rounds + 1):
             final = round_index == self.max_tool_rounds or turn.exhausted
             instructions = panel_instructions(
@@ -357,34 +361,67 @@ class BedrockChat:
                 ]
             else:
                 request["toolConfig"] = {"tools": tool_specs}
-            buffered = []
-            try:
-                async with ModelCall(
-                    "bedrock",
-                    self.model_id,
-                    turn.id,
-                    round_index + 1,
-                    final,
-                    self.on_usage,
-                ) as usage:
-                    async for event in self._response(client, request, usage):
-                        if event["type"] == "model_response":
-                            response = event
-                        elif final:
-                            buffered.append(event)
-                        else:
-                            yield event
-                    if final and response["calls"]:
-                        raise ToolError(
-                            "model_failed",
-                            "The assistant requested tools after its budget ended.",
-                        )
-            except Exception:
-                if not final:
-                    raise
-                yield {"type": "delta", "text": turn.fallback()}
-                return
+            # Final output stays buffered until a complete, tool-free answer succeeds.
+            # Retrying this request reuses completed results without executing tools.
+            for attempt in range(2 if final else 1):
+                buffered = []
+                try:
+                    async with ModelCall(
+                        "bedrock",
+                        self.model_id,
+                        turn.id,
+                        round_index + 1 + attempt,
+                        final,
+                        self.on_usage,
+                    ) as usage:
+                        async for event in self._response(client, request, usage):
+                            if event["type"] == "model_response":
+                                response = event
+                            elif final:
+                                buffered.append(event)
+                            else:
+                                if event["type"] == "delta" and event["text"]:
+                                    text_streamed = True
+                                yield event
+                        if final and response["calls"]:
+                            raise ToolError(
+                                "model_failed",
+                                "The assistant requested tools after its budget ended.",
+                            )
+                except Exception as error:
+                    if not final:
+                        raise
+                    logger.warning(
+                        "Bedrock final answer attempt %d failed (%s), turn %s: %s",
+                        attempt + 1,
+                        type(error).__name__,
+                        usage.context.get("turn_id") or turn.id,
+                        str(error)[:300].replace("\n", " ").replace("\r", " "),
+                    )
+                    details = getattr(error, "response", None)
+                    provider_error = (
+                        details.get("Error") if isinstance(details, dict) else None
+                    )
+                    code = (
+                        provider_error.get("Code")
+                        if isinstance(provider_error, dict)
+                        else None
+                    )
+                    # Permanent API errors cannot recover with an identical request.
+                    # Model-output failures can recover with a fresh generation.
+                    if attempt == 0 and code not in {
+                        "ValidationException",
+                        "AccessDeniedException",
+                        "ResourceNotFoundException",
+                    }:
+                        continue
+                    prefix = "\n\n" if text_streamed else ""
+                    yield {"type": "delta", "text": prefix + turn.fallback()}
+                    return
+                break
             if final:
+                if text_streamed:
+                    yield {"type": "delta", "text": "\n\n"}
                 for event in buffered:
                     yield event
                 return
