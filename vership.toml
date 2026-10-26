@@ -21,7 +21,12 @@ field = "version"
 command = "node scripts/sync-package-lock-version.mjs"
 files = ["package-lock.json"]
 
-# The agent has its own version, changelog, PyPI workflow and tag namespace.
+# Python helpers have independent versions, changelogs and PyPI workflows.
+[projects.bookmarks]
+path = "packaging/python-bookmarks"
+tag_prefix = "shinyhub-bookmarks-v"
+paths = ["packaging/python-bookmarks", ".github/workflows/publish-bookmarks.yml"]
+
 [projects.agent]
 path = "packaging/python-agent"
 tag_prefix = "shinyhub-agent-v"

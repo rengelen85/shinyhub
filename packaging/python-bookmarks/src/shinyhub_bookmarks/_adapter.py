@@ -363,7 +363,8 @@ def _known_input_ids(inputs: Any) -> set[str]:
     return {
         name
         for name in dir(inputs)
-        if name and not name.startswith(".") and not name.startswith("clientdata_")
+        # Shiny serializes dot-prefixed inputs too; only client metadata is skipped.
+        if name and not name.startswith(".clientdata_")
     }
 
 

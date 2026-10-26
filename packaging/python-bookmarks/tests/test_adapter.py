@@ -1090,17 +1090,87 @@ async def test_request_scopes_exclusions_to_its_bookmark_state(monkeypatch):
 
     assert session.bookmark.exclude == ["author_excluded", "region"]
     assert session.bookmark.last_save_state.exclude == [
+        ".private",
         BROWSER_REVISION_INPUT_ID,
         DISCOVER_INPUT_ID,
         REQUEST_INPUT_ID,
         SYNC_ACK_INPUT_ID,
         "author_excluded",
+        "clientdata_url_hostname",
         "period",
     ]
     message_type, payload = session.messages[-1]
     assert message_type == "shinyhub-bookmark-result"
     assert payload["purpose"] == "sync"
     assert payload["syncRevision"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("committed", [False, True])
+async def test_generated_urls_exclude_unregistered_dot_inputs(
+    monkeypatch, automatic, committed
+):
+    from urllib.parse import parse_qs, urlsplit
+
+    from shiny import Inputs as ShinyInputs, reactive
+    from shiny.bookmark import BookmarkState
+
+    effects = []
+
+    def capture_effect(fn=None, **_kwargs):
+        if fn is None:
+            return capture_effect
+        effects.append(fn)
+        return fn
+
+    monkeypatch.setattr(reactive, "effect", capture_effect)
+    monkeypatch.setattr(
+        reactive, "event", lambda *_args, **_kwargs: lambda callback: callback
+    )
+    session = Session()
+    inputs = ShinyInputs({"region": reactive.Value("Europe")})
+
+    async def encode():
+        async def save(state):
+            for callback in session.bookmark.bookmark_callbacks:
+                await callback(state)
+
+        return "https://example.test/app?" + await BookmarkState(
+            inputs, list(session.bookmark.exclude), save
+        )._encode_state()
+
+    session.bookmark.get_bookmark_url = encode
+    register(
+        session=session,
+        input=inputs,
+        fields={"region": "Region"},
+        **({"commit": inputs["apply"]} if committed else {}),
+    )
+    # Inputs can first arrive after registration, including third-party inputs.
+    for name in (
+        ".foo",
+        ".shinyhub_agent_chat_request",
+        ".shinyhub_agent_chat_decision",
+        ".shinyhub_agent_request",
+        ".shinyhub_agent_discover",
+        ".clientdata_url_search",
+        "clientdata_custom",
+        "unregistered",
+    ):
+        inputs[name]._set({"text": "sensitive prompt"})
+    inputs[REQUEST_INPUT_ID]._set({
+        "version": 1,
+        "requestId": "privacy-regression",
+        "include": ["region"],
+        **({"purpose": "sync", "syncRevision": 1} if automatic else {}),
+    })
+    handle = next(fn for fn in effects if fn.__name__ == "_handle_request")
+    with reactive.isolate():
+        await handle()
+    message_type, payload = session.messages[-1]
+    assert message_type == "shinyhub-bookmark-result"
+    assert parse_qs(urlsplit(payload["url"]).query) == {"region": ['"Europe"']}
 
 
 @pytest.mark.asyncio
@@ -1141,10 +1211,12 @@ async def test_automatic_sync_can_exclude_every_field_at_baseline(monkeypatch):
     await handle()
 
     assert session.bookmark.last_save_state.exclude == [
+        ".private",
         BROWSER_REVISION_INPUT_ID,
         DISCOVER_INPUT_ID,
         REQUEST_INPUT_ID,
         SYNC_ACK_INPUT_ID,
+        "clientdata_url_hostname",
         "period",
         "region",
     ]
@@ -1274,10 +1346,12 @@ async def test_overlapping_native_bookmark_does_not_inherit_adapter_selection(
     release.set()
     await request_task
     assert session.bookmark.last_save_state.exclude == [
+        ".private",
         BROWSER_REVISION_INPUT_ID,
         DISCOVER_INPUT_ID,
         REQUEST_INPUT_ID,
         SYNC_ACK_INPUT_ID,
+        "clientdata_url_hostname",
         "period",
     ]
 
