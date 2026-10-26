@@ -6,10 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.21.4](https://github.com/rvben/shinyhub/compare/v0.21.3...v0.21.4) - 2026-10-26
+
 ### Fixed
 
 - Reclaim never-used idle replicas without letting app metadata updates extend the hibernation timeout. Closing a session starts its idle window without creating new demand for warm expansion.
 - Corrective deployments restore the saved hibernated state of producer-quarantined apps, preserve that intent across failed retries, and audit deployment status transitions with the deploying principal.
+- **demo**: verify clean canceled WebSocket upgrades ([3affd8d](https://github.com/rvben/shinyhub/commit/3affd8de2296ee49110ed0f558e86a9740073566))
+- **demo**: verify recovery from canceled smoke probes ([a6526d9](https://github.com/rvben/shinyhub/commit/a6526d9e0f18758d7dc1c1a748f26e0f1097c910))
 
 ### Upgrade notice
 
