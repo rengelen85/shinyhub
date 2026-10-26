@@ -8,10 +8,13 @@ const (
 	PrepareKeepStopped
 	PrepareActivateNext
 	PrepareWhileServing
+	PrepareKeepHibernated
 )
 
 func (i PreparationIntent) message() string {
 	switch i {
+	case PrepareKeepHibernated:
+		return "Bundle prepared; app remains hibernated"
 	case PrepareKeepStopped:
 		return "Bundle prepared; app remains stopped"
 	case PrepareActivateNext:

@@ -33,6 +33,9 @@ func TestProducerStatusRecovery(t *testing.T) {
 			if displaced && (app.Status != "failed" || !strings.Contains(app.LastError, fmt.Sprint(failed))) {
 				t.Fatalf("failure status/diagnostic: %+v", app)
 			}
+			if displaced && app.ProducerRecoveryStatus != initial {
+				t.Fatalf("recovery intent=%q want=%q", app.ProducerRecoveryStatus, initial)
+			}
 			// Startup must retain the original recovery intent.
 			if err := store.EnforceCompatibilityQuarantines(); err != nil {
 				t.Fatal(err)

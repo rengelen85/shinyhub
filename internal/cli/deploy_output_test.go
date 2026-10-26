@@ -3,11 +3,13 @@ package cli
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -337,36 +339,41 @@ func TestDeploy_OpenBrowserFailureKeepsSuccessfulDeploy(t *testing.T) {
 	}
 }
 
-func TestDeploy_OpenRecoversWhenServerKeepsAppStopped(t *testing.T) {
-	var restartHits int
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/apps/demo", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"app":{"slug":"demo","status":"running","access":"private","deploy_count":2}}`))
-	})
-	mux.HandleFunc("/api/apps/demo/deploy", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"slug":"demo","status":"stopped","access":"private","deploy_count":3,"kept_stopped":true}`))
-	})
-	mux.HandleFunc("/api/apps/demo/restart", func(w http.ResponseWriter, r *http.Request) {
-		restartHits++
-		if r.URL.Query().Get("if_not_running") != "true" {
-			t.Errorf("restart query = %q", r.URL.RawQuery)
-		}
-		_, _ = w.Write([]byte(`{"status":"running"}`))
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	writeTestCLIConfig(t, srv.URL)
-	stubBrowser(t, func(string) error { return nil })
+func TestDeploy_OpenRecoversWhenServerKeepsAppDown(t *testing.T) {
+	for _, state := range []string{"stopped", "hibernated"} {
+		t.Run(state, func(t *testing.T) {
+			var restartHits int
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/apps/demo", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"app":{"slug":"demo","status":"running","access":"private","deploy_count":2}}`))
+			})
+			mux.HandleFunc("/api/apps/demo/deploy", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"slug":"demo","status":%q,"access":"private","deploy_count":3,"kept_%s":true}`, state, state)))
+			})
+			mux.HandleFunc("/api/apps/demo/restart", func(w http.ResponseWriter, r *http.Request) {
+				restartHits++
+				if r.URL.Query().Get("if_not_running") != "true" {
+					t.Errorf("restart query = %q", r.URL.RawQuery)
+				}
+				_, _ = w.Write([]byte(`{"status":"running"}`))
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			writeTestCLIConfig(t, srv.URL)
+			stubBrowser(t, func(string) error { return nil })
 
-	stdout, stderr, err := execCLISplit(t, "deploy", deployTestBundleDir(t), "--slug", "demo", "--open", "-o", "json")
-	if err != nil {
-		t.Fatalf("deploy --open recovery: %v", err)
-	}
-	if restartHits != 1 || !strings.Contains(stderr, "starting it now") {
-		t.Errorf("restart hits = %d, stderr = %q", restartHits, stderr)
-	}
-	if result := decodeOpenResult(t, stdout); result["kept_stopped"] != false || result["opened"] != true {
-		t.Errorf("final result should reflect recovered live state: %#v", result)
+			stdout, stderr, err := execCLISplit(t, "deploy", deployTestBundleDir(t), "--slug", "demo", "--open", "-o", "json")
+			if err != nil {
+				t.Fatalf("deploy --open recovery: %v", err)
+			}
+			if restartHits != 1 || !strings.Contains(stderr, "starting it now") {
+				t.Errorf("restart hits = %d, stderr = %q", restartHits, stderr)
+			}
+			if result := decodeOpenResult(t, stdout); result["kept_stopped"] != false || result["kept_hibernated"] != false || result["opened"] != true {
+				t.Errorf("final result should reflect recovered live state: %#v", result)
+			}
+
+		})
 	}
 }
 
@@ -440,5 +447,53 @@ func TestDeploy_ManifestWarningsReachBothOutputModes(t *testing.T) {
 	}
 	if _, present := obj["warnings"]; present {
 		t.Errorf("warnings must be omitted when the server sends none; got %v", obj["warnings"])
+	}
+}
+
+func TestDeploy_KeptHibernatedSkipsWait(t *testing.T) {
+	for _, format := range []string{"table", "json"} {
+		t.Run(format, func(t *testing.T) {
+			var deployed atomic.Bool
+			var healthPolls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/apps/demo/deploy":
+					deployed.Store(true)
+					fmt.Fprint(w, `{"slug":"demo","status":"hibernated","deploy_count":4,"kept_hibernated":true}`)
+				case "/api/apps/demo":
+					if deployed.Load() {
+						healthPolls.Add(1)
+					}
+					// Return healthy to an erroneous wait, so the poll-count assertion fails
+					// immediately instead of hanging for the normal health timeout.
+					fmt.Fprint(w, `{"app":{"slug":"demo","status":"running","deploy_count":4}}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			writeTestCLIConfig(t, srv.URL)
+			stdout, stderr, err := execCLISplit(t, "deploy", deployTestBundleDir(t), "--slug", "demo", "--wait", "--wait-timeout", "1", "-o", format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if healthPolls.Load() != 0 {
+				t.Fatalf("kept-hibernated deploy made %d health polls", healthPolls.Load())
+			}
+			prose := stdout
+			if format == "json" {
+				prose = stderr
+				var result map[string]any
+				if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+					t.Fatal(err)
+				}
+				if result["kept_hibernated"] != true || result["kept_stopped"] != false {
+					t.Fatalf("incorrect deploy result: %v", result)
+				}
+			}
+			if !strings.Contains(prose, "remains hibernated") {
+				t.Fatalf("missing hibernation note: %s", prose)
+			}
+		})
 	}
 }

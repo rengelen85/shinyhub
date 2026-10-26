@@ -350,6 +350,12 @@ type replicaBackend struct {
 // can key replica_sessions rows without a DB lookup at snapshot time. Zero
 // means not yet set (reporter skips pools without an appID).
 type backendPool struct {
+	// idleBaseline starts the inactivity window independently of app metadata.
+	// Protected by Proxy.mu; real request activity remains in lastSeen.
+	idleBaseline    time.Time
+	idleReady       bool
+	idleRelayActive bool
+
 	settingsDraining bool // suppress demand-driven allocation during an explicit settings restart
 	size             int
 	replicas         []*replicaBackend
@@ -558,8 +564,9 @@ type Proxy struct {
 	// Nil means the dependency-free StartProxySpan path.
 	spanTracer atomic.Pointer[tracerHolder]
 
-	seenMu   sync.RWMutex
-	lastSeen map[string]time.Time
+	seenMu     sync.RWMutex
+	lastSeen   map[string]time.Time
+	lastClosed map[string]time.Time
 	// wsReady tracks slugs for which at least one upstream has completed a
 	// WebSocket handshake (HTTP 101) since the last deregister/hibernate.
 	// Surfaced via GET /app/<slug>/.shinyhub/ready so deploy scripts can
@@ -706,6 +713,7 @@ func New() *Proxy {
 		poolEpoch:            make(map[string]uint64),
 		slotSeq:              make(map[string]int),
 		lastSeen:             make(map[string]time.Time),
+		lastClosed:           make(map[string]time.Time),
 		wsReady:              make(map[string]struct{}),
 		firstFailedWSAt:      make(map[string]time.Time),
 		wsWarned:             make(map[string]struct{}),
@@ -735,9 +743,10 @@ func (p *Proxy) PoolEpoch(slug string) uint64 {
 // writing.
 func (p *Proxy) newBackendPoolLocked(slug string, size int) *backendPool {
 	return &backendPool{
-		size:       size,
-		replicas:   make([]*replicaBackend, size),
-		nextSlotID: p.slotSeq[slug],
+		idleBaseline: time.Now(),
+		size:         size,
+		replicas:     make([]*replicaBackend, size),
+		nextSlotID:   p.slotSeq[slug],
 	}
 }
 
@@ -1672,6 +1681,9 @@ func (p *Proxy) recordWSFailure(slug string) {
 // Only an upgrade actually forwarded upstream and answered unsuccessfully
 // arms the warning. Boot parking and admission rejections are not proxy faults.
 func (p *Proxy) serveBackend(backend *httputil.ReverseProxy, rec *statusRecorder, r *http.Request, slug string) {
+	// Long-lived requests and WebSockets become idle when they close. Record
+	// this before their active connection count is released by the caller.
+	defer p.recordRequestClosed(slug)
 	if isWSUpgrade(r) {
 		defer func() {
 			if rec.status != http.StatusSwitchingProtocols {
@@ -1688,6 +1700,42 @@ func (p *Proxy) LastSeen(slug string) time.Time {
 	p.seenMu.RLock()
 	defer p.seenMu.RUnlock()
 	return p.lastSeen[slug]
+}
+
+// recordRequestClosed extends the idle window without representing new
+// demand. Warm expansion and relay observation use request starts only.
+func (p *Proxy) recordRequestClosed(slug string) {
+	p.seenMu.Lock()
+	p.lastClosed[slug] = time.Now()
+	p.seenMu.Unlock()
+}
+
+// IdleSince returns the latest pool readiness, request start, or close. Unlike
+// apps.updated_at, this clock is unaffected by configuration or producer writes.
+// LastSeen stays traffic-only so readiness cannot trigger warm expansion.
+func (p *Proxy) IdleSince(slug string) time.Time {
+	// Relayed sockets belong to a retiring server, so their final close does
+	// not pass through this proxy. Observe the lease disappearing and start a
+	// full idle window then, conservatively including one polling interval.
+	relayActive := p.HasRelaySessions(slug, 0)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if pool := p.pools[slug]; pool != nil {
+		if relayActive || pool.idleRelayActive {
+			pool.idleBaseline = time.Now()
+		}
+		pool.idleRelayActive = relayActive
+	}
+	p.seenMu.RLock()
+	defer p.seenMu.RUnlock()
+	since := p.lastSeen[slug]
+	if closed := p.lastClosed[slug]; closed.After(since) {
+		since = closed
+	}
+	if pool := p.pools[slug]; pool != nil && pool.idleBaseline.After(since) {
+		since = pool.idleBaseline
+	}
+	return since
 }
 
 // MarkWSReady records that slug has completed at least one WebSocket
@@ -2051,6 +2099,10 @@ func (p *Proxy) RegisterReplica(slug string, index int, targetURL string, base h
 		ownerAppID = expectedAppID[0]
 	}
 
+	if !pool.idleReady || (deploymentID != 0 && pool.activeDeploymentID != deploymentID) {
+		pool.idleBaseline = time.Now()
+		pool.idleReady = true
+	}
 	pool.replicas[index] = p.newReplicaBackend(pool, slug, index, target, targetURL, base, deploymentID, ownerAppID)
 	if deploymentID != 0 {
 		pool.activeDeploymentID = deploymentID
@@ -2317,6 +2369,8 @@ func (p *Proxy) ActivateGeneration(slug string, deploymentID int64) (int64, erro
 		pool.size = len(slots)
 	}
 	pool.activeDeploymentID = deploymentID
+	pool.idleBaseline = time.Now()
+	pool.idleReady = true
 	delete(pool.candidates, deploymentID)
 	p.clearWSReady(slug)
 	return previous, nil
@@ -2495,6 +2549,8 @@ func (p *Proxy) RevertGeneration(slug string, failedDeploymentID, previousDeploy
 		pool.size = len(previous)
 	}
 	pool.activeDeploymentID = previousDeploymentID
+	pool.idleBaseline = time.Now()
+	pool.idleReady = true
 	return nil
 }
 
@@ -2552,6 +2608,11 @@ func (p *Proxy) registerElasticWorker(slug string, slotID int, targetURL string,
 			return fmt.Errorf("register elastic %s#%d: app identity changed", slug, slotID)
 		}
 		ownerAppID = expectedAppID[0]
+	}
+
+	if !pool.idleReady {
+		pool.idleBaseline = time.Now()
+		pool.idleReady = true
 	}
 
 	slugCopy := slug
@@ -2897,6 +2958,17 @@ func (p *Proxy) RegisteredSlugs() map[string]struct{} {
 // while activeConns catches a request that has already picked a replica but
 // has not yet completed.
 func (p *Proxy) BeginHibernate(slug string, since time.Time) bool {
+	return p.beginHibernate(slug, since, false)
+}
+
+// BeginIdleHibernate additionally rejects a pool becoming ready after the idle
+// snapshot. Startup restoration uses BeginHibernate to park newly booted pools
+// deliberately; the idle watchdog must give those pools a full idle window.
+func (p *Proxy) BeginIdleHibernate(slug string, since time.Time) bool {
+	return p.beginHibernate(slug, since, true)
+}
+
+func (p *Proxy) beginHibernate(slug string, since time.Time, checkReadiness bool) bool {
 	if p.RetiringParentAlive() || p.HasRelaySessions(slug, 0) {
 		return false
 	}
@@ -2905,10 +2977,13 @@ func (p *Proxy) BeginHibernate(slug string, since time.Time) bool {
 	p.seenMu.Lock()
 	defer p.seenMu.Unlock()
 
-	if last := p.lastSeen[slug]; last.After(since) {
+	if p.lastSeen[slug].After(since) || p.lastClosed[slug].After(since) {
 		return false
 	}
 	if pool := p.pools[slug]; pool != nil {
+		if checkReadiness && pool.idleBaseline.After(since) {
+			return false
+		}
 		if len(pool.drainingGenerations) > 0 || len(pool.candidates) > 0 {
 			return false
 		}
@@ -2955,6 +3030,7 @@ func (p *Proxy) BeginHibernate(slug string, since time.Time) bool {
 		delete(p.pools, slug)
 	}
 	delete(p.lastSeen, slug)
+	delete(p.lastClosed, slug)
 	p.clearWSReadyLocked(slug)
 	return true
 }

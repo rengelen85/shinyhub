@@ -509,6 +509,7 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 	deployCount := 0
 	currentVersion := ""
 	keptStopped := false
+	keptHibernated := false
 	deployStatus := ""
 	if err := json.Unmarshal(out, &appResp); err == nil {
 		if v, ok := appResp["deploy_count"].(float64); ok {
@@ -518,10 +519,15 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 			currentVersion = v
 		}
 		keptStopped, _ = appResp["kept_stopped"].(bool)
+		keptHibernated, _ = appResp["kept_hibernated"].(bool)
 		deployStatus, _ = appResp["status"].(string)
 	}
-	if f.open && (keptStopped || deployStatus == "stopped") {
-		fmt.Fprintf(errW, "%s remained stopped after deployment; starting it now...\n", slug)
+	if f.open && (keptStopped || keptHibernated || deployStatus == "stopped" || deployStatus == "hibernated") {
+		state := "stopped"
+		if keptHibernated || deployStatus == "hibernated" {
+			state = "hibernated"
+		}
+		fmt.Fprintf(errW, "%s remained %s after deployment; starting it now...\n", slug, state)
 		if _, err := startAppIfNotRunning(cfg, slug); err != nil {
 			return &hintedMsgError{
 				msg:   fmt.Sprintf("%s deployed successfully, but could not be started for --open: %v", slug, err),
@@ -530,6 +536,7 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 			}
 		}
 		keptStopped = false
+		keptHibernated = false
 	}
 
 	// In JSON mode all prose goes to stderr; one result object on stdout.
@@ -556,6 +563,9 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 		ps.okPrefix(), slug, deployment, took, target)
 	if note := formatKeptStoppedNote(keptStopped, slug); note != "" {
 		fmt.Fprintln(noteW, note)
+	}
+	if keptHibernated {
+		fmt.Fprintln(noteW, "This app remains hibernated; it will wake on the next request.")
 	}
 	for _, line := range formatManifestSummary(appResp["manifest"]) {
 		fmt.Fprintln(noteW, line)
@@ -641,7 +651,7 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 	// A deploy that deliberately left the app down will never report healthy, so
 	// waiting could only end in a timeout that failed a deploy which in fact
 	// succeeded. --start is how a caller asks for a running app to wait for.
-	if f.wait && !keptStopped {
+	if f.wait && !keptStopped && !keptHibernated {
 		if err := waitForHealthyWithContext(cmd.Context(), cfg, slug, time.Duration(f.waitTimeout)*time.Second, errW); err != nil {
 			return err
 		}
@@ -677,14 +687,15 @@ func runDeploy(cmd *cobra.Command, args []string, f *deployFlags) error {
 		// able to distinguish "deployed and live" from "deployed and still down"
 		// without matching on prose.
 		result := map[string]any{
-			"status":         "deployed",
-			"slug":           slug,
-			"deploy_count":   deployCount,
-			"version":        currentVersion,
-			"kept_stopped":   keptStopped,
-			"url":            target,
-			"opened":         opened,
-			"warm_restarted": warmRestarted,
+			"status":          "deployed",
+			"slug":            slug,
+			"deploy_count":    deployCount,
+			"version":         currentVersion,
+			"kept_stopped":    keptStopped,
+			"kept_hibernated": keptHibernated,
+			"url":             target,
+			"opened":          opened,
+			"warm_restarted":  warmRestarted,
 		}
 		for _, key := range []string{"hooks_declared", "hooks_run", "hooks_skipped"} {
 			if value, ok := appResp[key]; ok {

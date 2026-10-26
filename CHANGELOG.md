@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Reclaim never-used idle replicas without letting app metadata updates extend the hibernation timeout. Closing a session starts its idle window without creating new demand for warm expansion.
+- Corrective deployments restore the saved hibernated state of producer-quarantined apps, preserve that intent across failed retries, and audit deployment status transitions with the deploying principal.
+
+### Upgrade notice
+
+Upgrade the CLI alongside the server when using `deploy --wait` or `fleet apply`.
+A corrective deploy may now leave a previously sleeping, producer-quarantined app
+hibernated. Older clients do not recognize the `kept_hibernated` result and can
+time out waiting for running replicas after the deploy succeeds. Use `--start`
+to explicitly request running replicas.
+
 ## [0.21.3](https://github.com/rvben/shinyhub/compare/v0.21.2...v0.21.3) - 2026-10-23
 
 ### Fixed

@@ -280,6 +280,7 @@ var schemaAnnotations = map[string]cmdAnnotation{
 			{Name: "slug", Type: "string"},
 			{Name: "deploy_count", Type: "integer", Desc: "Cumulative deployment number; 0 when the server does not report one"},
 			{Name: "version", Type: "string", Desc: "Version string from the deployment; empty when the server does not report one"},
+			{Name: "kept_hibernated", Type: "boolean", Desc: "True when deployment repaired a quarantined app and restored its saved hibernated state; wakes on the next request"},
 			{Name: "kept_stopped", Type: "boolean", Desc: "True when the app was stopped before this deploy and was left stopped; start it with 'apps start <slug>' or deploy with --start"},
 			{Name: "url", Type: "string", Desc: "Canonical user-facing app URL"},
 			{Name: "opened", Type: "boolean", Desc: "True when --open successfully launched the default browser; false otherwise"},

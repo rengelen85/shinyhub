@@ -1006,12 +1006,15 @@ type App struct {
 	// DesiredStatus is the persisted lifecycle intent before the API overlays
 	// live replica/worker reality onto Status. It is computed by the API layer;
 	// database reads leave it empty.
-	DesiredStatus            string   `json:"desired_status,omitempty"`
-	CompatibilityQuarantined bool     `json:"compatibility_quarantined"`
-	ProducerRepairRequired   bool     `json:"producer_repair_required"`
-	ProducerRepairSchedules  []string `json:"producer_repair_schedules"`
-	RunningDataProducers     []string `json:"running_data_producers"`
-	Replicas                 int      `json:"replicas"`
+	DesiredStatus            string `json:"desired_status,omitempty"`
+	CompatibilityQuarantined bool   `json:"compatibility_quarantined"`
+	// ProducerRecoveryStatus is lifecycle intent saved when a producer
+	// quarantines an app. It is internal state, independent of current status.
+	ProducerRecoveryStatus  string   `json:"-"`
+	ProducerRepairRequired  bool     `json:"producer_repair_required"`
+	ProducerRepairSchedules []string `json:"producer_repair_schedules"`
+	RunningDataProducers    []string `json:"running_data_producers"`
+	Replicas                int      `json:"replicas"`
 	// ReplicasRunning and WorkersRunning are live process counts computed by the
 	// API layer. Replicas remains the configured/desired replica count.
 	ReplicasRunning       int `json:"replicas_running"`
@@ -1327,7 +1330,7 @@ const appColumns = `id, slug, name, project_slug, owner_id, access, status,
 		       managed_by, replica_placement,
 		       autoscale_enabled, autoscale_min_replicas, autoscale_max_replicas, autoscale_target,
 		       last_autoscale_at, identity_headers, usage_identity_mode, min_warm_replicas,
-		       last_error, crashed_at, description, icon_mime, icon_emoji,
+		       last_error, crashed_at, description, icon_mime, icon_emoji, producer_recovery_status,
 		       worker_isolation, worker_grouped_size, worker_max_workers, worker_warm_spares,
 		       worker_max_session_lifetime_secs, ephemeral_data_ack, render_seconds,
 		       redeploy_seq_launched, last_redeploy_seq, last_redeploy_outcome,
@@ -2011,6 +2014,18 @@ func (s *Store) ListPublicApps(limit, offset int) ([]*App, error) {
 }
 
 type UpdateAppStatusParams struct {
+	// PreserveRecoveryIntent is for failed automatic operations, not explicit lifecycle choices.
+	PreserveRecoveryIntent bool
+
+	// Reason requests an atomic app_status_changed audit for a real transition.
+	Reason string
+	// BestEffortAudit keeps recovery status truthful when audit storage is
+	// unavailable. A failed insert is retried/logged after the status commits.
+	// Authoritative promotion leaves this false to require an atomic audit.
+	BestEffortAudit bool
+	// Audit identifies the initiating principal for an audited transition.
+	Audit AuditEventParams
+
 	Slug   string
 	Status string
 	// LastError is recorded for a non-"crashed" status write (e.g. "failed");
@@ -2020,33 +2035,117 @@ type UpdateAppStatusParams struct {
 	LastError string
 }
 
-func (s *Store) UpdateAppStatus(p UpdateAppStatusParams) error {
-	// Any transition OUT of "crashed" (start, restart, wake, hibernate, stop)
-	// clears the recorded crash diagnostic so a stale reason never lingers on a
-	// recovered app. A status write TO "crashed" must NOT clear it: crashed
-	// transitions go through MarkAppCrashed (which records the reason), and a bare
-	// UpdateAppStatus("crashed") - from a current or future caller - must preserve
-	// whatever reason is already there rather than wiping it.
-	var res sql.Result
-	var err error
-	if p.Status == "crashed" {
-		res, err = s.db.Exec(
-			`UPDATE apps SET status = ?, producer_recovery_status = '', updated_at = CURRENT_TIMESTAMP WHERE slug = ?`,
-			p.Status, p.Slug,
-		)
-	} else {
-		res, err = s.db.Exec(
-			`UPDATE apps SET status = ?, producer_recovery_status = '', last_error = ?, crashed_at = 0, updated_at = CURRENT_TIMESTAMP WHERE slug = ?`,
-			p.Status, p.LastError, p.Slug,
-		)
+func updateAppStatusRow(exec func(string, ...any) (sql.Result, error), p UpdateAppStatusParams) error {
+	recovery := "producer_recovery_status = ''"
+	if p.PreserveRecoveryIntent {
+		recovery = "producer_recovery_status = producer_recovery_status"
 	}
+	query := `UPDATE apps SET status = ?, ` + recovery + `, updated_at = CURRENT_TIMESTAMP WHERE slug = ?`
+	args := []any{p.Status, p.Slug}
+	if p.Status != "crashed" {
+		query = `UPDATE apps SET status = ?, ` + recovery + `, last_error = ?, crashed_at = 0, updated_at = CURRENT_TIMESTAMP WHERE slug = ?`
+		args = []any{p.Status, p.LastError, p.Slug}
+	}
+	result, err := exec(query, args...)
 	if err != nil {
 		return fmt.Errorf("update app status: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("app status rows affected: %w", err)
+	}
 	if n == 0 {
 		return ErrNotFound
 	}
+	return nil
+}
+
+type appStatusTransition struct {
+	slug, from, to, reason string
+	retryAudit             *AuditEventParams
+}
+
+func (s *Store) logAppStatusTransition(c *appStatusTransition) {
+	if c != nil {
+		slog.Info("app_status_changed", "slug", c.slug, "from", c.from, "to", c.to, "reason", c.reason)
+		if c.retryAudit != nil {
+			s.LogAuditEvent(*c.retryAudit)
+		}
+	}
+}
+
+func recordAppStatusTransition(tx writeTx, slug, previous, target, reason string, audit AuditEventParams, bestEffort bool) (*appStatusTransition, error) {
+	if previous == target {
+		return nil, nil
+	}
+	detail, err := json.Marshal(map[string]any{"from": previous, "to": target, "reason": reason})
+	if err != nil {
+		return nil, err
+	}
+	audit.Action, audit.ResourceType, audit.ResourceID, audit.Detail = "app_status_changed", "app", slug, string(detail)
+	change := &appStatusTransition{slug: slug, from: previous, to: target, reason: reason}
+	if bestEffort {
+		// PostgreSQL aborts a transaction after a rejected insert; isolate the
+		// optional audit so the recovery status can still commit on both DBs.
+		if _, err := tx.Exec(`SAVEPOINT app_status_audit`); err != nil {
+			return nil, err
+		}
+	}
+	if err := insertAuditEvent(tx.Exec, audit); err != nil {
+		if !bestEffort {
+			return nil, fmt.Errorf("audit app status: %w", err)
+		}
+		if _, rollbackErr := tx.Exec(`ROLLBACK TO SAVEPOINT app_status_audit`); rollbackErr != nil {
+			return nil, rollbackErr
+		}
+		change.retryAudit = &audit
+	}
+	if bestEffort {
+		if _, err := tx.Exec(`RELEASE SAVEPOINT app_status_audit`); err != nil {
+			return nil, err
+		}
+	}
+	return change, nil
+}
+
+// updateAppStatusTx composes status and its audit into an existing writer.
+func updateAppStatusTx(tx writeTx, p UpdateAppStatusParams) (*appStatusTransition, error) {
+	if _, err := tx.Exec(`UPDATE apps SET status = status WHERE slug = ?`, p.Slug); err != nil {
+		return nil, fmt.Errorf("lock app status: %w", err)
+	}
+	var previous string
+	if err := tx.QueryRow(`SELECT status FROM apps WHERE slug = ?`, p.Slug).Scan(&previous); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("read app status: %w", err)
+	}
+	if err := updateAppStatusRow(tx.Exec, p); err != nil {
+		return nil, err
+	}
+	if p.Reason == "" {
+		return nil, nil
+	}
+	return recordAppStatusTransition(tx, p.Slug, previous, p.Status, p.Reason, p.Audit, p.BestEffortAudit)
+}
+
+func (s *Store) UpdateAppStatus(p UpdateAppStatusParams) error {
+	if p.Reason == "" {
+		return updateAppStatusRow(s.db.Exec, p)
+	}
+	tx, err := s.d.beginWrite(context.Background(), s.rawDB(), 0)
+	if err != nil {
+		return fmt.Errorf("begin app status: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	change, err := updateAppStatusTx(tx, p)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit app status: %w", err)
+	}
+	s.logAppStatusTransition(change)
 	return nil
 }
 
@@ -2611,7 +2710,16 @@ func (s *Store) BeginDeploymentWithOrigin(appID int64, version, bundleDir, runID
 // PromoteDeployment atomically marks a pending deployment live and terminalizes
 // every older pending attempt for the same app. It is idempotent for an already
 // succeeded target so a caller can safely recover an ambiguous commit result.
-func (s *Store) PromoteDeployment(id int64) error {
+func (s *Store) PromoteDeployment(id int64) error { return s.promoteDeployment(id, nil) }
+
+// PromoteDeploymentWithAppStatus commits the serving bundle, recovered lifecycle
+// intent, and the required transition audit together. A failed transaction leaves
+// the previous serving digest intact so fleet retries cannot skip recovery.
+func (s *Store) PromoteDeploymentWithAppStatus(id int64, status UpdateAppStatusParams) error {
+	return s.promoteDeployment(id, &status)
+}
+
+func (s *Store) promoteDeployment(id int64, appStatus *UpdateAppStatusParams) error {
 	// Reserve SQLite's writer before reading the target. Otherwise another
 	// connection can advance the WAL and make the later write upgrade fail
 	// immediately with SQLITE_BUSY(_SNAPSHOT), despite busy_timeout.
@@ -2681,10 +2789,25 @@ func (s *Store) PromoteDeployment(id int64) error {
 	} else if n != 1 {
 		return fmt.Errorf("promote deployment %d: active generation app not found", id)
 	}
+	var change *appStatusTransition
+	if appStatus != nil {
+		var slug string
+		if err := tx.QueryRow(`SELECT slug FROM apps WHERE id = ?`, appID).Scan(&slug); err != nil {
+			return err
+		}
+		if slug != appStatus.Slug {
+			return fmt.Errorf("promote deployment %d: app status identity mismatch", id)
+		}
+		change, err = updateAppStatusTx(tx, *appStatus)
+		if err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("promote deployment %d: commit: %w", id, err)
 	}
 	committed = true
+	s.logAppStatusTransition(change)
 	return nil
 }
 
@@ -3024,8 +3147,8 @@ func (s *Store) BlockDeploymentWithReason(id int64, reason string) error {
 //
 // reason is recorded on both rows; callers that also hold a boot diagnostic use
 // QuarantineAndFailDeploymentWithAppStatus to put it on the app instead.
-func (s *Store) QuarantineAndFailDeployment(id int64, reason string) error {
-	return s.QuarantineAndFailDeploymentWithAppStatus(id, reason, reason, "failed")
+func (s *Store) QuarantineAndFailDeployment(id int64, reason string, audit ...AuditEventParams) error {
+	return s.QuarantineAndFailDeploymentWithAppStatus(id, reason, reason, "failed", audit...)
 }
 
 // QuarantineAndFailDeploymentWithAppStatus preserves an operator-stopped app
@@ -3034,10 +3157,12 @@ func (s *Store) QuarantineAndFailDeployment(id int64, reason string) error {
 // whether the UI says failed or deliberately stopped. reason becomes
 // deployments.failure_reason (the durable quarantine record) and lastError
 // becomes apps.last_error, so an operator looking at the app - not the
-// deployment history - can still see why it is down. The two differ when the
+// deployment history - can still see why it is down. Failed corrective deploys
+// retain existing producer recovery intent; an explicit stopped outcome clears
+// it so later repairs cannot override an operator stop. The diagnostics differ when the
 // caller has a boot diagnostic (raw error plus log tail) that is more useful
 // on the app than the classified reason.
-func (s *Store) QuarantineAndFailDeploymentWithAppStatus(id int64, reason, lastError, appStatus string) error {
+func (s *Store) QuarantineAndFailDeploymentWithAppStatus(id int64, reason, lastError, appStatus string, audit ...AuditEventParams) error {
 	if appStatus != "failed" && appStatus != "stopped" {
 		return fmt.Errorf("quarantine deployment %d: invalid app status %q", id, appStatus)
 	}
@@ -3046,12 +3171,22 @@ func (s *Store) QuarantineAndFailDeploymentWithAppStatus(id int64, reason, lastE
 		return fmt.Errorf("quarantine deployment %d: begin: %w", id, err)
 	}
 	defer tx.Rollback() //nolint:errcheck
+	var slug, previous string
+	if len(audit) > 0 {
+		if _, err := tx.Exec(`UPDATE apps SET status = status WHERE id = (SELECT app_id FROM deployments WHERE id = ?)`, id); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT slug, status FROM apps WHERE id = (SELECT app_id FROM deployments WHERE id = ?)`, id).Scan(&slug, &previous); err != nil {
+			return err
+		}
+	}
 	res, err := tx.Exec(`
-		UPDATE apps SET status = CASE WHEN status = 'deleting' THEN status ELSE ? END, producer_recovery_status = '',
+		UPDATE apps SET status = CASE WHEN status = 'deleting' THEN status ELSE ? END,
+        producer_recovery_status = CASE WHEN ? = 'failed' THEN producer_recovery_status ELSE '' END,
         last_error = CASE WHEN status = 'deleting' THEN last_error ELSE ? END, crashed_at = 0, updated_at = CURRENT_TIMESTAMP
 		WHERE id = (SELECT app_id FROM deployments
 		            WHERE id = ? AND status = ? AND
-		                  (producer_barrier_entered = 1 OR prior_schedule_snapshot_recorded = 0))`, appStatus, lastError, id, DeploymentPending)
+		                  (producer_barrier_entered = 1 OR prior_schedule_snapshot_recorded = 0))`, appStatus, appStatus, lastError, id, DeploymentPending)
 	if err != nil {
 		return fmt.Errorf("quarantine deployment %d app: %w", id, err)
 	}
@@ -3065,9 +3200,17 @@ func (s *Store) QuarantineAndFailDeploymentWithAppStatus(id int64, reason, lastE
 		WHERE id = ? AND status = ?`, DeploymentFailed, reason, id, DeploymentPending); err != nil {
 		return fmt.Errorf("quarantine deployment %d row: %w", id, err)
 	}
+	var change *appStatusTransition
+	if len(audit) > 0 && previous != "deleting" {
+		change, err = recordAppStatusTransition(tx, slug, previous, appStatus, "deploy_quarantined", audit[0], true)
+		if err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("quarantine deployment %d: commit: %w", id, err)
 	}
+	s.logAppStatusTransition(change)
 	return nil
 }
 
@@ -4218,13 +4361,18 @@ type AuditEvent struct {
 // never break normal operation.
 func (s *Store) LogAuditEvent(p AuditEventParams) { _ = s.recordAuditEvent(context.Background(), p) }
 
-func (s *Store) recordAuditEvent(ctx context.Context, p AuditEventParams) error {
-	_, err := s.db.ExecContext(ctx, `
+func insertAuditEvent(exec func(string, ...any) (sql.Result, error), p AuditEventParams) error {
+	_, err := exec(`
 		INSERT INTO audit_events (user_id, action, resource_type, resource_id, detail, ip_address, run_id,
 		 credential_id, credential_type, credential_name)
 		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)`,
 		p.UserID, p.Action, p.ResourceType, p.ResourceID, p.Detail, p.IPAddress, p.RunID,
 		p.CredentialID, p.CredentialType, p.CredentialName)
+	return err
+}
+
+func (s *Store) recordAuditEvent(ctx context.Context, p AuditEventParams) error {
+	err := insertAuditEvent(func(query string, args ...any) (sql.Result, error) { return s.db.ExecContext(ctx, query, args...) }, p)
 	var userID any
 	if p.UserID != nil {
 		userID = *p.UserID
@@ -6041,7 +6189,7 @@ func scanApp(s scanner) (*App, error) {
 		&a.ManagedBy, &a.ReplicaPlacement,
 		&autoscaleEnabledInt, &a.AutoscaleMinReplicas, &a.AutoscaleMaxReplicas, &a.AutoscaleTarget,
 		&a.LastAutoscaleAt, &a.IdentityHeaders, &a.UsageIdentityMode, &a.MinWarmReplicas,
-		&a.LastError, &a.CrashedAt, &a.Description, &a.IconMime, &a.IconEmoji,
+		&a.LastError, &a.CrashedAt, &a.Description, &a.IconMime, &a.IconEmoji, &a.ProducerRecoveryStatus,
 		&a.WorkerIsolation, &a.WorkerGroupedSize, &a.WorkerMaxWorkers,
 		&a.WorkerWarmSpares, &a.WorkerMaxSessionLifetimeSecs, &ephemeralDataAckInt, &a.RenderSeconds,
 		&a.RedeploySeqLaunched, &lastRedeploy.Seq, &lastRedeploy.Outcome,
@@ -6107,7 +6255,7 @@ func scanAppLean(s scanner) (*App, error) {
 		&a.ManagedBy, &a.ReplicaPlacement,
 		&autoscaleEnabledInt, &a.AutoscaleMinReplicas, &a.AutoscaleMaxReplicas, &a.AutoscaleTarget,
 		&a.LastAutoscaleAt, &a.IdentityHeaders, &a.UsageIdentityMode, &a.MinWarmReplicas,
-		&a.LastError, &a.CrashedAt, &a.Description, &a.IconMime, &a.IconEmoji,
+		&a.LastError, &a.CrashedAt, &a.Description, &a.IconMime, &a.IconEmoji, &a.ProducerRecoveryStatus,
 		&a.WorkerIsolation, &a.WorkerGroupedSize, &a.WorkerMaxWorkers,
 		&a.WorkerWarmSpares, &a.WorkerMaxSessionLifetimeSecs, &ephemeralDataAckInt, &a.RenderSeconds,
 		&a.RedeploySeqLaunched, &lastRedeploy.Seq, &lastRedeploy.Outcome,

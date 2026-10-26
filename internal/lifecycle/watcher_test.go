@@ -300,6 +300,8 @@ type registeredBackend struct {
 }
 
 type fakeProxy struct {
+	idleBaseline map[string]time.Time
+
 	mu              sync.Mutex
 	seen            map[string]time.Time
 	deregistered    []string
@@ -326,6 +328,16 @@ func (f *fakeProxy) LastSeen(slug string) time.Time {
 	defer f.mu.Unlock()
 	return f.seen[slug]
 }
+func (f *fakeProxy) IdleSince(slug string) time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	since := f.seen[slug]
+	if f.idleBaseline[slug].After(since) {
+		since = f.idleBaseline[slug]
+	}
+	return since
+}
+
 func (f *fakeProxy) Deregister(slug string) {
 	f.mu.Lock()
 	f.deregistered = append(f.deregistered, slug)
@@ -3955,5 +3967,33 @@ func TestHandleIdle_ClusteredAlreadyAtFloorSkipsWarmShrink(t *testing.T) {
 	st.mu.Unlock()
 	if len(casCalls) != 0 {
 		t.Errorf("clustered: HibernateApp must NOT fire when already at floor, got %v", casCalls)
+	}
+}
+
+// Metadata updates (including producer publication) must not extend the idle
+// window of a deployed replica that has never handled a request.
+func TestHibernation_NeverUsedPoolIgnoresMetadataUpdates(t *testing.T) {
+	for _, clustered := range []bool{false, true} {
+		for _, idleMinutes := range []int{1, 11} {
+			t.Run(fmt.Sprintf("clustered=%v/idle=%dm", clustered, idleMinutes), func(t *testing.T) {
+				mgr := &fakeManager{entries: []*process.ProcessInfo{{Slug: "app", Index: 0, Status: process.StatusRunning}}}
+				prx := newFakeProxy()
+				prx.idleBaseline = map[string]time.Time{"app": time.Now().Add(-time.Duration(idleMinutes) * time.Minute)}
+				st := newFakeStore(map[string]*db.App{"app": {ID: 1, Slug: "app", Status: "running", Replicas: 1, UpdatedAt: time.Now()}}, nil)
+				st.fleetIdleSinceSec = db.NoFleetActivity
+				w := newTestWatcher(Config{HibernateTimeout: 10 * time.Minute, Clustered: clustered}, mgr, prx, st, nil)
+				w.handleIdle("app", 1)
+				wantStatus, wantStops := "running", 0
+				if idleMinutes > 10 {
+					wantStatus, wantStops = "hibernated", 1
+				}
+				if len(mgr.stopped) != wantStops {
+					t.Fatalf("stops=%v want=%d", mgr.stopped, wantStops)
+				}
+				if app, _ := st.GetAppBySlug("app"); app.Status != wantStatus {
+					t.Fatalf("status=%s want=%s", app.Status, wantStatus)
+				}
+			})
+		}
 	}
 }

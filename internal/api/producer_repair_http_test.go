@@ -128,7 +128,7 @@ func TestProducerFailureAndRepairThroughHTTP(t *testing.T) {
 		t.Fatalf("repair left durable app unavailable: %+v err=%v", durable, err)
 	}
 	events, err := store.ListAuditEvents("app_status_changed", 10, 0)
-	if err != nil || len(events) != 2 {
+	if err != nil || len(events) != 3 {
 		t.Fatalf("transition events=%+v err=%v", events, err)
 	}
 	for i, want := range []struct {
@@ -145,6 +145,13 @@ func TestProducerFailureAndRepairThroughHTTP(t *testing.T) {
 		if detail["schedule_run_id"] != float64(want.run) || detail["from"] != want.from || detail["to"] != want.to || !strings.Contains(fmt.Sprint(detail["reason"]), want.reason) {
 			t.Fatalf("incomplete transition audit: %s", events[i].Detail)
 		}
+	}
+	var deployed map[string]any
+	if err := json.Unmarshal([]byte(events[2].Detail), &deployed); err != nil {
+		t.Fatal(err)
+	}
+	if deployed["from"] != "stopped" || deployed["to"] != "running" || deployed["reason"] != "deploy_succeeded" {
+		t.Fatalf("missing initial deploy transition: %s", events[2].Detail)
 	}
 	woke := make(chan string, 1)
 	srv.proxy.SetWakeTrigger(func(_ context.Context, slug string) { woke <- slug })

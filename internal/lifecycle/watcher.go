@@ -2693,6 +2693,30 @@ func (w *Watcher) allReplicasExhausted(slug string, replicas int) bool {
 	return true
 }
 
+// beginIdleHibernate validates readiness as well as traffic when the proxy
+// supports it. Pool synchronization can replace a generation between the idle
+// snapshot and this CAS, independently of the local application lease.
+func (w *Watcher) beginIdleHibernate(slug string, since time.Time) bool {
+	if p, ok := w.prx.(interface{ BeginIdleHibernate(string, time.Time) bool }); ok {
+		return p.BeginIdleHibernate(slug, since)
+	}
+	return w.prx.BeginHibernate(slug, since)
+}
+
+// idleSince uses a pool-owned clock when available. The metadata fallback is
+// retained for proxy implementations without a local pool (and older adapters).
+func (w *Watcher) idleSince(app *db.App) time.Time {
+	if p, ok := w.prx.(interface{ IdleSince(string) time.Time }); ok {
+		if since := p.IdleSince(app.Slug); !since.IsZero() {
+			return since
+		}
+	}
+	if since := w.prx.LastSeen(app.Slug); !since.IsZero() {
+		return since
+	}
+	return app.UpdatedAt
+}
+
 // handleIdle checks whether a running app has been idle past its configured
 // timeout and hibernates it if so. It stops all replicas and zeroes replica rows.
 //
@@ -2702,7 +2726,7 @@ func (w *Watcher) allReplicasExhausted(slug string, replicas int) bool {
 // is already at or below its floor, avoiding a lock acquisition and DB read for
 // a no-op.
 //
-// Single-node (!w.cfg.Clustered): the original path is taken byte-for-byte.
+// Single-node checks the local pool; clustered mode also checks peer activity.
 // Clustered (w.cfg.Clustered): a conservative fleet-idle CAS is used. See
 // handleIdleClustered for the exact predicate and ordering.
 func (w *Watcher) handleIdle(slug string, runningCount int) {
@@ -2729,11 +2753,8 @@ func (w *Watcher) handleIdle(slug string, runningCount int) {
 		return
 	}
 
-	// Single-node path: byte-for-byte original behaviour.
-	lastActivity := w.prx.LastSeen(slug)
-	if lastActivity.IsZero() {
-		lastActivity = app.UpdatedAt // freshly deployed, never served
-	}
+	// Single-node activity comes from readiness or the most recent request.
+	lastActivity := w.idleSince(app)
 	if time.Since(lastActivity) < timeout {
 		return
 	}
@@ -2766,10 +2787,7 @@ func (w *Watcher) handleIdle(slug string, runningCount int) {
 	if w.servingIsolation(app) == "unknown" || w.activationOwnsRuntime(app, "hibernate") {
 		return
 	}
-	lastActivity = w.prx.LastSeen(slug)
-	if lastActivity.IsZero() {
-		lastActivity = app.UpdatedAt
-	}
+	lastActivity = w.idleSince(app)
 	if time.Since(lastActivity) < timeout {
 		return
 	}
@@ -2778,7 +2796,7 @@ func (w *Watcher) handleIdle(slug string, runningCount int) {
 	// activity has been recorded since the snapshot AND no request is in
 	// flight. If a request slipped in between LastSeen above and here, abort
 	// without stopping the manager — the next tick will reconsider.
-	if !w.prx.BeginHibernate(slug, lastActivity) {
+	if !w.beginIdleHibernate(slug, lastActivity) {
 		return
 	}
 
@@ -2836,10 +2854,7 @@ func (w *Watcher) handleIdleClustered(app *db.App, timeout time.Duration, runnin
 	// (A) Time-idle check: compare local last-seen against the local clock.
 	// This is the only place the local wall clock appears, and it governs only
 	// the local idle predicate - never the cross-instance stale/idle decision.
-	lastActivity := w.prx.LastSeen(slug)
-	if lastActivity.IsZero() {
-		lastActivity = app.UpdatedAt
-	}
+	lastActivity := w.idleSince(app)
 	if time.Since(lastActivity) < timeout {
 		return
 	}
@@ -2898,10 +2913,7 @@ func (w *Watcher) handleIdleClustered(app *db.App, timeout time.Duration, runnin
 	if w.servingIsolation(app) == "unknown" || w.activationOwnsRuntime(app, "clustered hibernate") {
 		return
 	}
-	lastActivity = w.prx.LastSeen(slug)
-	if lastActivity.IsZero() {
-		lastActivity = app.UpdatedAt
-	}
+	lastActivity = w.idleSince(app)
 	if time.Since(lastActivity) < timeout {
 		return
 	}
@@ -2909,7 +2921,7 @@ func (w *Watcher) handleIdleClustered(app *db.App, timeout time.Duration, runnin
 	// (C) Local CAS: atomically remove the local pool from routing iff no
 	// activity has been recorded since the snapshot AND no local request is
 	// in flight. If a request slipped in between (A) and here, abort.
-	if !w.prx.BeginHibernate(slug, lastActivity) {
+	if !w.beginIdleHibernate(slug, lastActivity) {
 		return
 	}
 

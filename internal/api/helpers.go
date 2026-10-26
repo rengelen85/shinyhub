@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/rvben/shinyhub/internal/auth"
 	"github.com/rvben/shinyhub/internal/db"
@@ -101,6 +102,10 @@ func writeListPage[T any](w http.ResponseWriter, page []T, total, limit, offset 
 // audit records a mutating action with the authenticated user, request IP, and
 // optional JSON detail blob. detail may be empty.
 func (s *Server) audit(r *http.Request, action, resourceType, resourceID, detail string) {
+	s.store.LogAuditEvent(s.auditParams(r, action, resourceType, resourceID, detail))
+}
+
+func (s *Server) auditParams(r *http.Request, action, resourceType, resourceID, detail string) db.AuditEventParams {
 	var uid *int64
 	if u := auth.UserFromContext(r.Context()); u != nil {
 		v := u.ID
@@ -116,7 +121,20 @@ func (s *Server) audit(r *http.Request, action, resourceType, resourceID, detail
 		RunID:        s.knownFleetRunID(r),
 	}
 	requestAuditCredential(r, &p)
-	s.store.LogAuditEvent(p)
+	return p
+}
+
+// updateDeployStatus records automatic deploy recovery with request attribution.
+func (s *Server) updateDeployStatus(r *http.Request, p db.UpdateAppStatusParams) error {
+	if p.Reason == "" {
+		p.Reason = "deploy_recovery"
+		if strings.HasSuffix(r.URL.Path, "/rollback") {
+			p.Reason = "rollback_recovery"
+		}
+	}
+	p.BestEffortAudit = true
+	p.Audit = s.auditParams(r, "app_status_changed", "app", p.Slug, "")
+	return s.store.UpdateAppStatus(p)
 }
 
 func requestAuditCredential(r *http.Request, p *db.AuditEventParams) {

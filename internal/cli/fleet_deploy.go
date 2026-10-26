@@ -183,9 +183,10 @@ func deployAppBundleFromSpecWithDowntime(cfg *cliConfig, slug string, spec bundl
 	// prints, so a fleet operator is not left unaware that setup hooks did not
 	// run under the container runtime.
 	var deployResp map[string]any
-	var keptStopped bool
+	var keptStopped, keptHibernated bool
 	if err := json.Unmarshal(rb, &deployResp); err == nil {
 		keptStopped, _ = deployResp["kept_stopped"].(bool)
+		keptHibernated, _ = deployResp["kept_hibernated"].(bool)
 		if summary := formatHookExecutionSummary(deployResp); summary != "" && !updateFleetProgress(out, "Bundle deployed", summary, time.Time{}, false) {
 			fmt.Fprintf(out, "  %s: %s\n", slug, summary)
 		}
@@ -221,6 +222,8 @@ func deployAppBundleFromSpecWithDowntime(cfg *cliConfig, slug string, spec bundl
 	// is skipped and the state is reported instead.
 	if keptStopped {
 		emitFleetWarning(out, slug, fmt.Sprintf("stopped, so the new version is not serving yet; start it with `shinyhub apps start %s`", slug))
+	} else if keptHibernated {
+		emitFleetWarning(out, slug, "remains hibernated; the new version will wake on the next request")
 	} else if err := waitForFleetHealthy(cfg, slug, out, timeout); err != nil {
 		return "", true, deployRuns, deployfail.Unknown, err
 	}

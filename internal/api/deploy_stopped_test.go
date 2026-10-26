@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/rvben/shinyhub/internal/config"
 	"github.com/rvben/shinyhub/internal/db"
 	"github.com/rvben/shinyhub/internal/deploy"
 )
@@ -479,5 +481,251 @@ func TestDeploy_HibernatedAppStillEndsRunning(t *testing.T) {
 	}
 	if app.Status != "running" {
 		t.Errorf("status = %q, want running", app.Status)
+	}
+}
+
+func TestDeploy_HibernatedIntentSurvivesQuarantine(t *testing.T) {
+	for _, tc := range []struct{ name, status, recovery, query, want string }{
+		{"hibernated", "hibernated", "", "", "running"},
+		{"quarantined", "failed", "hibernated", "", "hibernated"},
+		{"explicit start", "failed", "hibernated", "?start=true", "running"},
+		{"running recovery", "failed", "running", "", "running"},
+		{"independent failure", "failed", "", "", "running"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, store, token := newManifestE2EServer(t)
+			app := seedStoppedTestApp(t, store, "idle-deploy", tc.status, 1)
+			// Persist the quarantine intent as it exists at deploy admission. The
+			// producer's independent data fence is covered by the producer repair tests.
+			if _, err := store.DB().Exec(`UPDATE apps SET producer_recovery_status = ? WHERE id = ?`, tc.recovery, app.ID); err != nil {
+				t.Fatal(err)
+			}
+			rec := postStoppedTestBundle(t, srv, token, app.Slug, tc.query)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("deploy: %d %s", rec.Code, rec.Body.String())
+			}
+			fresh, err := store.GetAppBySlug(app.Slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fresh.Status != tc.want || fresh.ProducerRecoveryStatus != "" {
+				t.Fatalf("status=%s recovery=%s", fresh.Status, fresh.ProducerRecoveryStatus)
+			}
+			if live := srv.proxy.PoolHasAny(app.Slug); live != (tc.want == "running") {
+				t.Fatalf("live pool=%v want status=%s", live, tc.want)
+			}
+			var response struct {
+				KeptHibernated bool `json:"kept_hibernated"`
+				KeptStopped    bool `json:"kept_stopped"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.KeptHibernated != (tc.want == "hibernated") || response.KeptStopped {
+				t.Fatalf("deploy flags=%+v", response)
+			}
+			events, err := store.ListAuditEvents("app_status_changed", 20, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			count := 0
+			for _, event := range events {
+				var detail map[string]any
+				if err := json.Unmarshal([]byte(event.Detail), &detail); err != nil {
+					t.Fatal(err)
+				}
+				if detail["reason"] == "deploy_succeeded" {
+					if event.UserID == nil || *event.UserID != app.OwnerID || event.IPAddress == "" || event.CredentialType != "session_token" {
+						t.Fatalf("deploy transition lacks request attribution: %+v", event)
+					}
+					count++
+					if detail["from"] != tc.status || detail["to"] != tc.want {
+						t.Fatalf("transition=%v", detail)
+					}
+				}
+			}
+			wantCount := 1
+			if tc.status == tc.want {
+				wantCount = 0
+			}
+			if count != wantCount {
+				t.Fatalf("deploy transitions=%d want=%d", count, wantCount)
+			}
+		})
+	}
+}
+
+func TestDeploy_BrokenBundlePreservesQuarantineIntent(t *testing.T) {
+	srv, store, token := newManifestE2EServer(t)
+	app := seedStoppedTestApp(t, store, "sleeping", "failed", 1)
+	if _, err := store.DB().Exec(`UPDATE apps SET producer_recovery_status = 'hibernated' WHERE id = ?`, app.ID); err != nil {
+		t.Fatal(err)
+	}
+	srv.SetDeployRunForTest(func(p deploy.Params) (*deploy.PoolResult, error) { return nil, errors.New("broken bundle") })
+	rec := postStoppedTestBundle(t, srv, token, "sleeping", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("deploy: %d %s", rec.Code, rec.Body.String())
+	}
+	fresh, err := store.GetAppBySlug("sleeping")
+	if err != nil || fresh.Status != "failed" || fresh.ProducerRecoveryStatus != "hibernated" {
+		t.Fatalf("app=%+v err=%v", fresh, err)
+	}
+	if srv.proxy.PoolHasAny("sleeping") {
+		t.Fatal("failed deploy started sleeping app")
+	}
+}
+
+func TestDeploy_CommitFailurePreservesQuarantineIntent(t *testing.T) {
+	for _, tc := range []struct {
+		name, condition, table, event string
+	}{
+		{"audit", `NEW.action = 'app_status_changed'`, "audit_events", "INSERT"},
+		{"promotion", `NEW.status = 'succeeded'`, "deployments", "UPDATE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, store, token := newManifestE2EServer(t)
+			app := seedStoppedTestApp(t, store, "commit-sleeper", "failed", 1)
+			if _, err := store.DB().Exec(`UPDATE apps SET producer_recovery_status = 'hibernated' WHERE id = ?`, app.ID); err != nil {
+				t.Fatal(err)
+			}
+			previous, err := store.GetServingDeployment(app.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			removeFailure := installDBFailureTrigger(t, store, dbFailureTrigger{name: "reject_commit", table: tc.table, event: tc.event, condition: tc.condition})
+			rec := postStoppedTestBundle(t, srv, token, app.Slug, "")
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("failed commit reported success: %d %s", rec.Code, rec.Body.String())
+			}
+			fresh, err := store.GetAppBySlug(app.Slug)
+			if err != nil || fresh.Status != "failed" || fresh.ProducerRecoveryStatus != "hibernated" {
+				t.Fatalf("lost quarantine intent: %+v err=%v", fresh, err)
+			}
+			var failedDigest string
+			if err := store.DB().QueryRow(`SELECT content_digest FROM deployments WHERE app_id = ? ORDER BY id DESC LIMIT 1`, app.ID).Scan(&failedDigest); err != nil {
+				t.Fatal(err)
+			}
+			if fresh.ContentDigest == failedDigest {
+				t.Fatal("same-digest fleet retry would skip unfinished recovery")
+			}
+			active, err := store.GetServingDeployment(app.ID)
+			if err != nil || active.ID != previous.ID {
+				t.Fatalf("unexpected publication state: %+v err=%v", active, err)
+			}
+			if srv.proxy.PoolHasAny(app.Slug) {
+				t.Fatal("failed commit started sleeping app")
+			}
+			removeFailure()
+			rec = postStoppedTestBundle(t, srv, token, app.Slug, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("retry failed: %d %s", rec.Code, rec.Body.String())
+			}
+			fresh, err = store.GetAppBySlug(app.Slug)
+			if err != nil || fresh.Status != "hibernated" || fresh.ProducerRecoveryStatus != "" {
+				t.Fatalf("retry did not restore hibernation: %+v err=%v", fresh, err)
+			}
+			if fresh.ContentDigest != failedDigest {
+				t.Fatal("retry did not promote the same content digest")
+			}
+		})
+	}
+}
+
+func TestDeploy_DeclarationRestoreFailurePreservesQuarantineIntent(t *testing.T) {
+	srv, store, token := newManifestE2EServer(t)
+	app := seedStoppedTestApp(t, store, "restore-sleeper", "failed", 1)
+	if _, err := store.DB().Exec(`UPDATE apps SET producer_recovery_status = 'hibernated' WHERE id = ?`, app.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSchedule(db.CreateScheduleParams{AppID: app.ID, Name: "disabled", CronExpr: "0 * * * *", CommandJSON: `["true"]`, Enabled: false, TimeoutSeconds: 60, OverlapPolicy: "skip", MissedPolicy: "skip", DeployTrigger: "never", OnSuccess: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	srv.SetDeployRunForTest(func(p deploy.Params) (*deploy.PoolResult, error) {
+		installDBFailureTrigger(t, store, dbFailureTrigger{name: "reject_restore", table: "app_schedules", event: "UPDATE", condition: "1 = 1"})
+		return nil, errors.New("broken bundle")
+	})
+	rec := postStoppedTestBundle(t, srv, token, app.Slug, "")
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "restore previous schedule declarations") {
+		t.Fatalf("restore failure: %d %s", rec.Code, rec.Body.String())
+	}
+	fresh, err := store.GetAppBySlug(app.Slug)
+	if err != nil || fresh.Status != "failed" || fresh.ProducerRecoveryStatus != "hibernated" {
+		t.Fatalf("declaration restore lost saved intent: %+v err=%v", fresh, err)
+	}
+}
+
+func TestDeploy_CommitFailureStopsUncommittedConsumers(t *testing.T) {
+	for _, initial := range []string{"hibernated", "stopped", "crashed"} {
+		for _, fault := range []string{"audit", "promotion"} {
+			t.Run(initial+"/"+fault, func(t *testing.T) {
+				srv, store, token := newManifestE2EServer(t)
+				t.Cleanup(func() { _ = srv.manager.StopAll(); srv.Close() })
+				deploys := 1
+				if initial == "stopped" {
+					deploys = 0 // a first deploy must boot, rather than preserve operator stop
+				}
+				app := seedStoppedTestApp(t, store, "commit-live", initial, deploys)
+				var faultTrigger dbFailureTrigger
+				if fault == "audit" {
+					faultTrigger = dbFailureTrigger{name: "reject_live_commit", table: "audit_events", event: "INSERT", condition: "NEW.action = 'app_status_changed'"}
+				} else {
+					faultTrigger = dbFailureTrigger{name: "reject_live_commit", table: "deployments", event: "UPDATE", condition: "NEW.status = 'succeeded'"}
+				}
+				installDBFailureTrigger(t, store, faultTrigger)
+				original := srv.deployRun
+				booted := false
+				srv.SetDeployRunForTest(func(p deploy.Params) (*deploy.PoolResult, error) {
+					result, err := original(p)
+					if err == nil && !p.PrepareOnly {
+						booted = srv.proxy.PoolHasAny(app.Slug)
+					}
+					return result, err
+				})
+				rec := postStoppedTestBundle(t, srv, token, app.Slug, "")
+				if rec.Code != http.StatusInternalServerError || !booted {
+					t.Fatalf("did not fail after consumer boot: booted=%v status=%d body=%s", booted, rec.Code, rec.Body.String())
+				}
+				if srv.proxy.PoolHasAny(app.Slug) || len(srv.manager.All()) != 0 {
+					t.Fatalf("commit failure orphaned uncommitted consumers: %+v", srv.manager.All())
+				}
+				rows, err := store.ListReplicas(app.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, row := range rows {
+					if row.PID != nil || row.Status == "running" {
+						t.Fatalf("commit failure retained live identity: %+v", row)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestDeploy_CommitFailureKeepsPreviouslyUpPoolServing(t *testing.T) {
+	for _, initial := range []string{"running", "degraded"} {
+		t.Run(initial, func(t *testing.T) {
+			srv, store, token, _, _, runtime := buildManifestE2EServer(t, config.RuntimeConfig{})
+			runtime.serveTraffic = true
+			t.Cleanup(func() { _ = srv.manager.StopAll(); srv.Close() })
+			app := seedStoppedTestApp(t, store, "commit-up", initial, 1)
+			installDBFailureTrigger(t, store, dbFailureTrigger{name: "reject_up_commit", table: "deployments", event: "UPDATE", condition: "NEW.status = 'succeeded'"})
+			rec := postStoppedTestBundle(t, srv, token, app.Slug, "")
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("expected commit failure: %d %s", rec.Code, rec.Body.String())
+			}
+			if !srv.proxy.PoolHasAny(app.Slug) || !srv.manager.HasRunning(app.Slug) {
+				t.Fatal("promotion failure stopped the serving pool of a previously up app")
+			}
+			visitor := httptest.NewRecorder()
+			srv.proxy.ServeHTTP(visitor, httptest.NewRequest(http.MethodGet, "/app/"+app.Slug+"/", nil))
+			if visitor.Code != http.StatusOK {
+				t.Fatalf("pool stopped serving requests: %d %s", visitor.Code, visitor.Body.String())
+			}
+			fresh, err := store.GetAppByID(app.ID)
+			if err != nil || fresh.Status != initial {
+				t.Fatalf("serving state changed: %+v err=%v", fresh, err)
+			}
+		})
 	}
 }
