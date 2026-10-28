@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Security
 
 - Update go-jose to 4.1.6 to fix excessive resource use while parsing RSA JSON Web Keys (CVE-2026-116587).
+- Update golang.org/x/net to 0.62.0 and its required Go dependencies to fix quadratic resource use when parsing HTML with repeated short text runs (CVE-2026-78661).
 
 ### Upgrade notice
 
