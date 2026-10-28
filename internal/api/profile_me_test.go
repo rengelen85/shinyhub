@@ -18,6 +18,8 @@ type meUserResp struct {
 	Username       string `json:"username"`
 	Role           string `json:"role"`
 	DisplayName    string `json:"display_name"`
+	AvatarURL      string `json:"avatar_url"`
+	AvatarColor    string `json:"avatar_color"`
 	CanSetPassword bool   `json:"can_set_password"`
 	CanManageSelf  bool   `json:"can_manage_self"`
 }

@@ -103,6 +103,7 @@ import { createSupportSessionRecovery } from '/static/views/support-session-reco
 import { shouldShowAppIsolationBanner, wireAppIsolationBanner } from '/static/views/app-isolation-banner.js';
 import { userRowCaps, userRolePresentation, RESERVED_USER_HINT } from '/static/views/user-row.js';
 import { identityModel } from '/static/views/user-identity.js';
+import { renderUserAvatar, prepareUserAvatar, avatarPickerColor } from '/static/views/user-avatar.js';
 import { createServerInfoLoader, renderAbout } from '/static/views/about.js';
 import { groupAppsForGrid } from '/static/views/app-grid-groups.js';
 import { GRID_PAGE, windowCount, createShowMore } from '/static/views/render-window.js';
@@ -256,15 +257,28 @@ document.addEventListener('DOMContentLoaded', () => {
   const refreshButton = document.getElementById('refresh-button');
   const fleetHealthEl = document.getElementById('fleet-health');
   const logoutButton = document.getElementById('logout-button');
-  // Sidebar identity card + profile modal (self-service display name + password).
+  // Sidebar identity card + profile modal (photo, display name, and password).
   const identityCard    = document.getElementById('identity-card');
   const identityAvatar  = document.getElementById('identity-avatar');
   const identityName    = document.getElementById('identity-name');
   const identityRole    = document.getElementById('identity-role');
   const profileModal    = document.getElementById('profile-modal');
   const profileClose    = document.getElementById('profile-close');
+  const profileCancel = document.getElementById('profile-cancel');
   const profileForm     = document.getElementById('profile-form');
   const profileAvatar   = document.getElementById('profile-avatar');
+  const profilePhotoControls = document.getElementById('profile-photo-controls');
+  const profilePhotoChange = document.getElementById('profile-photo-change');
+  const profilePhotoRemove = document.getElementById('profile-photo-remove');
+  const profilePhotoFile = document.getElementById('profile-photo-file');
+  const profilePhotoStatus = document.getElementById('profile-photo-status');
+  const profileAvatarColor = document.getElementById('profile-avatar-color');
+  const profileColorReset = document.getElementById('profile-color-reset');
+  let pendingAvatarColor;
+  let pendingAvatar;
+  let photoGeneration = 0;
+  let photoPreparing = false;
+  let profileSaving = false;
   const profileUsername = document.getElementById('profile-username');
   const profileRole     = document.getElementById('profile-role');
   const profileLogin    = document.getElementById('profile-login');
@@ -1145,19 +1159,64 @@ document.addEventListener('DOMContentLoaded', () => {
   function renderIdentity(user) {
     if (!identityCard) return;
     const m = identityModel(user);
-    identityAvatar.textContent = m.initials;
-    identityAvatar.style.setProperty('--avatar-hue', m.hue);
+    renderUserAvatar(identityAvatar, user);
     identityName.textContent = m.name;
     identityRole.textContent = m.roleLabel;
     identityCard.setAttribute('aria-label', user ? `Open your profile, ${m.name}` : 'Open your profile');
   }
 
+  function profilePreviewUser() {
+    return { ...state.user, avatar_color: pendingAvatarColor !== undefined ? pendingAvatarColor : state.user?.avatar_color };
+  }
+
+  function renderProfileAvatar() {
+    renderUserAvatar(profileAvatar, profilePreviewUser(), pendingAvatar !== undefined ? pendingAvatar : state.user?.avatar_url || '');
+  }
+
+  function profileHasChanges() {
+    if (!state.user || state.user.can_manage_self === false) return false;
+    return pendingAvatar !== undefined ||
+      (pendingAvatarColor !== undefined && pendingAvatarColor !== (state.user.avatar_color || '')) ||
+      (state.user.can_set_password && (profileDisplayName.value.trim() !== (state.user.display_name || '') ||
+        profileCurrentPw.value !== '' || profileNewPw.value !== ''));
+  }
+
+  function syncProfileSave() {
+    const dirty = profileHasChanges();
+    const hadSaveFocus = document.activeElement === profileSubmit;
+    profileSubmit.disabled = profileSaving || photoPreparing || !dirty;
+    if (!dirty && !profileSaving && !photoPreparing && hadSaveFocus && profileCancel) profileCancel.focus({ preventScroll: true });
+    if (profilePhotoStatus) {
+      profilePhotoStatus.textContent = !profileError.hidden && !photoPreparing ? '' :
+        photoPreparing ? 'Preparing photo…' : profileSaving ? 'Saving…' : dirty ? 'Unsaved changes' : '';
+    }
+  }
+
+  function syncProfileColor() {
+    const user = profilePreviewUser();
+    if (profileAvatarColor) {
+      profileAvatarColor.value = avatarPickerColor(user);
+      profileAvatarColor.disabled = profileSaving;
+    }
+    if (profileColorReset) profileColorReset.disabled = profileSaving || !user.avatar_color;
+  }
+
   function openProfileModal() {
     if (!profileModal || !state.user) return;
+    if (sidebarDrawer) sidebarDrawer.close();
     const u = state.user;
     const m = identityModel(u);
-    profileAvatar.textContent = m.initials;
-    profileAvatar.style.setProperty('--avatar-hue', m.hue);
+    photoGeneration++;
+    pendingAvatar = undefined;
+    pendingAvatarColor = undefined;
+    syncProfileColor();
+    photoPreparing = false;
+    if (profilePwSection) profilePwSection.open = false;
+    if (profilePhotoStatus) profilePhotoStatus.textContent = '';
+    if (profilePhotoFile) profilePhotoFile.value = '';
+    renderUserAvatar(profileAvatar, u);
+    setHidden(profilePhotoControls, u.can_manage_self === false);
+    setHidden(profilePhotoRemove, !u.avatar_url);
     profileUsername.textContent = m.name;
     profileRole.textContent = m.roleLabel;
     // When a display name is set, show the underlying @username (normal case, so
@@ -1179,16 +1238,20 @@ document.addEventListener('DOMContentLoaded', () => {
       profilePwManaged.textContent = 'Your name and password are managed by your identity provider.';
     }
     setHidden(profileTokensLink, !selfService);
-    setHidden(profileSubmit, !isLocalAccount);
+    setHidden(profileSubmit, !selfService);
     profileDisplayName.value = u.display_name || '';
     profileCurrentPw.value = '';
     profileNewPw.value = '';
     setError(profileError, '');
+    syncProfileSave();
+    if (profileCancel) profileCancel.textContent = selfService ? 'Cancel' : 'Close';
     setHidden(profileSuccess, true);
     reflectThemeRadios();
     profileModal.hidden = false;
     modalTrap(profileModal).activate();
-    (isLocalAccount ? profileDisplayName : (profileClose || logoutButton)).focus();
+    (selfService ? profilePhotoChange : (profileClose || logoutButton)).focus({ preventScroll: true });
+    const body = profileModal.querySelector('.profile-body');
+    if (body) body.scrollTop = 0;
   }
 
   // reflectThemeRadios checks the radio matching the stored theme preference, so
@@ -1203,6 +1266,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function closeProfileModal() {
     if (!profileModal || profileModal.hidden) return;
     profileModal.hidden = true;
+    photoGeneration++;
     modalTrap(profileModal).release();
     setError(profileError, '');
     setHidden(profileSuccess, true);
@@ -1232,53 +1296,91 @@ document.addEventListener('DOMContentLoaded', () => {
     event.preventDefault();
     if (!state.user) return;
     const canSetPw = state.user.can_manage_self !== false && !!state.user.can_set_password;
-    // SSO accounts have nothing to save (name + password are IdP-managed); the
-    // Save button is hidden, but guard against an Enter-key submit anyway.
-    if (!canSetPw) { closeProfileModal(); return; }
+    if (state.user.can_manage_self === false || photoPreparing || profileSaving || !profileHasChanges()) return;
     setError(profileError, '');
     setHidden(profileSuccess, true);
 
-    const body = { display_name: profileDisplayName.value.trim() };
+    const body = canSetPw ? { display_name: profileDisplayName.value.trim() } : {};
+    if (pendingAvatar !== undefined) body.avatar = pendingAvatar;
+    if (pendingAvatarColor !== undefined) body.avatar_color = pendingAvatarColor;
     const wantsPwChange = canSetPw &&
       (profileNewPw.value.length > 0 || profileCurrentPw.value.length > 0);
     if (wantsPwChange) {
       if (profileNewPw.value.length < 15) {
         setError(profileError, 'New password must be at least 15 characters');
+        syncProfileSave();
         return;
       }
       body.current_password = profileCurrentPw.value;
       body.new_password = profileNewPw.value;
     }
 
-    await runInFlight(profileSubmit, async () => {
-      let resp;
-      try {
-        resp = await api('/api/auth/me', { method: 'PATCH', body: JSON.stringify(body) });
-      } catch {
-        setError(profileError, 'Network error');
-        return;
-      }
-      if (resp.status === 401) { await handleUnauthorized(); return; }
-      if (!resp.ok) {
-        let msg = 'Failed to save profile';
-        try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch {}
-        setError(profileError, msg);
-        return;
-      }
-      let data = null;
-      try { data = await resp.json(); } catch {}
-      if (data && data.user) {
-        state.user = data.user;
-        renderIdentity(data.user);
-      }
-      profileCurrentPw.value = '';
-      profileNewPw.value = '';
-      profileSuccess.textContent = wantsPwChange ? 'Profile and password updated' : 'Profile updated';
-      setHidden(profileSuccess, false);
-      // If the admin Users table is on screen, refresh it so this user's display
-      // name updates there too.
-      if (usersView && !usersView.hidden) loadUsers();
-    });
+    const generation = photoGeneration;
+    profileSaving = true;
+    syncProfileColor();
+    for (const input of [profileDisplayName, profileCurrentPw, profileNewPw]) input.disabled = true;
+    if (profilePhotoStatus) profilePhotoStatus.textContent = 'Saving…';
+    if (profilePhotoChange) profilePhotoChange.disabled = true;
+    if (profilePhotoRemove) profilePhotoRemove.disabled = true;
+    try {
+      await runInFlight(profileSubmit, async () => {
+        let resp;
+        try {
+          resp = await api('/api/auth/me', { method: 'PATCH', body: JSON.stringify(body) });
+        } catch {
+          setError(profileError, 'Network error');
+          return;
+        }
+        if (resp.status === 401) { await handleUnauthorized(); return; }
+        if (!resp.ok) {
+          let msg = 'Failed to save profile';
+          try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch {}
+          setError(profileError, msg);
+          return;
+        }
+        let data = null;
+        try { data = await resp.json(); } catch {}
+        if (data && data.user) {
+          state.user = data.user;
+          renderIdentity(data.user);
+          // Reopening during a save discards the draft. Refresh that view too,
+          // so it cannot show the old photo after the sidebar has updated.
+          if (generation === photoGeneration || (pendingAvatar === undefined && pendingAvatarColor === undefined)) {
+            pendingAvatar = undefined;
+            pendingAvatarColor = undefined;
+            renderProfileAvatar();
+            syncProfileColor();
+            // Text fields are disabled during saves, including after reopening.
+            // Keep the reopened form aligned with the committed name too.
+            profileDisplayName.value = data.user.display_name || '';
+            const identity = identityModel(data.user);
+            profileUsername.textContent = identity.name;
+            profileLogin.textContent = identity.secondary ? `@${identity.secondary}` : '';
+            setHidden(profilePhotoRemove, !data.user.avatar_url);
+          }
+          if (generation === photoGeneration) {
+            profileUsername.textContent = identityModel(data.user).name;
+            if (profilePhotoStatus) profilePhotoStatus.textContent = '';
+          }
+        }
+        if (generation !== photoGeneration) return;
+        profileCurrentPw.value = '';
+        profileNewPw.value = '';
+        if (wantsPwChange && profilePwSection) profilePwSection.open = false;
+        profileSuccess.textContent = wantsPwChange ? 'Profile and password updated' : 'Changes saved';
+        setHidden(profileSuccess, false);
+        // If the admin Users table is on screen, refresh it so this user's display
+        // name updates there too.
+        if (usersView && !usersView.hidden) loadUsers();
+      });
+    } finally {
+      profileSaving = false;
+      for (const input of [profileDisplayName, profileCurrentPw, profileNewPw]) input.disabled = false;
+      syncProfileColor();
+      syncProfileSave();
+      if (profilePhotoChange) profilePhotoChange.disabled = false;
+      if (profilePhotoRemove) profilePhotoRemove.disabled = false;
+    }
   }
 
   async function handleUnauthorized() {
@@ -5008,6 +5110,71 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Profile modal: open from the sidebar identity card; close/submit wiring.
   if (identityCard) identityCard.addEventListener('click', openProfileModal);
+  function previewAvatarColor(color) {
+    if (!state.user || profileSaving || state.user.can_manage_self === false) return;
+    pendingAvatarColor = color;
+    renderProfileAvatar();
+    syncProfileColor();
+    setError(profileError, '');
+    setHidden(profileSuccess, true);
+    syncProfileSave();
+  }
+  if (profileAvatarColor) profileAvatarColor.addEventListener('input', () => previewAvatarColor(profileAvatarColor.value));
+  if (profileColorReset) profileColorReset.addEventListener('click', () => {
+    previewAvatarColor('');
+    profileAvatarColor.focus();
+  });
+  if (profilePhotoChange) profilePhotoChange.addEventListener('click', () => profilePhotoFile.click());
+  if (profilePhotoFile) profilePhotoFile.addEventListener('change', async () => {
+    const file = profilePhotoFile.files?.[0];
+    profilePhotoFile.value = '';
+    if (!file || profileSaving || state.user?.can_manage_self === false) return;
+    const generation = ++photoGeneration;
+    photoPreparing = true;
+    profileSubmit.disabled = true;
+    profilePhotoStatus.textContent = 'Preparing photo…';
+    setError(profileError, '');
+    setHidden(profileSuccess, true);
+    try {
+      const photo = await prepareUserAvatar(file, window);
+      if (generation !== photoGeneration) return;
+      pendingAvatar = photo;
+      renderProfileAvatar();
+      setHidden(profilePhotoRemove, false);
+      profilePhotoStatus.textContent = 'Unsaved changes';
+    } catch (err) {
+      if (generation !== photoGeneration) return;
+      profilePhotoStatus.textContent = '';
+      setError(profileError, err.message);
+    } finally {
+      if (generation === photoGeneration) {
+        photoPreparing = false;
+        syncProfileSave();
+      }
+    }
+  });
+  if (profilePhotoRemove) profilePhotoRemove.addEventListener('click', () => {
+    if (profileSaving) return;
+    photoGeneration++;
+    photoPreparing = false;
+    profileSubmit.disabled = false;
+    pendingAvatar = '';
+    renderProfileAvatar();
+    setHidden(profilePhotoRemove, true);
+    profilePhotoChange.focus();
+    profilePhotoStatus.textContent = 'Unsaved changes';
+    setError(profileError, '');
+    setHidden(profileSuccess, true);
+    syncProfileSave();
+  });
+  for (const input of [profileDisplayName, profileCurrentPw, profileNewPw]) {
+    if (input) input.addEventListener('input', () => {
+      setError(profileError, '');
+      setHidden(profileSuccess, true);
+      syncProfileSave();
+    });
+  }
+  if (profileCancel) profileCancel.addEventListener('click', closeProfileModal);
   if (profileClose) profileClose.addEventListener('click', closeProfileModal);
   if (profileForm)  profileForm.addEventListener('submit', submitProfile);
   if (profileModal) profileModal.addEventListener('click', e => {

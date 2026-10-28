@@ -987,11 +987,12 @@ func (s *Server) buildRouter() chi.Router {
 		// this ends every session belonging to the account.
 		r.Post("/api/auth/revoke-sessions", s.handleRevokeOwnSessions)
 		r.Get("/api/auth/me", s.handleMe)
+		r.Get("/api/auth/me/avatar", s.handleGetOwnAvatar)
 		// Verifies the caller's current password before accepting a change, so
 		// without a limit it is an unthrottled guessing oracle against a
 		// bearer-authenticated session. Reuses the existing per-user action
 		// limiter rather than adding a new one.
-		r.With(rateLimitByUser(s.userLimiter)).Patch("/api/auth/me", s.handlePatchMe) // self-service profile: display name + own password
+		r.With(rateLimitByUser(s.userLimiter)).Patch("/api/auth/me", s.handlePatchMe) // self-service profile: photo, display name, and own password
 		r.Get("/api/apps", s.handleListApps)
 		r.With(rateLimitByUser(s.actionLimiter)).Post("/api/fleet/runs", s.handleRegisterFleetRun)
 		r.Get("/api/fleet/runs/{id}", s.handleGetFleetRun)

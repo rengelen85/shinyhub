@@ -1268,7 +1268,7 @@
       </div>
     </div>
   </div>
-  <!-- Profile modal: self-service display name + own password, plus logout -->
+  <!-- Profile modal: photo, display name, own password, and logout -->
   <div id="profile-modal" class="modal-overlay" hidden
        role="dialog" aria-modal="true" aria-labelledby="profile-heading">
     <div class="modal-card">
@@ -1276,57 +1276,75 @@
         <h2 id="profile-heading" class="modal-title">Your profile</h2>
         <button id="profile-close" type="button" aria-label="Close profile"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="3" x2="13" y2="13"/><line x1="13" y1="3" x2="3" y2="13"/></svg></button>
       </div>
-      <div class="modal-body">
-        <div class="profile-identity">
-          <span id="profile-avatar" class="identity-avatar identity-avatar-lg" aria-hidden="true">?</span>
-          <div class="profile-identity-meta">
-            <span id="profile-username" class="profile-username"></span>
-            <span id="profile-role" class="profile-role"></span>
-            <span id="profile-login" class="profile-login"></span>
-          </div>
-        </div>
+      <form id="profile-form">
+        <div class="modal-body profile-body">
+          <section class="profile-identity" aria-label="Your avatar">
+            <span id="profile-avatar" class="identity-avatar identity-avatar-lg" aria-hidden="true">?</span>
+            <div class="profile-identity-meta">
+              <span id="profile-username" class="profile-username"></span>
+              <span id="profile-role" class="profile-role"></span>
+              <span id="profile-login" class="profile-login"></span>
+            </div>
+            <div id="profile-photo-controls" class="profile-photo-controls">
+              <div class="modal-actions profile-photo-actions">
+                <button id="profile-photo-change" type="button" aria-describedby="profile-photo-hint">Change photo</button>
+                <button id="profile-photo-remove" type="button" hidden>Use initials</button>
+              </div>
+              <input id="profile-photo-file" type="file" aria-label="Profile photo" accept="image/png,image/jpeg,image/webp" hidden>
+              <div class="modal-actions profile-color-actions">
+                <label for="profile-avatar-color">Initials color</label>
+                <input id="profile-avatar-color" type="color">
+                <button id="profile-color-reset" type="button">Use default</button>
+              </div>
+              <p id="profile-photo-hint" class="profile-hint">PNG, JPEG or WebP · 5 MB max · Square crop</p>
+            </div>
+          </section>
 
-        <fieldset id="theme-picker" class="profile-appearance">
-          <legend>Appearance</legend>
-          <div class="theme-options">
-            <label class="theme-option"><input type="radio" name="theme-pref" value="system"> System</label>
-            <label class="theme-option"><input type="radio" name="theme-pref" value="light"> Light</label>
-            <label class="theme-option"><input type="radio" name="theme-pref" value="dark"> Dark</label>
-          </div>
-        </fieldset>
-
-        <form id="profile-form">
           <div id="profile-name-field">
             <label for="profile-display-name">Display name</label>
             <input id="profile-display-name" type="text" maxlength="80"
-                   autocomplete="name" spellcheck="false" placeholder="Your name">
-            <p class="profile-hint">Shown across the dashboard. Leave blank to use your username.</p>
+                   autocomplete="name" spellcheck="false" placeholder="Your name" aria-describedby="profile-name-hint">
+            <p id="profile-name-hint" class="profile-hint">Leave blank to use your username.</p>
           </div>
 
-          <fieldset id="profile-password-section" class="profile-password">
-            <legend>Change password</legend>
-            <label for="profile-current-password">Current password</label>
-            <input id="profile-current-password" type="password"
-                   autocomplete="current-password" placeholder="Your current password">
-            <label for="profile-new-password">New password</label>
-            <input id="profile-new-password" type="password" minlength="15"
-                   autocomplete="new-password" placeholder="At least 15 characters">
+          <fieldset id="theme-picker" class="profile-appearance">
+            <legend>Appearance <span>Applies immediately</span></legend>
+            <div class="theme-options">
+              <label class="theme-option"><input type="radio" name="theme-pref" value="system"> System</label>
+              <label class="theme-option"><input type="radio" name="theme-pref" value="light"> Light</label>
+              <label class="theme-option"><input type="radio" name="theme-pref" value="dark"> Dark</label>
+            </div>
           </fieldset>
-          <p id="profile-password-managed" class="profile-hint" hidden>Your name and password are managed by your identity provider.</p>
 
-          <p class="profile-tokens-link">
-            <a href="/tokens" data-nav id="profile-tokens-link">Manage API tokens &rarr;</a>
-          </p>
-
-          <p id="profile-error" class="error" role="alert" hidden></p>
-          <p id="profile-success" class="profile-success" role="status" aria-live="polite" hidden></p>
-
+          <div class="profile-account">
+            <details id="profile-password-section" class="profile-password">
+              <summary>Change password<svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 3 5 5-5 5"/></svg></summary>
+              <div class="profile-password-fields">
+                <label for="profile-current-password">Current password</label>
+                <input id="profile-current-password" type="password" autocomplete="current-password" placeholder="Your current password">
+                <label for="profile-new-password">New password</label>
+                <input id="profile-new-password" type="password" minlength="15" autocomplete="new-password" placeholder="At least 15 characters">
+              </div>
+            </details>
+            <p id="profile-password-managed" class="profile-hint" hidden>Your name and password are managed by your identity provider.</p>
+            <div class="profile-account-links">
+              <a href="/tokens" data-nav id="profile-tokens-link">Manage API tokens <span aria-hidden="true">&rarr;</span></a>
+              <button id="logout-button" type="button" class="profile-logout">Log out</button>
+            </div>
+          </div>
+        </div>
+        <div class="profile-footer">
+          <div class="profile-feedback">
+            <p id="profile-photo-status" role="status" aria-live="polite"></p>
+            <p id="profile-error" class="error" role="alert" hidden></p>
+            <p id="profile-success" class="profile-success" role="status" aria-live="polite" hidden></p>
+          </div>
           <div class="modal-actions profile-actions">
-            <button id="logout-button" type="button" class="profile-logout">Log out</button>
+            <button id="profile-cancel" type="button">Cancel</button>
             <button id="profile-submit" type="submit" class="btn-primary">Save changes</button>
           </div>
-        </form>
-      </div>
+        </div>
+      </form>
     </div>
   </div>
   <!-- About: which ShinyHub is this, and what can it run. Filled by

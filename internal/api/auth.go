@@ -174,6 +174,8 @@ type sessionUserResponse struct {
 	Username          string `json:"username"`
 	Role              string `json:"role"`
 	DisplayName       string `json:"display_name"`
+	AvatarURL         string `json:"avatar_url,omitempty"`
+	AvatarColor       string `json:"avatar_color,omitempty"`
 	PrincipalType     string `json:"principal_type"`
 	ServiceAccountKey string `json:"service_account_key,omitempty"`
 	ManagedBy         string `json:"managed_by,omitempty"`
@@ -199,6 +201,8 @@ func newSessionUser(u *db.User) *sessionUserResponse {
 		Username:          u.Username,
 		Role:              u.Role,
 		DisplayName:       u.DisplayName,
+		AvatarURL:         userAvatarURL(u),
+		AvatarColor:       u.AvatarColor,
 		PrincipalType:     u.PrincipalType,
 		ServiceAccountKey: u.ServiceAccountKey,
 		ManagedBy:         u.ManagedBy,
@@ -557,13 +561,15 @@ type patchMeRequest struct {
 	// DisplayName is a pointer so the handler can tell "set to empty" (clear the
 	// name, re-opening it to SSO backfill) apart from "field omitted".
 	DisplayName     *string `json:"display_name"`
+	Avatar          *string `json:"avatar"`
+	AvatarColor     *string `json:"avatar_color"`
 	CurrentPassword string  `json:"current_password"`
 	NewPassword     string  `json:"new_password"`
 }
 
-// handlePatchMe lets the authenticated user edit their own profile: the
-// friendly display name and, for local accounts, their password (verifying the
-// current one first). SSO and system accounts cannot set a password here. It
+// handlePatchMe lets human users change their photo and local users change
+// their display name or password (verifying the current password first).
+// SSO names/passwords and configuration-managed identities remain read-only. It
 // returns the refreshed session view so the dashboard can update the sidebar
 // without a reload.
 func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
@@ -579,7 +585,7 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req patchMeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 768<<10)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad request")
 		return
 	}
@@ -598,6 +604,24 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.AvatarColor != nil {
+		color, err := normalizeAvatarColor(*req.AvatarColor)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.AvatarColor = &color
+	}
+	var avatarData []byte
+	var avatarVersion *string
+	if req.Avatar != nil {
+		data, version, err := decodeUserAvatar(*req.Avatar)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		avatarData, avatarVersion = data, &version
+	}
 	changedDisplayName := false
 	if req.DisplayName != nil {
 		// SSO accounts get their name from the identity provider (refreshed on
@@ -612,11 +636,8 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "display name must be at most 80 characters")
 			return
 		}
+		req.DisplayName = &name
 		if name != current.DisplayName {
-			if err := s.store.UpdateUserDisplayName(u.ID, name); err != nil {
-				writeError(w, http.StatusInternalServerError, "internal server error")
-				return
-			}
 			changedDisplayName = true
 		}
 	}
@@ -679,7 +700,23 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	if req.DisplayName != nil || req.AvatarColor != nil || avatarVersion != nil {
+		if err := s.store.UpdateUserProfile(u.ID, req.DisplayName, req.AvatarColor, avatarVersion, avatarData); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+	}
+	changed := []string{}
 	if changedDisplayName {
+		changed = append(changed, "display_name")
+	}
+	if avatarVersion != nil && *avatarVersion != current.AvatarVersion {
+		changed = append(changed, "avatar")
+	}
+	if req.AvatarColor != nil && *req.AvatarColor != current.AvatarColor {
+		changed = append(changed, "avatar_color")
+	}
+	if len(changed) > 0 {
 		s.logAuditEvent(r, db.AuditEventParams{
 			UserID:       &u.ID,
 			Action:       "update_profile",
@@ -687,7 +724,7 @@ func (s *Server) handlePatchMe(w http.ResponseWriter, r *http.Request) {
 			ResourceID:   u.Username,
 			// update_profile is the only action name this endpoint has, so the
 			// field says which part of the profile actually moved.
-			Detail:    db.AuditDetail(map[string]any{"changed": []string{"display_name"}}),
+			Detail:    db.AuditDetail(map[string]any{"changed": changed}),
 			IPAddress: s.ClientIP(r),
 		})
 	}

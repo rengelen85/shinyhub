@@ -1,0 +1,2 @@
+ALTER TABLE users ADD COLUMN avatar_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN avatar_data BLOB;
