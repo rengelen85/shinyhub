@@ -15,6 +15,8 @@ import { startVisiblePoll } from './visible-poll.js';
 
 const POLL_MS = 10000;
 const REQUEST_TIMEOUT_MS = 8000;
+// Keep navigation context only for this signed-in session, not across users.
+const overviewContexts = new WeakMap();
 
 export function mountOverview(ctx) {
   const view = document.getElementById('overview-view');
@@ -22,10 +24,15 @@ export function mountOverview(ctx) {
   view.hidden = false;
   ctx.updateActiveNav(location.pathname);
 
-  let selectedScope = 'all';
+  const savedContext = overviewContexts.get(ctx.state);
+  const sessionIdentity = ctx.state.sessionIdentity ?? ctx.state.user;
+  const sessionUserID = ctx.state.user?.id;
+  let returnContext = savedContext?.session === sessionIdentity && savedContext?.userID === sessionUserID ? savedContext : null;
+  let selectedScope = returnContext?.scope || 'all';
   let overviewSnapshot = null;
   let overviewStale = false;
   let overviewRetryPending = false;
+  let resourceRetryPending = false;
   let scopeNotice = '';
   const pendingRestarts = new Set();
   let disposed = false;
@@ -56,6 +63,11 @@ export function mountOverview(ctx) {
   // stop ends the liveness poll (on unmount or after a 401), so a logged-out or
   // navigated-away Overview never keeps fetching in the background.
   function stop() {
+    if (!disposed && overviewSnapshot && (ctx.state.sessionIdentity ?? ctx.state.user) === sessionIdentity
+      && ctx.state.user?.id === sessionUserID) overviewContexts.set(ctx.state, {
+      session: sessionIdentity, userID: sessionUserID, scope: selectedScope,
+      focusKey: focusedKey(body), disclosures: expandedDisclosureKeys(body),
+    });
     disposed = true;
     if (stopPoll) { stopPoll(); stopPoll = null; }
     for (const controller of pendingControllers) controller.abort();
@@ -63,6 +75,7 @@ export function mountOverview(ctx) {
   }
 
   body.replaceChildren(skeleton());
+  const initialScrollY = window.scrollY;
 
   function requestJSON(path) {
     return apiWithTimeout(ctx.api, path, REQUEST_TIMEOUT_MS, pendingControllers, async (response) => ({
@@ -75,6 +88,7 @@ export function mountOverview(ctx) {
     if (loadInFlight) return;
     loadInFlight = true;
     if (!initial) live.textContent = '';
+    const wasResourceRetry = resourceRetryPending;
     try {
       let apps = [];
       try {
@@ -108,32 +122,70 @@ export function mountOverview(ctx) {
         ? 'The selected fleet is no longer available. Showing all apps.' : '';
       selectedScope = workspace.selectedKey;
       const model = workspace.model;
+      const announceResourceRetry = wasResourceRetry || resourceRetryPending;
+      resourceRetryPending = false;
+      // Async navigation must not take focus back after the operator has
+      // started using another control or scrolling while readings load.
+      const canRestoreContextFocus = window.scrollY === initialScrollY
+        && (document.activeElement === document.body || document.activeElement === view.querySelector('h1'));
       replaceOverviewContent(body, render(workspace, activitySnapshot));
+      if (returnContext) {
+        restoreDisclosures(body, returnContext.disclosures);
+        revealFocusedRow(body, returnContext.focusKey);
+        if (returnContext.focusKey && canRestoreContextFocus) {
+          if (!restoreFocus(body, returnContext.focusKey)) restoreFocus(body, 'overview:scope');
+          // The skeleton can shrink the document before Back restores its
+          // scroll position. Keep the restored control visible once data lands.
+          if (body.contains(document.activeElement)) document.activeElement.scrollIntoView?.({ block: 'nearest' });
+        }
+        returnContext = null;
+      }
       if (scopeNotice) appendOverviewAnnouncement(live, scopeNotice);
       if (recovered) appendOverviewAnnouncement(live, 'Overview is current again.');
       const signature = resourceLiveSignature(model.resources);
       if (!initial && lastLiveSignature && signature !== lastLiveSignature) {
         appendOverviewAnnouncement(live, resourceLiveSummary(model.resources, lastLiveResources));
       }
+      if (announceResourceRetry) appendOverviewAnnouncement(live, ['stale', 'unavailable'].includes(model.resources.state)
+        ? 'Resource readings could not refresh. Retrying automatically every 10 seconds while this page is visible.'
+        : 'Resource readings refreshed.');
       lastLiveSignature = signature;
       lastLiveResources = model.resources;
     } finally {
       loadInFlight = false;
       overviewRetryPending = false;
+      resourceRetryPending = false;
+      const resourceRetry = body.querySelector('[data-focus-key="usage:retry"]');
+      if (resourceRetry) {
+        resourceRetry.removeAttribute('aria-disabled');
+        resourceRetry.textContent = 'Retry readings';
+        body.querySelector('.ov-resources')?.removeAttribute('aria-busy');
+      }
       const warning = body.querySelector('.ov-refresh-warning');
       if (warning) {
         warning.removeAttribute('aria-busy');
         const retry = warning.querySelector('button');
-        retry.disabled = false;
+        retry.removeAttribute('aria-disabled');
         retry.textContent = 'Retry';
       }
     }
   }
 
+  function retryResources() {
+    if (disposed) return;
+    resourceRetryPending = true;
+    const retry = body.querySelector('[data-focus-key="usage:retry"]');
+    // Keep the initiating control focusable while the guarded request runs.
+    // Native disabled buttons lose focus in Chrome before snapshot replacement.
+    if (retry) { retry.setAttribute('aria-disabled', 'true'); retry.textContent = 'Trying again…'; }
+    body.querySelector('.ov-resources')?.setAttribute('aria-busy', 'true');
+    if (!loadInFlight) void load(false);
+  }
+
   function showRefreshFailure(initial) {
     if (initial || !overviewSnapshot) { body.replaceChildren(errorState()); return; }
     const changed = !overviewStale;
-    const wasRetry = overviewRetryPending;
+    const wasRetry = overviewRetryPending || resourceRetryPending;
     overviewRetryPending = false;
     overviewStale = true;
     const { apps, metrics, history } = overviewSnapshot;
@@ -249,31 +301,33 @@ export function mountOverview(ctx) {
     replaceOverviewContent(body, render(workspace, activitySnapshot));
     restoreFocus(body, 'overview:scope');
     if (bringIntoView) body.querySelector('.ov-scope')?.scrollIntoView?.({ block: 'start' });
-    live.textContent = `${workspace.scopes.find((scope) => scope.key === selectedScope).label}. ${workspace.model.verdict.headline}. ${workspace.model.verdict.detail}`;
+    live.textContent = '';
+    appendOverviewAnnouncement(live, `${workspace.scopes.find((scope) => scope.key === selectedScope).label}. ${workspace.model.verdict.headline}. ${workspace.model.verdict.detail}`);
   }
 
   function render(workspace, activity) {
     const model = workspace.model;
     const root = el('div', 'ov-grid');
     if (overviewStale) {
-      model.verdict = { tone: 'warning', headline: 'Overview data is stale', detail: 'App health, fleet membership, and resources reflect the last successful update.' };
+      model.verdict = { tone: 'warning', headline: 'Overview data is stale', detail: 'App health, fleet membership, and resources reflect the last successful update.'
+        + (model.attention.length ? ` Last reported: ${model.attention.length} ${model.attention.length === 1 ? 'app needs' : 'apps need'} attention.` : '') };
       const notice = el('section', 'ov-panel ov-refresh-warning');
       notice.setAttribute('aria-label', 'Overview refresh status');
       notice.appendChild(el('p', null, 'Overview could not refresh. Showing the last successful update.'));
       const stamp = el('time', 'ov-res-scope', `Last updated ${new Date(overviewSnapshot.updatedAt).toLocaleTimeString()}`);
       stamp.dateTime = overviewSnapshot.updatedAt;
       const retry = el('button', 'ov-btn', overviewRetryPending ? 'Trying again…' : 'Retry');
-      retry.disabled = overviewRetryPending;
+      if (overviewRetryPending) retry.setAttribute('aria-disabled', 'true');
       notice.setAttribute('aria-busy', String(overviewRetryPending));
       retry.type = 'button';
       retry.dataset.focusKey = 'overview:retry';
       retry.addEventListener('click', () => {
-        if (loadInFlight) return;
+        if (retry.getAttribute('aria-disabled') === 'true') return;
         overviewRetryPending = true;
-        retry.disabled = true;
+        retry.setAttribute('aria-disabled', 'true');
         retry.textContent = 'Trying again…';
         notice.setAttribute('aria-busy', 'true');
-        void load(false);
+        if (!loadInFlight) void load(false);
       });
       notice.append(stamp, retry);
       root.appendChild(notice);
@@ -310,9 +364,20 @@ export function mountOverview(ctx) {
     wrap.appendChild(field);
     const selected = workspace.scopes.find((scope) => scope.key === workspace.selectedKey);
     const text = selected.key === 'all'
-      ? `${selected.total} ${selected.total === 1 ? 'app' : 'apps'} across the hub · ${workspace.fleetCount} named ${workspace.fleetCount === 1 ? 'fleet' : 'fleets'}`
+      ? `${selected.total} ${selected.total === 1 ? 'app' : 'apps'} across the hub${workspace.fleetCount ? ` · ${workspace.fleetCount} named ${workspace.fleetCount === 1 ? 'fleet' : 'fleets'}` : ''}`
       : `${selected.total} ${selected.total === 1 ? 'app' : 'apps'} · health and resources for ${selected.label}`;
     wrap.appendChild(el('p', 'ov-scope-summary', text));
+    if (canReadAudit) {
+      const recent = el('button', 'ov-res-toggle ov-recent-jump', 'Recent changes');
+      recent.type = 'button';
+      recent.dataset.focusKey = 'activity:jump';
+      recent.addEventListener('click', () => {
+        const heading = document.getElementById('ov-activity-title');
+        heading?.focus();
+        heading?.scrollIntoView?.({ block: 'start' });
+      });
+      wrap.appendChild(recent);
+    }
     return wrap;
   }
 
@@ -371,9 +436,12 @@ export function mountOverview(ctx) {
       });
       actions.appendChild(inspect);
     };
-    if (model.verdict.headline.startsWith('App usage')) {
-      addJump('Review app usage', 'usage:review', 'ov-resources-title');
-    } else if (model.attention.length === 0 && model.resources.hotspots.length > 0 && model.resources.state !== 'stale') {
+    if (model.attention.length > 0) {
+      addJump(overviewStale ? 'Review last app issues' : 'Review app issues', 'attention:review', 'ov-attention-title');
+    }
+    const highUsage = [model.resources.cpu, model.resources.memory].some((metric) => ['critical', 'warning'].includes(metric.usage.severity));
+    if (highUsage && !['stale', 'unavailable'].includes(model.resources.state)) addJump('Review app usage', 'usage:review', 'ov-resources-title');
+    if (model.resources.hotspots.length > 0 && model.resources.state !== 'stale') {
       addJump('Review pressure alerts', 'pressure:review', 'ov-pressure-title');
     } else if (model.resources.state === 'stale') {
       addJump('Review last readings', 'usage:review', 'ov-resources-title');
@@ -381,23 +449,30 @@ export function mountOverview(ctx) {
     if (model.resources.state === 'partial' || model.resources.state === 'unavailable') {
       addJump('Review resource coverage', 'coverage:review', 'ov-coverage-title');
     }
-    if (actions.children.length) vtext.appendChild(actions);
+    if (actions.children.length) {
+      actions.firstElementChild.classList.add('ov-primary-response');
+      vtext.appendChild(actions);
+    }
     verdict.appendChild(vtext);
     sec.appendChild(verdict);
 
     const active = model.segments.filter((s) => s.count > 0);
     if (model.total > 0) {
-      const bar = el('div', 'ov-bar');
-      bar.setAttribute('role', 'img');
-      bar.setAttribute('aria-label',
-        active.map((s) => `${s.count} ${s.label.toLowerCase()}`).join(', '));
-      for (const seg of active) {
-        const s = el('span', 'ov-bar-seg');
-        s.style.flexGrow = String(seg.count);
-        s.style.setProperty('--seg', `var(${seg.cssVar})`);
-        bar.appendChild(s);
+      // A single status needs a count, not a full-width decorative bar.
+      // Mixed statuses retain the proportional overview at a quieter weight.
+      if (active.length > 1) {
+        const bar = el('div', 'ov-bar');
+        bar.setAttribute('role', 'img');
+        bar.setAttribute('aria-label',
+          active.map((s) => `${s.count} ${s.label.toLowerCase()}`).join(', '));
+        for (const seg of active) {
+          const s = el('span', 'ov-bar-seg');
+          s.style.flexGrow = String(seg.count);
+          s.style.setProperty('--seg', `var(${seg.cssVar})`);
+          bar.appendChild(s);
+        }
+        sec.appendChild(bar);
       }
-      sec.appendChild(bar);
 
       const legend = el('ul', 'ov-legend');
       for (const seg of active) {
@@ -417,7 +492,12 @@ export function mountOverview(ctx) {
   // ── Attention: actionable rows for crashed / degraded apps. ──
   function renderAttention(items) {
     const sec = el('section', 'ov-panel ov-attention');
-    sec.appendChild(sectionTitle('Needs attention', items.length));
+    const title = sectionTitle('Needs attention', items.length);
+    title.id = 'ov-attention-title';
+    title.tabIndex = -1;
+    title.dataset.focusKey = 'attention:heading';
+    sec.setAttribute('aria-labelledby', title.id);
+    sec.appendChild(title);
     const list = el('ul', 'ov-attn-list');
     for (const a of items) {
       const li = el('li', 'ov-attn-row');
@@ -495,7 +575,10 @@ export function mountOverview(ctx) {
   }
 
   function renderResources(res) {
-    return renderResourcePressure(res, { canManageApp: (app) => ctx.canManageApp(ctx.state.user, app) });
+    return renderResourcePressure(res, {
+      canManageApp: (app) => ctx.canManageApp(ctx.state.user, app),
+      onRetry: overviewStale ? null : retryResources, retryPending: resourceRetryPending,
+    });
   }
 
   // ── helpers ──
@@ -821,7 +904,7 @@ function safeDOMID(value) {
 
 // Exported as a small, state-complete renderer so its meter semantics and
 // unavailable/partial copy can be verified without mounting the whole SPA.
-export function renderResourcePressure(res, { canManageApp = () => false } = {}) {
+export function renderResourcePressure(res, { canManageApp = () => false, onRetry = null, retryPending = false } = {}) {
   const sec = el('section', 'ov-panel ov-resources');
   sec.setAttribute('aria-labelledby', 'ov-resources-title');
 
@@ -832,10 +915,24 @@ export function renderResourcePressure(res, { canManageApp = () => false } = {})
   title.tabIndex = -1;
   title.dataset.focusKey = 'usage:heading';
   titleWrap.appendChild(title);
-  titleWrap.appendChild(el('p', 'ov-res-scope', panelScope(res.scale, res.scope, res.cpu.scale !== res.memory.scale)));
+  titleWrap.appendChild(el('p', 'ov-res-scope', panelScope(res)));
   head.appendChild(titleWrap);
   head.appendChild(el('p', 'ov-res-updated', updatedText(res)));
   sec.appendChild(head);
+  if (res.state === 'stale' || res.state === 'unavailable') {
+    const recovery = el('div', 'ov-resource-retry');
+    recovery.appendChild(el('p', 'ov-capacity-basis', 'Retries every 10 seconds while this page is visible.'));
+    if (onRetry) {
+      const retry = el('button', 'ov-btn', retryPending ? 'Trying again…' : 'Retry readings');
+      retry.type = 'button';
+      if (retryPending) retry.setAttribute('aria-disabled', 'true');
+      retry.dataset.focusKey = 'usage:retry';
+      retry.addEventListener('click', () => { if (retry.getAttribute('aria-disabled') !== 'true') onRetry(); });
+      recovery.appendChild(retry);
+    }
+    if (retryPending) sec.setAttribute('aria-busy', 'true');
+    sec.appendChild(recovery);
+  }
 
   if (res.state === 'unavailable') {
     const unavailable = el('div', 'ov-res-message ov-res-message--unavailable');
@@ -865,7 +962,7 @@ export function renderResourcePressure(res, { canManageApp = () => false } = {})
   // With no limits anywhere there are no per-replica thresholds to alert on, so
   // the panel answers the next question instead: which apps account for this.
   if (res.scale !== 'limits') {
-    if (res.state === 'partial' || res.state === 'stale') sec.appendChild(renderCoverageGaps(res, canManageApp));
+    if (res.state === 'stale' || res.cpu.gaps.length || res.memory.gaps.length) sec.appendChild(renderCoverageGaps(res, canManageApp));
     if (res.topConsumers) sec.appendChild(renderTopConsumers(res.topConsumers, res.scope));
     return sec;
   }
@@ -905,7 +1002,7 @@ export function renderResourcePressure(res, { canManageApp = () => false } = {})
       sec.appendChild(toggle);
     }
   }
-  if (res.state === 'partial' || res.state === 'stale') sec.appendChild(renderCoverageGaps(res, canManageApp));
+  if (res.state === 'stale' || res.cpu.gaps.length || res.memory.gaps.length) sec.appendChild(renderCoverageGaps(res, canManageApp));
   return sec;
 }
 
@@ -917,6 +1014,17 @@ export function replaceOverviewContent(body, next) {
   const disclosures = expandedDisclosureKeys(body);
   body.replaceChildren(next);
   restoreDisclosures(body, disclosures);
+  revealFocusedRow(body, focusKey);
+  if (!restoreFocus(body, focusKey) && focusKey && focusKey.startsWith('activity:')) {
+    restoreFocus(body, 'activity:heading');
+  } else if (focusKey === 'usage:retry' && !body.contains(document.activeElement)) {
+    if (!restoreFocus(body, 'overview:retry')) restoreFocus(body, 'usage:heading');
+  } else if (focusKey && !body.contains(document.activeElement)) {
+    restoreFocus(body, 'overview:scope');
+  }
+}
+
+function revealFocusedRow(body, focusKey) {
   // A new higher-priority gap can push the focused row into the overflow.
   // Keep that still-present action visible before restoring its focus.
   if (focusKey?.startsWith('coverage') || focusKey?.startsWith('pressure:')) {
@@ -927,11 +1035,6 @@ export function replaceOverviewContent(body, next) {
     if (target?.closest('.ov-hotspot-row[hidden]')) {
       body.querySelector('[data-disclosure-key="pressure-alerts"]')?.click();
     }
-  }
-  if (!restoreFocus(body, focusKey) && focusKey && focusKey.startsWith('activity:')) {
-    restoreFocus(body, 'activity:heading');
-  } else if (focusKey && !body.contains(document.activeElement)) {
-    restoreFocus(body, 'overview:scope');
   }
 }
 
@@ -986,6 +1089,7 @@ function renderCapacityRow(label, metric, runningReplicas) {
     }
     row.appendChild(checks);
   }
+  if (metric.kind === 'memory') row.appendChild(el('p', 'ov-capacity-basis ov-memory-definition', 'RSS is memory held in RAM by reporting apps.'));
   return row;
 }
 
@@ -997,13 +1101,15 @@ function capacitySourceLabel(source) {
   if (source === 'cgroup-limit' || source === 'cgroup-quota' || source === 'cgroup-cpuset') return 'Container / service capacity';
   if (source === 'config') return 'Configured capacity';
   if (source === 'host-total') return 'Host capacity · OS total';
-  if (source === 'affinity') return 'Host capacity · CPU affinity';
+  if (source === 'affinity') return 'Available CPU cores';
   return 'Host capacity';
 }
 
 function disclosure(label, key, content) {
   const wrap = el('div', 'ov-resource-disclosure');
   const toggle = el('button', 'ov-res-toggle', label);
+  toggle.classList.add('ov-disclosure-toggle');
+  toggle.appendChild(activityIcon('chevron'));
   toggle.type = 'button';
   toggle.dataset.disclosureKey = key;
   toggle.dataset.focusKey = key;
@@ -1068,7 +1174,9 @@ function renderCoverageGaps(res, canManageApp) {
   }
   section.appendChild(el('p', 'ov-capacity-basis', res.state === 'stale'
     ? 'Last reported gaps. Live metrics are being retried.'
-    : 'Missing measurements and incomplete app-limit checks.'));
+    : [...groups.values()].every((gap) => gap.reason === 'unlimited')
+      ? 'All replicas are reporting. Setting app limits is optional.'
+      : 'Measurement gaps and app-limit checks.'));
   const reasons = {
     metrics: ['No measurement', 'Inspect the app’s replica health and recent worker logs. Check the ShinyHub service logs if several apps stop reporting. This page retries automatically.'],
     unlimited: ['No limit set · optional', 'Usage is still included above when this replica reports. Set a limit in app configuration only if you want to check this replica against an enforced allocation.'],
@@ -1085,7 +1193,9 @@ function renderCoverageGaps(res, canManageApp) {
     if (index >= 4) row.hidden = true;
     const main = el('div', 'ov-coverage-main');
     main.appendChild(el('b', null, gap.name));
-    const [reason, advice] = reasons[gap.reason];
+    const [reason, baseAdvice] = reasons[gap.reason];
+    const advice = gap.reason === 'unlimited' && !canManageApp(gap.app)
+      ? 'Usage is still included above when this replica reports. Ask an app manager to set a limit if you want to check this replica against an enforced allocation.' : baseAdvice;
     main.appendChild(el('p', 'ov-capacity-basis', reason));
     main.appendChild(el('p', 'ov-coverage-counts', gap.counts.join(' · ')));
     row.appendChild(main);
@@ -1142,12 +1252,14 @@ function renderTopConsumers(top, scope = { key: 'all', label: 'All apps' }) {
   for (const item of top.items) {
     const li = el('li', 'ov-consumer-row');
     const link = el('a', 'ov-hotspot-name', item.name);
-    link.href = '/apps/' + encodeURIComponent(item.slug) + '/configuration';
+    link.href = '/apps/' + encodeURIComponent(item.slug);
+    link.setAttribute('aria-label', `${item.name} Inspect app usage`);
+    link.appendChild(el('span', 'ov-resource-link-hint', 'Inspect app'));
     link.setAttribute('data-nav', '');
     link.dataset.focusKey = `consumer:${item.slug}:${top.kind}`;
     const main = el('div', 'ov-consumer-main');
     main.appendChild(link);
-    if (scope.key === 'all') main.appendChild(el('span', 'ov-fleet-meta', item.fleetID ? `Fleet · ${item.fleetID}` : 'Outside fleets'));
+    if (scope.key === 'all' && item.fleetID) main.appendChild(el('span', 'ov-fleet-meta', `Fleet · ${item.fleetID}`));
     li.appendChild(main);
 
     const share = el('span', 'ov-consumer-share');
@@ -1175,16 +1287,22 @@ function panelTitle(scale, scope) {
 
 // The scope line says what the numbers are measured against, and on a fleet
 // with no limits it also says why the panel is answering a different question.
-function panelScope(scale, scope) {
+function panelScope(res) {
+  const { scope } = res;
   const prefix = scope && scope.key !== 'all' ? scope.label : 'All apps';
-  return `${prefix} · app usage against shared host capacity. Other host processes are not included.`;
+  const sources = [res.cpu.hostCapacity?.source, res.memory.hostCapacity?.source];
+  const capacity = sources.every((source) => source?.startsWith('cgroup-')) ? 'container / service capacity'
+    : sources.every((source) => source === 'config') ? 'configured capacity' : 'available capacity';
+  return `${prefix} · app usage against ${capacity}. Other host processes are not included.`;
 }
 
 function renderHotspot(item) {
   const li = el('li', 'ov-hotspot-row');
   const main = el('div', 'ov-hotspot-main');
   const link = el('a', 'ov-hotspot-name', item.name);
-  link.href = '/apps/' + encodeURIComponent(item.slug) + '/configuration';
+  link.href = '/apps/' + encodeURIComponent(item.slug);
+  link.setAttribute('aria-label', `${item.name} Inspect app ${item.metric === 'cpu' ? 'CPU' : 'memory'} pressure`);
+  link.appendChild(el('span', 'ov-resource-link-hint', 'Inspect app'));
   link.setAttribute('data-nav', '');
   link.dataset.focusKey = `pressure:${item.slug}:${item.metric}`;
   main.appendChild(link);

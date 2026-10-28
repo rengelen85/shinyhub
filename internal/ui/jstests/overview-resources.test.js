@@ -253,7 +253,7 @@ test('resource renderer never turns unavailable metrics into plausible zeros', (
   assert.equal(node.querySelector('meter'), null);
 });
 
-test('hotspot rows name severity, metric, replica, and configuration target', () => {
+test('hotspot rows name severity, metric, replica, and inspection target', () => {
   const resources = resourcesFor([{ slug: 'forecast', name: 'Forecast', status: 'running' }], {
     forecast: { status: 'running', replicas: [replica(1, 96, 500)] },
   });
@@ -261,7 +261,7 @@ test('hotspot rows name severity, metric, replica, and configuration target', ()
   assert.match(node.textContent, /Critical/);
   assert.match(node.textContent, /Replica 2/);
   const link = node.querySelector('.ov-hotspot-name');
-  assert.equal(link.getAttribute('href'), '/apps/forecast/configuration');
+  assert.equal(link.getAttribute('href'), '/apps/forecast');
   assert.equal(link.dataset.focusKey, 'pressure:forecast:memory');
   assert.match(node.querySelector('.ov-hotspot-row meter').getAttribute('aria-label'), /98 percent, critical/);
 });
@@ -301,8 +301,8 @@ test('a fleet with no limits is measured against the host, not reported as immea
   );
   const node = renderResourcePressure(resources);
   assert.match(node.textContent, /App resource usage/);
-  assert.match(node.textContent, /All apps · app usage against shared host capacity/);
-  assert.match(node.textContent, /1\.5 coresHost capacity · CPU affinity4\.0 cores/);
+  assert.match(node.textContent, /All apps · app usage against available capacity/);
+  assert.match(node.textContent, /1\.5 coresAvailable CPU cores4\.0 cores/);
   assert.match(node.textContent, /2\.0 GBHost capacity · OS total8\.0 GB/);
   assert.match(node.textContent, /1 of 1 replicas reporting/);
   assert.doesNotMatch(node.textContent, /Capacity unavailable/);
@@ -311,7 +311,7 @@ test('a fleet with no limits is measured against the host, not reported as immea
 
   const meters = node.querySelectorAll('meter');
   assert.equal(meters.length, 2);
-  assert.match(meters[0].getAttribute('aria-label'), /CPU reported app usage, 38% of host capacity/);
+  assert.match(meters[0].getAttribute('aria-label'), /CPU reported app usage, 38% of available cpu cores/);
   assert.equal(Number(meters[1].value.toFixed(2)), 0.25);
 });
 
@@ -342,7 +342,7 @@ test('a no-limit fleet attributes its usage to the apps behind it', () => {
   assert.match(node.textContent, /Top memory consumers/);
   const rows = [...node.querySelectorAll('.ov-consumer-row')];
   assert.equal(rows.length, 3);
-  assert.equal(rows[0].querySelector('a').getAttribute('href'), '/apps/alpha/configuration');
+  assert.equal(rows[0].querySelector('a').getAttribute('href'), '/apps/alpha');
   assert.match(rows[0].textContent, /400 MB/);
   assert.match(rows[0].textContent, /40% of measured usage/);
   // Attribution, not alarm: no pressure alerts and no all-clear about limits

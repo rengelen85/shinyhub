@@ -228,7 +228,8 @@ function buildResources(apps, metricsState, historyInput) {
   else if (metricsState.state === 'unavailable') state = 'unavailable';
   else if (metricsState.state === 'stale') state = 'stale';
   else if (cpu.usage.state === 'unavailable' && memory.usage.state === 'unavailable') state = 'unavailable';
-  else if (cpu.state !== 'ready' || memory.state !== 'ready' || cpu.gaps.length || memory.gaps.length) state = 'partial';
+  else if ([cpu, memory].some((metric) => metric.usage.state !== 'ready'
+    || metric.gaps.some((gap) => gap.reason !== 'unlimited'))) state = 'partial';
 
   // The panel's scale is the strongest denominator any row has: one row on
   // enforced limits still makes this an allocation-pressure panel.
@@ -726,12 +727,15 @@ function verdictFor(total, counts, attention, resources) {
   if (total === 0) {
     return { tone: 'empty', headline: 'Fleet not configured', detail: 'Deploy your first Shiny app to begin monitoring.' };
   }
+  const criticalHost = resources.state !== 'stale' && resources.state !== 'unavailable'
+    ? hostScaleMetric(resources, 'critical') : null;
   if (attention.length > 0) {
     const n = attention.length;
     return {
       tone: 'critical',
       headline: n === 1 ? '1 app needs attention' : `${n} apps need attention`,
-      detail: attention.map((a) => a.slug).slice(0, 3).join(', ') + (n > 3 ? ` +${n - 3} more` : ''),
+      detail: attention.map((a) => a.name || a.slug).slice(0, 3).join(', ') + (n > 3 ? ` +${n - 3} more` : '')
+        + (criticalHost ? `. ${hostScaleDetail(criticalHost, resources.runningReplicas)}` : ''),
     };
   }
 
@@ -748,20 +752,19 @@ function verdictFor(total, counts, attention, resources) {
     };
   }
 
+  if (criticalHost) {
+    return {
+      tone: 'critical',
+      headline: 'App usage is nearing available capacity',
+      detail: hostScaleDetail(criticalHost, resources.runningReplicas),
+    };
+  }
   const critical = resources.hotspots.find((item) => item.severity === 'critical');
   if (critical) {
     return {
       tone: 'critical',
       headline: 'Resource limit critical',
       detail: `${critical.name} ${critical.metric} is at ${Math.round(critical.fraction * 100)}% on replica ${(critical.replicaIndex ?? 0) + 1}.`,
-    };
-  }
-  const criticalHost = hostScaleMetric(resources, 'critical');
-  if (criticalHost) {
-    return {
-      tone: 'critical',
-      headline: 'App usage is nearing available capacity',
-      detail: hostScaleDetail(criticalHost, resources.runningReplicas),
     };
   }
   const warning = resources.hotspots.find((item) => item.severity === 'warning');
@@ -826,9 +829,12 @@ function partialDetail(resources) {
   const silent = [resources.cpu, resources.memory].some(
     (metric) => metric.coverage.observedReplicas < resources.runningReplicas,
   );
-  return silent
-    ? 'Some running replicas are not reporting CPU or memory.'
-    : 'Some running replicas have unset, unknown, or unenforced app limits.';
+  const reasons = new Set([resources.cpu, resources.memory].flatMap((metric) => metric.gaps.map((gap) => gap.reason)));
+  const details = [];
+  if (silent) details.push('Some running replicas are not reporting CPU or memory.');
+  if (reasons.has('unenforced')) details.push('Some configured app limits are not enforced.');
+  if (reasons.has('unknown')) details.push('Some app limits could not be verified.');
+  return details.join(' ');
 }
 
 function summaryLine(total, counts) {

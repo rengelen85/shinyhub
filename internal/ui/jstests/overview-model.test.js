@@ -16,6 +16,39 @@ test('host usage includes unlimited apps even when covered app-limit checks are 
   assert.equal(model.verdict.headline, 'App usage is nearing available capacity');
 });
 
+test('critical total app usage leads a simultaneous replica limit alert', () => {
+  const apps = [{ slug: 'limited', name: 'Limited', status: 'running' }, { slug: 'free', status: 'running' }];
+  const input = { ...ready({
+    limited: { replicas: [replica(0, { rssMB: 500, memMB: 512 })] },
+    free: { replicas: [replica(0, { rssMB: 7600, memMB: 0, cpuQuota: 0 })] },
+  }), host: { cores: 4, memory_mb: 8192 } };
+  const model = buildOverviewModel(apps, input);
+  assert.equal(model.resources.hotspots[0].severity, 'critical');
+  assert.equal(model.verdict.headline, 'App usage is nearing available capacity');
+  assert.match(model.verdict.detail, /99% of available capacity \(2 of 2 replicas reporting\)/);
+  const mixed = buildOverviewModel([...apps, { slug: 'failed', name: 'Failed app', status: 'crashed' }], input);
+  assert.equal(mixed.verdict.headline, '1 app needs attention');
+  assert.match(mixed.verdict.detail, /Failed app.*99% of available capacity/);
+});
+
+test('optional limits do not mask genuine unenforced-limit warnings', () => {
+  const model = buildOverviewModel([{ slug: 'a', status: 'running' }], ready({ a: { replicas: [
+    replica(0), replica(1, { memMB: 0, cpuQuota: 0 }), replica(2, { memoryEnforced: false }),
+  ] } }));
+  assert.equal(model.verdict.tone, 'warning');
+  assert.equal(model.resources.state, 'partial');
+  assert.equal(model.verdict.detail, 'Some configured app limits are not enforced.');
+});
+
+test('fully reporting mixed-limit apps with only optional gaps remain nominal', () => {
+  const model = buildOverviewModel([{ slug: 'a', status: 'running' }], ready({ a: { replicas: [
+    replica(0), replica(1, { memMB: 0, cpuQuota: 0 }),
+  ] } }));
+  assert.equal(model.resources.state, 'ready');
+  assert.equal(model.verdict.tone, 'nominal');
+  assert.equal(model.resources.memory.gaps[0].reason, 'unlimited');
+});
+
 test('coverage identifies missing memory without turning null into zero usage', () => {
   const sample = replica(0);
   sample.rss_bytes = null;
@@ -257,9 +290,9 @@ test('buildOverviewModel: one limited app keeps the whole panel on the limits sc
   assert.equal(m.resources.scale, 'limits');
   assert.equal(m.resources.memory.scale, 'limits');
   assert.equal(m.resources.memory.capacity, 512 * MIB);
-  assert.equal(m.resources.state, 'partial');
-  assert.equal(m.verdict.headline, 'Resource coverage is partial');
-  assert.equal(m.verdict.detail, 'Some running replicas have unset, unknown, or unenforced app limits.');
+  assert.equal(m.resources.state, 'ready');
+  assert.equal(m.verdict.tone, 'nominal');
+  assert.equal(m.verdict.headline, 'App health is stable');
   assert.equal(m.resources.topConsumers, null);
 });
 

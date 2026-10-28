@@ -55,6 +55,74 @@ function deferred() {
   return { promise, resolve };
 }
 
+test('metrics retry reports pending, failure and recovery while retaining keyboard focus', async () => {
+  let metricsFail = true;
+  let appsFail = false;
+  let pending = null;
+  const app = { slug: 'forecast', name: 'Forecast', status: 'running' };
+  const metrics = { host: { cores: 8, memory_mb: 65536 }, metrics: { forecast: { replicas: [{
+    index: 0, status: 'running', metrics_available: true, cpu_percent: 10, rss_bytes: 128 * 1024 * 1024,
+    effective_cpu_quota_percent: 0, effective_memory_limit_mb: 0, resource_enforcement_known: true,
+  }] } } };
+  mounted = mountOverview(context(async (path) => {
+    if (path === '/api/apps' && appsFail) return { ok: false, status: 503 };
+    if (path === '/api/apps/metrics' && pending) await pending.promise;
+    if (path === '/api/apps/metrics' && metricsFail) return { ok: false, status: 503 };
+    return { ok: true, status: 200, json: async () => path === '/api/apps' ? { items: [app] }
+      : path === '/api/apps/metrics' ? metrics : { history: {} } };
+  }));
+  const retry = () => document.querySelector('[data-focus-key="usage:retry"]');
+  await eventually(() => retry());
+  retry().focus();
+  pending = deferred();
+  retry().click();
+  assert.equal(retry().getAttribute('aria-disabled'), 'true');
+  assert.match(retry().textContent, /Trying again/);
+  assert.equal(document.querySelector('.ov-resources').getAttribute('aria-busy'), 'true');
+  pending.resolve(); pending = null;
+  await eventually(() => !retry().hasAttribute('aria-disabled'));
+  assert.equal(document.activeElement, retry());
+  assert.match(document.querySelector('#overview-live').textContent, /could not refresh/);
+  pending = deferred();
+  poll();
+  retry().click();
+  assert.match(retry().textContent, /Trying again/);
+  pending.resolve(); pending = null;
+  await eventually(() => !retry().hasAttribute('aria-disabled'));
+  assert.match(document.querySelector('#overview-live').textContent, /could not refresh/);
+  metricsFail = false;
+  retry().click();
+  await eventually(() => !retry());
+  assert.equal(document.activeElement.id, 'ov-resources-title');
+  assert.match(document.querySelector('#overview-live').textContent, /Resource readings refreshed/);
+  assert.match(document.querySelector('.ov-resources').textContent, /64.0 GB/);
+  metricsFail = true;
+  poll();
+  await eventually(() => retry());
+  assert.match(document.querySelector('.ov-resources').textContent, /Last reported app usage/);
+  assert.match(document.querySelector('.ov-resources').textContent, /128 MB/);
+  assert.match(document.querySelector('#overview-live').textContent, /stale/);
+  metricsFail = false;
+  poll();
+  await eventually(() => !retry());
+  assert.doesNotMatch(document.querySelector('.ov-resources').textContent, /Last reported app usage/);
+  // A broader outage during resource retry must not leave its button inert.
+  metricsFail = true;
+  poll();
+  await eventually(() => retry());
+  appsFail = true;
+  retry().focus(); retry().click();
+  await eventually(() => document.querySelector('.ov-refresh-warning'));
+  const overallRetry = document.querySelector('[data-focus-key="overview:retry"]');
+  assert.equal(retry(), null, 'a broader outage has one retry action');
+  assert.equal(document.activeElement, overallRetry);
+  appsFail = false; metricsFail = false;
+  overallRetry.click();
+  await eventually(() => !document.querySelector('.ov-refresh-warning'));
+  assert.equal(document.querySelector('.ov-refresh-warning'), null);
+  assert.equal(document.activeElement.id, 'ov-scope-select');
+});
+
 async function eventually(predicate) {
   for (let i = 0; i < 50; i += 1) {
     if (predicate()) return;
@@ -295,11 +363,11 @@ test('failed app polls retain a visibly stale scoped snapshot and retry restores
   retryResponse = deferred();
   document.querySelector('.ov-refresh-warning button').focus();
   document.querySelector('.ov-refresh-warning button').click();
-  assert.equal(document.querySelector('.ov-refresh-warning button').disabled, true);
+  assert.equal(document.querySelector('.ov-refresh-warning button').getAttribute('aria-disabled'), 'true');
   assert.equal(document.querySelector('.ov-refresh-warning button').textContent, 'Trying again…');
   assert.equal(document.querySelector('.ov-refresh-warning').getAttribute('aria-busy'), 'true');
   retryResponse.resolve({ ok: false, status: 500 });
-  await eventually(() => !document.querySelector('.ov-refresh-warning button').disabled);
+  await eventually(() => !document.querySelector('.ov-refresh-warning button').hasAttribute('aria-disabled'));
   assert.match(document.getElementById('overview-live').textContent, /could not refresh/);
   assert.equal(document.activeElement.dataset.focusKey, 'overview:retry');
   retryResponse = null;
@@ -352,7 +420,7 @@ test('critical resource verdict leads to pressure alerts before secondary covera
   const sample = { index: 0, status: 'running', metrics_available: true, rss_bytes: 500 * 1024 * 1024, cpu_percent: 10, effective_memory_limit_mb: 512, effective_cpu_quota_percent: 100, memory_limit_enforced: true, cpu_quota_enforced: true, resource_enforcement_known: true };
   mounted = mountOverview(context(async (path) => ({ ok: true, status: 200, json: async () => path === '/api/apps'
     ? { items: apps } : path.endsWith('/history') ? { history: {} }
-      : { metrics: { hot: { replicas: [sample] }, free: { replicas: [{ ...sample, effective_memory_limit_mb: 0 }] } } },
+      : { metrics: { hot: { replicas: [sample] }, free: { replicas: [{ ...sample, effective_memory_limit_mb: 0, metrics_available: false }] } } },
   })));
   await eventually(() => document.querySelector('[data-focus-key="pressure:review"]'));
   const actions = [...document.querySelectorAll('.ov-pulse-actions button')];
@@ -364,4 +432,36 @@ test('critical resource verdict leads to pressure alerts before secondary covera
   actions[0].click();
   assert.equal(document.activeElement, target);
   assert.equal(scrolled, true);
+  apps.push({ slug: 'reports', name: 'Weekly reports', status: 'crashed' });
+  poll();
+  await eventually(() => document.querySelector('[data-focus-key="attention:review"]'));
+  const mixedActions = [...document.querySelectorAll('.ov-pulse-actions button')];
+  assert.deepEqual(mixedActions.map((button) => button.textContent), [
+    'Review app issues', 'Review pressure alerts', 'Review resource coverage',
+  ]);
+  assert.equal(document.querySelector('.ov-pulse-detail').textContent, 'Weekly reports');
+  assert.equal(mixedActions[0].classList.contains('ov-primary-response'), true);
+  const attention = document.getElementById('ov-attention-title');
+  attention.scrollIntoView = () => {};
+  mixedActions[0].click();
+  assert.equal(document.activeElement, attention);
+});
+
+test('critical total usage and replica pressure each have a correctly ordered jump action', async () => {
+  const apps = [{ slug: 'hot', status: 'running' }, { slug: 'free', status: 'running' }];
+  const sample = { index: 0, status: 'running', metrics_available: true, rss_bytes: 500 * 1024 * 1024, cpu_percent: 10, effective_memory_limit_mb: 512, effective_cpu_quota_percent: 100, memory_limit_enforced: true, cpu_quota_enforced: true, resource_enforcement_known: true };
+  mounted = mountOverview(context(async (path) => ({ ok: true, status: 200, json: async () => path === '/api/apps'
+    ? { items: apps } : path.endsWith('/history') ? { history: {} }
+      : { host: { cores: 4, memory_mb: 1024 }, metrics: { hot: { replicas: [sample] }, free: { replicas: [{ ...sample, effective_memory_limit_mb: 0 }] } } },
+  })));
+  await eventually(() => document.querySelector('[data-focus-key="usage:review"]'));
+  assert.match(document.querySelector('.ov-pulse-headline').textContent, /App usage is nearing available capacity/);
+  const actions = [...document.querySelectorAll('.ov-pulse-actions button')];
+  assert.deepEqual(actions.map((button) => button.textContent), ['Review app usage', 'Review pressure alerts']);
+  const usage = document.getElementById('ov-resources-title');
+  usage.scrollIntoView = () => {};
+  actions[0].click();
+  assert.equal(document.activeElement, usage);
+  assert.equal(document.querySelector('[data-focus-key="coverage:review"]'), null, 'optional gaps do not become a warning action');
+  assert.match(document.querySelector('.ov-coverage').textContent, /All replicas are reporting. Setting app limits is optional/);
 });
