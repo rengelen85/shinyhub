@@ -416,6 +416,10 @@
     },
     {
       "method": "GET",
+      "path": "/api/auth/me/avatar"
+    },
+    {
+      "method": "GET",
       "path": "/api/auth/oidc/callback"
     },
     {
@@ -704,6 +708,7 @@
     "views/trends-card.js",
     "views/usage-privacy.js",
     "views/usage-ui.js",
+    "views/user-avatar.js",
     "views/user-identity.js",
     "views/user-row.js",
     "views/users.js",

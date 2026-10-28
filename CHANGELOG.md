@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- Customize your profile avatar and color from the profile editor.
+
+### Fixed
+
+- Distinguish measured app CPU and memory usage, available host or container capacity, and per-app limit checks on Overview. Missing readings and unenforced limits now identify the affected apps and offer recovery guidance; unset optional limits no longer produce a warning when all replicas report.
+- Keep Overview resources and recent changes in balanced full-width sections, preserve fleet and disclosure context during app inspection, and retain keyboard focus through polling and retry flows without interrupting interaction during loading.
+- Improve dashboard recovery states and creation and deployment journeys, and include the avatar endpoint and frontend module in the demo route allowlist.
+- Keep private bookmark inputs and agent payloads out of view URLs.
+
+### Security
+
+- Update go-jose to 4.1.6 to fix excessive resource use while parsing RSA JSON Web Keys (CVE-2026-116587).
+
+### Upgrade notice
+
+This release adds profile-avatar database columns. Back up the database before upgrading; older binaries reject the newer schema, so downgrading requires restoring the pre-upgrade database.
+
+The patched JWK parser rejects RSA keys larger than 4096 bits by default. Check your identity provider's signing-key size before upgrading if it uses unusually large RSA keys.
+
+
 ## [0.21.4](https://github.com/rvben/shinyhub/compare/v0.21.3...v0.21.4) - 2026-10-26
 
 ### Fixed
