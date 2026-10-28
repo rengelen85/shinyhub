@@ -1057,6 +1057,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function showLoggedOut() {
     sessionController.stop();
+    workersLoadVersion += 1;
+    tokensLoadVersion += 1;
+    workersLoaded = false;
+    tokensLoaded = false;
+    workersBody.replaceChildren();
+    tokensList.replaceChildren();
+    workersTable.hidden = true;
+    workersEmpty.hidden = true;
+    document.getElementById('workers-summary').hidden = true;
+    document.getElementById('workers-loading').hidden = true;
+    document.getElementById('tokens-loading').hidden = true;
+    workersBody.removeAttribute('aria-busy');
+    tokensList.removeAttribute('aria-busy');
+    document.getElementById('workers-refresh').disabled = false;
+    tokensRefresh.disabled = false;
     closeLogs();
     metrics.setTargets([]);
     state.user = null;
@@ -1086,6 +1101,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setHidden(appsView, true);
     setHidden(projectDetailView, true);
     setHidden(usersView, true);
+    setHidden(tokensView, true);
+    setHidden(document.getElementById('workers-view'), true);
     setHidden(auditView, true);
     setHidden(appDetailView, true);
     document.body.dataset.auth = 'out';
@@ -1717,26 +1734,55 @@ document.addEventListener('DOMContentLoaded', () => {
     syncSidebar();
   }
 
+  let workersLoadVersion = 0;
+  let workersLoaded = false;
   async function loadWorkers() {
+    const version = ++workersLoadVersion;
+    const owner = state.user?.id;
+    const current = () => version === workersLoadVersion && owner === state.user?.id;
+    const refresh = document.getElementById('workers-refresh');
+    const loading = document.getElementById('workers-loading');
+    const summary = document.getElementById('workers-summary');
+    refresh.disabled = true;
+    loading.hidden = false;
+    workersBody.setAttribute('aria-busy', 'true');
     setError(workersError, '');
-    let resp;
     try {
-      resp = await api('/api/workers');
+      const resp = await api('/api/workers');
+      if (!current()) return;
+      if (resp.status === 401) { await handleUnauthorized(); return; }
+      if (resp.status === 403) {
+        workersBody.replaceChildren();
+        workersTable.hidden = true;
+        workersEmpty.hidden = true;
+        summary.hidden = true;
+        workersLoaded = false;
+        setError(workersError, 'Administrator access is required to view workers.');
+        return;
+      }
+      if (!resp.ok) throw new Error('request failed');
+      const workers = await resp.json();
+      if (!current()) return;
+      if (!Array.isArray(workers)) throw new Error('invalid response');
+      renderWorkers(workers);
+      workersLoaded = true;
+      const available = workers.filter(w => w.status === 'up' && !w.revoked).length;
+      summary.textContent = `${workers.length} ${workers.length === 1 ? 'worker' : 'workers'} registered · ${available} available`;
+      summary.hidden = false;
     } catch {
-      setError(workersError, 'Network error');
-      return;
+      if (!current()) return;
+      workersEmpty.hidden = true;
+      summary.hidden = true;
+      setError(workersError, workersLoaded
+        ? 'Could not refresh workers. Showing the last loaded list. Select Refresh to try again.'
+        : 'Could not load workers. Check your connection and select Refresh to try again.');
+    } finally {
+      if (current()) {
+        refresh.disabled = false;
+        loading.hidden = true;
+        workersBody.removeAttribute('aria-busy');
+      }
     }
-    if (resp.status === 401) { await handleUnauthorized(); return; }
-    if (resp.status === 403) { setError(workersError, 'Admin access required'); return; }
-    if (!resp.ok) { setError(workersError, 'Failed to load workers'); return; }
-    let workers;
-    try {
-      workers = await resp.json();
-    } catch {
-      setError(workersError, 'Invalid response from server');
-      return;
-    }
-    renderWorkers(Array.isArray(workers) ? workers : []);
   }
 
   function renderWorkers(workers) {
@@ -1748,7 +1794,16 @@ document.addEventListener('DOMContentLoaded', () => {
       const tr = document.createElement('tr');
 
       const node = document.createElement('td');
-      node.textContent = d.node;
+      const name = document.createElement('strong');
+      name.className = 'worker-name';
+      name.textContent = w.name || w.node_id || 'Unknown worker';
+      node.appendChild(name);
+      if (w.name && w.node_id) {
+        const id = document.createElement('span');
+        id.className = 'worker-node';
+        id.textContent = w.node_id;
+        node.appendChild(id);
+      }
       tr.appendChild(node);
 
       const tier = document.createElement('td');
@@ -1771,6 +1826,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (w.last_heartbeat) {
         const dt = new Date(w.last_heartbeat);
         hbText = isNaN(dt.getTime()) ? String(w.last_heartbeat) : relativeTime(dt);
+        if (!isNaN(dt.getTime())) hb.title = dt.toLocaleString();
       }
       hb.textContent = hbText;
       tr.appendChild(hb);
@@ -2896,31 +2952,50 @@ document.addEventListener('DOMContentLoaded', () => {
   function submitNewUser(event) { return newPerson.submit(event); }
 
   // ── API tokens (self-service, /tokens page) ────────────────────────────────
+  let tokensLoadVersion = 0;
+  let tokensLoaded = false;
   async function loadTokens() {
     if (!tokensList) return;
+    const version = ++tokensLoadVersion;
+    const owner = state.user?.id;
+    const current = () => version === tokensLoadVersion && owner === state.user?.id;
+    const loading = document.getElementById('tokens-loading');
+    tokensRefresh.disabled = true;
+    loading.hidden = false;
+    tokensList.setAttribute('aria-busy', 'true');
     const selfService = !state.user || state.user.can_manage_self !== false;
     if (newTokenButton) newTokenButton.hidden = !selfService;
     setError(tokensError, '');
-    let resp;
     try {
-      resp = await api('/api/tokens');
+      const resp = await api('/api/tokens');
+      if (!current()) return;
+      if (resp.status === 401) { await handleUnauthorized(); return; }
+      if (resp.status === 403) {
+        tokensList.replaceChildren();
+        tokensLoaded = false;
+        setError(tokensError, 'This account does not have access to personal API tokens.');
+        return;
+      }
+      if (!resp.ok) throw new Error('request failed');
+      const body = await resp.json();
+      if (!current()) return;
+      const tokens = Array.isArray(body) ? body : body?.items;
+      if (!Array.isArray(tokens)) throw new Error('invalid response');
+      renderTokenList(tokensList, tokenListModels(tokens), document, {mutable: selfService});
+      tokensLoaded = true;
     } catch {
-      setError(tokensError, 'Network error loading tokens');
-      renderTokenList(tokensList, [], document, {mutable: selfService});
-      return;
+      if (!current()) return;
+      tokensList.querySelector('[data-tokens-empty]')?.remove();
+      setError(tokensError, tokensLoaded
+        ? 'Could not refresh tokens. Showing the last loaded list. Select Refresh to try again.'
+        : 'Could not load tokens. Check your connection and select Refresh to try again.');
+    } finally {
+      if (current()) {
+        tokensRefresh.disabled = false;
+        loading.hidden = true;
+        tokensList.removeAttribute('aria-busy');
+      }
     }
-    if (resp.status === 401) { await handleUnauthorized(); return; }
-    if (!resp.ok) {
-      setError(tokensError, 'Failed to load tokens');
-      renderTokenList(tokensList, [], document, {mutable: selfService});
-      return;
-    }
-    let body = [];
-    try { body = await resp.json(); } catch {}
-    // The server returns the standard {items,...} list envelope; tolerate a bare
-    // array for resilience across versions.
-    const tokens = Array.isArray(body) ? body : (body && Array.isArray(body.items) ? body.items : []);
-    renderTokenList(tokensList, tokenListModels(tokens), document, {mutable: selfService});
   }
 
   // The code-entry form has no state carried on the URL or in storage: a

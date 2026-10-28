@@ -390,7 +390,7 @@
         <h1 id="tokens-heading">API tokens</h1>
         <div class="toolbar-actions">
           <button id="new-token-button" type="button" class="btn-primary">+ New token</button>
-          <button id="tokens-refresh" type="button">Refresh</button>
+          <button id="tokens-refresh" class="toolbar-btn-quiet" type="button">Refresh</button>
         </div>
       </div>
       <section id="cli-connect-panel" class="cli-connect-panel" aria-labelledby="cli-connect-heading">
@@ -408,21 +408,25 @@
           <p id="cli-connect-success" class="cli-connect-success" role="status" hidden></p>
         </div>
       </section>
+      <h2 class="list-heading">Personal tokens</h2>
       <p class="tokens-intro">Personal tokens for the CLI and API. Use with <code>Authorization: token &lt;value&gt;</code> or <code>SHINYHUB_TOKEN</code>. A token is shown once at creation, so store it somewhere safe.</p>
+      <p id="tokens-loading" class="list-status" role="status" hidden>Loading tokens…</p>
       <p id="tokens-error" class="error" role="alert" hidden></p>
       <div id="tokens-list" class="tokens-list"></div>
     </section>
 
-    <section id="workers-view" hidden>
+    <section id="workers-view" hidden aria-labelledby="workers-heading">
       <div class="toolbar">
-        <h1>Workers</h1>
+        <div><h1 id="workers-heading">Workers</h1><p class="page-description">Worker availability and the last heartbeat received by this hub.</p></div>
         <div class="toolbar-actions">
-          <button id="workers-refresh" type="button">Refresh</button>
+          <button id="workers-refresh" class="toolbar-btn-quiet" type="button">Refresh</button>
         </div>
       </div>
+      <p id="workers-loading" class="list-status" role="status" hidden>Loading workers…</p>
+      <p id="workers-summary" class="list-status" role="status" hidden></p>
       <p id="workers-error" class="error" role="alert" hidden></p>
       <p id="workers-empty" class="env-empty" hidden>No workers have joined. Workers appear here when worker hosting is enabled and a <code>shinyhub worker</code> node joins over mTLS.</p>
-      <table id="workers-table" hidden>
+      <table id="workers-table" tabindex="0" aria-label="Registered workers" hidden>
         <thead>
           <tr>
             <th scope="col">Node</th>
@@ -460,7 +464,7 @@
       <p id="audit-loading" class="env-empty" role="status" hidden>Loading audit events…</p>
       <p id="audit-error" class="error" role="alert" hidden></p>
       <p id="audit-empty" class="env-empty" hidden>No audit events recorded yet. Every mutating action will appear here.</p>
-      <table id="audit-table">
+      <table id="audit-table" tabindex="0" aria-label="Audit events">
         <thead>
           <tr>
             <th scope="col">Time</th>
@@ -1168,7 +1172,7 @@
           <div>
             <p class="handoff-section-label" id="new-app-snippet-label">Deploy from your machine after creating</p>
             <div class="snippet">
-              <pre><code id="new-app-snippet"></code></pre>
+              <pre role="region" tabindex="0" aria-labelledby="new-app-snippet-label"><code id="new-app-snippet"></code></pre>
               <button type="button" id="new-app-snippet-copy" class="copy-btn"
                       aria-label="Copy CLI commands to clipboard">
                 <svg class="copy-icon-clipboard" viewBox="0 0 16 16" fill="none"
@@ -1246,7 +1250,7 @@
         <div>
           <p class="handoff-section-label">Or deploy from your CLI</p>
           <div class="snippet">
-            <pre><code id="deploy-cli-snippet"></code></pre>
+            <pre role="region" tabindex="0" aria-label="CLI deployment commands"><code id="deploy-cli-snippet"></code></pre>
             <button type="button" id="deploy-cli-snippet-copy" class="copy-btn"
                     aria-label="Copy CLI commands to clipboard">
               <svg class="copy-icon-clipboard" viewBox="0 0 16 16" fill="none"
@@ -1416,7 +1420,7 @@
             Copy this token now. For security it is <strong>shown only once</strong> and cannot be retrieved again.
           </p>
           <div class="snippet">
-            <pre><code id="token-reveal-value"></code></pre>
+            <pre role="region" tabindex="0" aria-label="Created API token"><code id="token-reveal-value"></code></pre>
             <button type="button" id="token-reveal-copy" class="copy-btn"
                     aria-label="Copy token to clipboard">
               <span class="copy-label">Copy</span>
@@ -1464,7 +1468,7 @@
           <h3 id="new-user-success-heading" tabindex="-1">Invitation ready</h3>
           <p id="new-user-result-detail" class="profile-hint"></p>
           <p>Send this link privately to the intended person. Anyone with the link can create this account.</p>
-          <pre class="person-signin-details" id="new-user-snippet"></pre>
+          <pre role="region" tabindex="0" aria-label="Sign-in details" class="person-signin-details" id="new-user-snippet"></pre>
           <p class="profile-hint">Copy this link before closing. It works once. You can replace it from Pending invitations if you need a new link. No email is sent automatically.</p>
           <p id="new-user-snippet-status" role="status"></p>
           <div class="modal-actions">

@@ -185,7 +185,8 @@ function metric(doc, label, value, help, title = '') {
   const dd = doc.createElement('dd');
   dd.textContent = value;
   if (title) dd.title = title;
-  const note = doc.createElement('span');
+  const note = doc.createElement('dd');
+  note.className = 'usage-metric-note';
   note.textContent = help;
   wrap.append(dt, dd, note);
   return wrap;
