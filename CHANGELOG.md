@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **ui**: polish dashboard pages and recovery states ([2aab626](https://github.com/rvben/shinyhub/commit/2aab626243eda2acd743ab66a906d0b4d451dd10))
 - **overview**: distinguish app usage from host capacity ([75a2b61](https://github.com/rvben/shinyhub/commit/75a2b616afbd4b3cc5f30ab832a753ec470db3cd))
 - **bookmarks**: keep private inputs and agent payloads out of view URLs ([5ca0c99](https://github.com/rvben/shinyhub/commit/5ca0c99597bda072c05a29d547df59245cb77068))
+- **security**: patch HTML parser resource exhaustion ([af1485d](https://github.com/rvben/shinyhub/commit/af1485da839c03c4489f5687a03c08a516b0eeeb))
 
 ### Security
 
