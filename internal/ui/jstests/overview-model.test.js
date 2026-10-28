@@ -4,6 +4,45 @@ import { buildOverviewModel, pulseOrder } from '../static/views/overview-model.j
 
 const MIB = 1024 * 1024;
 
+test('host usage includes unlimited apps even when covered app-limit checks are cool', () => {
+  const model = buildOverviewModel([{ slug: 'limited', status: 'running' }, { slug: 'free', status: 'running' }], {
+    ...ready({ limited: { replicas: [replica(0, { rssMB: 128, memMB: 2048 })] }, free: { replicas: [replica(0, { rssMB: 7800, memMB: 0, cpuQuota: 0 })] } }),
+    host: { cores: 4, memory_mb: 8192 },
+  });
+  assert.equal(model.resources.memory.used, 128 * MIB);
+  assert.equal(model.resources.memory.usage.used, 7928 * MIB);
+  assert.equal(model.resources.memory.usage.capacity, 8192 * MIB);
+  assert.equal(model.resources.memory.usage.severity, 'critical');
+  assert.equal(model.verdict.headline, 'App usage is nearing available capacity');
+});
+
+test('coverage identifies missing memory without turning null into zero usage', () => {
+  const sample = replica(0);
+  sample.rss_bytes = null;
+  const { resources } = buildOverviewModel([{ slug: 'a', status: 'running' }], ready({ a: { replicas: [sample] } }));
+  assert.equal(resources.memory.coverage.observedReplicas, 0);
+  assert.equal(resources.memory.fraction, null);
+  assert.equal(resources.memory.gaps[0].reason, 'metrics');
+  assert.equal(resources.cpu.gaps.length, 0);
+});
+
+test('coverage distinguishes unset, unknown and unenforced limits from missing samples', () => {
+  const samples = [replica(0), replica(1, { memMB: 0 }), replica(2, { memoryEnforced: false }), replica(3)];
+  samples[3].effective_memory_limit_mb = null;
+  const { resources } = buildOverviewModel([{ slug: 'a', status: 'running' }], ready({ a: { replicas: samples } }));
+  assert.deepEqual(resources.memory.gaps.map((gap) => gap.reason), ['unlimited', 'unenforced', 'unknown']);
+  assert.equal(resources.memory.coverage.unknownCapacityReplicas, 1);
+  assert.equal(resources.memory.coverage.unlimitedReplicas, 1);
+});
+
+test('usage-scale monitoring does not ask operators to set optional limits', () => {
+  const { resources } = buildOverviewModel([{ slug: 'a', status: 'running' }], ready({
+    a: { replicas: [replica(0, { memMB: 0, cpuQuota: 0 }), replica(1, { memMB: 0, cpuQuota: 0, metricsAvailable: false })] },
+  }));
+  assert.equal(resources.memory.scale, 'none');
+  assert.deepEqual(resources.memory.gaps.map((gap) => gap.reason), ['metrics']);
+});
+
 test('capacity-blocked update does not mark a healthy app as needing attention', () => {
   const model = buildOverviewModel([
     { slug: 'a', status: 'running', deploy_count: 1, last_deployment_status: 'blocked' },
@@ -50,7 +89,7 @@ test('buildOverviewModel: healthy fleet is nominal with a one-line summary', () 
     b: { status: 'running', replicas: [replica(0)] },
   }));
   assert.equal(m.verdict.tone, 'nominal');
-  assert.equal(m.verdict.headline, 'All systems nominal');
+  assert.equal(m.verdict.headline, 'App health is stable');
   assert.equal(m.counts.healthy, 2);
   assert.equal(m.counts.sleeping, 1);
   assert.match(m.verdict.detail, /3 apps/);
@@ -127,10 +166,9 @@ test('buildOverviewModel: stale state preserves last good values and timestamp',
   assert.equal(m.verdict.headline, 'Resource data is stale');
 });
 
-// A fleet with no limits set anywhere is fully measurable as usage, so it is
-// reported as usage rather than as a fleet whose pressure cannot be determined.
-// The coverage counts still record why there is no allocation to measure.
-test('buildOverviewModel: a fleet with no enforced limits reports usage, not partial coverage', () => {
+// Failed enforcement must remain actionable even when no limit is enforced.
+// Usage is independently measurable and retains its own complete status.
+test('buildOverviewModel: unenforced limits retain coverage guidance alongside measured usage', () => {
   const apps = [
     { slug: 'unlimited', name: 'Unlimited', status: 'running' },
     { slug: 'unenforced', name: 'Unenforced', status: 'running' },
@@ -141,7 +179,9 @@ test('buildOverviewModel: a fleet with no enforced limits reports usage, not par
   }));
   assert.equal(m.resources.scale, 'none');
   assert.equal(m.resources.memory.scale, 'none');
-  assert.equal(m.resources.state, 'ready');
+  assert.equal(m.resources.state, 'partial');
+  assert.equal(m.resources.memory.usage.state, 'ready');
+  assert.deepEqual(m.resources.memory.gaps.map((gap) => gap.reason), ['unenforced']);
   assert.equal(m.resources.memory.coverage.unlimitedReplicas, 1);
   assert.equal(m.resources.memory.coverage.unenforcedReplicas, 1);
   assert.equal(m.resources.memory.capacity, 0);
@@ -149,7 +189,7 @@ test('buildOverviewModel: a fleet with no enforced limits reports usage, not par
   assert.equal(m.resources.memory.used, 400 * MIB);
   assert.equal(m.resources.memory.fraction, null);
   assert.equal(m.resources.memory.severity, 'normal');
-  assert.equal(m.verdict.headline, 'All systems nominal');
+  assert.equal(m.verdict.headline, 'Resource coverage is partial');
   assert.equal(m.resources.topConsumers.kind, 'memory');
   assert.deepEqual(m.resources.topConsumers.items.map((i) => i.slug), ['unlimited', 'unenforced']);
   assert.equal(m.resources.topConsumers.items[0].fraction, 0.75);
@@ -173,7 +213,7 @@ test('buildOverviewModel: host capacity supplies the denominator when no app car
   // named as the peak.
   assert.equal(m.resources.memory.peakFraction, null);
   assert.equal(m.resources.state, 'ready');
-  assert.equal(m.verdict.headline, 'All systems nominal');
+  assert.equal(m.verdict.headline, 'App health is stable');
 });
 
 test('buildOverviewModel: host scale still raises a verdict when the box is nearly full', () => {
@@ -184,8 +224,8 @@ test('buildOverviewModel: host scale still raises a verdict when the box is near
   });
   assert.equal(m.resources.memory.severity, 'critical');
   assert.equal(m.verdict.tone, 'critical');
-  assert.equal(m.verdict.headline, 'Host capacity is nearly exhausted');
-  assert.match(m.verdict.detail, /Memory is at 96% of host capacity across 1 running replica\./);
+  assert.equal(m.verdict.headline, 'App usage is nearing available capacity');
+  assert.match(m.verdict.detail, /Reported app memory is at 96% of available capacity/);
 });
 
 test('buildOverviewModel: a host that reports cores but not memory scales only CPU', () => {
@@ -219,7 +259,7 @@ test('buildOverviewModel: one limited app keeps the whole panel on the limits sc
   assert.equal(m.resources.memory.capacity, 512 * MIB);
   assert.equal(m.resources.state, 'partial');
   assert.equal(m.verdict.headline, 'Resource coverage is partial');
-  assert.equal(m.verdict.detail, 'Some running replicas have unlimited or unenforced capacity.');
+  assert.equal(m.verdict.detail, 'Some running replicas have unset, unknown, or unenforced app limits.');
   assert.equal(m.resources.topConsumers, null);
 });
 
@@ -385,7 +425,7 @@ test('stale pressure is explicitly historical even when its last reading was cri
   assert.equal(model.resources.hotspots.length, 1);
   metrics.metrics.a.replicas[0] = replica(0, { cpu: 390, cpuQuota: 0, memMB: 0 });
   metrics.host = { cores: 4, memory_mb: 8192 };
-  assert.match(buildOverviewModel(apps, metrics).verdict.detail, /Last reported: CPU was at 98%/);
+  assert.match(buildOverviewModel(apps, metrics).verdict.detail, /Last reported: Reported app CPU was at 98%/);
 });
 
 test('known enforced limits keep their scale when only unlimited replicas report', () => {

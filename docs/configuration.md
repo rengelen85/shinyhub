@@ -586,10 +586,16 @@ application log run pruning above.
 
 ## Host capacity
 
-The Overview measures fleet CPU and memory against each application's enforced
-per-replica limits. When no application carries one - the common case on a
-single-purpose host - it measures against the box itself instead, so the panel
-reports what the server is actually using rather than declining to answer.
+The Overview shows measured app usage alongside host capacity for CPU and
+memory. Usage includes all reporting replicas in the selected scope, including
+replicas without enforced app limits. It excludes other processes on the host;
+it is not a whole-machine utilization reading. Memory is summed RSS and can
+count shared pages more than once.
+
+App-limit checks are shown separately, with per-replica pressure alerts and
+coverage. Missing measurements, optional unset limits, unknown limit status,
+and unenforced limits have distinct recovery guidance. The host capacity remains
+visible even when app limits are smaller, or when no apps are running.
 
 The size of the box is detected at startup and needs no configuration. Override
 it only when the detected number is wrong for your deployment:
@@ -628,8 +634,9 @@ log warns when memory specifically could not be read.
 
 Two cases are worth an explicit override. Under `runtime.mode: docker` the
 detected figures describe the shared box, not any one worker's container; those
-applications normally carry enforced limits and are measured against those
-instead. And on a host ShinyHub shares with other services, the detected total
+applications normally carry enforced limits, which appear separately in
+app-limit checks. The detected host capacity does not represent remote worker
+capacity. And on a host ShinyHub shares with other services, the detected total
 is the whole machine, so set these keys to the share you intend ShinyHub to
 have if you want the panel scaled to that.
 

@@ -133,7 +133,7 @@ test('fleet metrics requests do not encode every app slug into the URL', async (
     throw new Error(`unexpected request: ${path}`);
   }));
 
-  await eventually(() => document.getElementById('overview-body').textContent.includes('App allocation pressure'));
+  await eventually(() => document.getElementById('overview-body').textContent.includes('App resource usage'));
   assert.deepEqual(calls, ['/api/apps', '/api/apps/metrics', '/api/apps/metrics/history']);
   assert.equal(calls.some((path) => path.includes('?slugs=')), false);
 });
@@ -165,7 +165,7 @@ test('activity loads independently and never holds the health-first Overview ske
   ctx.state.canReadAudit = true;
   mounted = mountOverview(ctx);
 
-  await eventually(() => document.getElementById('overview-body').textContent.includes('App allocation pressure'));
+  await eventually(() => document.getElementById('overview-body').textContent.includes('App resource usage'));
   assert.equal(document.querySelector('.ov-activity').getAttribute('aria-busy'), 'true');
   assert.match(document.getElementById('overview-body').textContent, /Recent changes/);
 
@@ -345,4 +345,23 @@ test('attention focus and pending restarts survive polling, with a stable fallba
   healthy = true; restart.resolve();
   await eventually(() => !document.querySelector('.ov-attention'));
   assert.equal(document.activeElement.id, 'ov-scope-select');
+});
+
+test('critical resource verdict leads to pressure alerts before secondary coverage gaps', async () => {
+  const apps = [{ slug: 'hot', status: 'running' }, { slug: 'free', status: 'running' }];
+  const sample = { index: 0, status: 'running', metrics_available: true, rss_bytes: 500 * 1024 * 1024, cpu_percent: 10, effective_memory_limit_mb: 512, effective_cpu_quota_percent: 100, memory_limit_enforced: true, cpu_quota_enforced: true, resource_enforcement_known: true };
+  mounted = mountOverview(context(async (path) => ({ ok: true, status: 200, json: async () => path === '/api/apps'
+    ? { items: apps } : path.endsWith('/history') ? { history: {} }
+      : { metrics: { hot: { replicas: [sample] }, free: { replicas: [{ ...sample, effective_memory_limit_mb: 0 }] } } },
+  })));
+  await eventually(() => document.querySelector('[data-focus-key="pressure:review"]'));
+  const actions = [...document.querySelectorAll('.ov-pulse-actions button')];
+  assert.equal(actions[0].textContent, 'Review pressure alerts');
+  assert.equal(actions[1].textContent, 'Review resource coverage');
+  const target = document.getElementById('ov-pressure-title');
+  let scrolled = false;
+  target.scrollIntoView = () => { scrolled = true; };
+  actions[0].click();
+  assert.equal(document.activeElement, target);
+  assert.equal(scrolled, true);
 });

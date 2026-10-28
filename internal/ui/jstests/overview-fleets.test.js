@@ -79,7 +79,26 @@ test('fleet rendering identifies the share denominator and partial coverage with
   partial.metrics.b.replicas.push({ ...replica(100), index: 1, metrics_available: false });
   const incomplete = renderResourcePressure(buildOverviewWorkspace(apps, partial, {}, 'fleet:prod').model.resources);
   assert.match(incomplete.textContent, /Partial reporting/);
-  assert.match(incomplete.textContent, /2 of 3 running replicas reporting/);
+  assert.match(incomplete.textContent, /2 of 3 replicas reporting/);
+});
+
+test('fleet summary shows measured usage when only unlimited replicas report', async () => {
+  setup();
+  const mixed = structuredClone(metrics);
+  mixed.metrics.a.replicas.push({ ...replica(0), index: 1, metrics_available: false,
+    effective_memory_limit_mb: 512, memory_limit_enforced: true, resource_enforcement_known: true });
+  mounted = mountOverview({
+    state: { apps: [], user: {}, canReadAudit: false },
+    updateActiveNav() {}, syncSidebar() {}, onUnauthorized() {}, canManageApp() { return false; },
+    async api(path) {
+      const body = path === '/api/apps' ? { items: apps }
+        : path === '/api/apps/metrics' ? mixed : { history: {} };
+      return { ok: true, status: 200, json: async () => body };
+    },
+  });
+  await eventually(() => document.querySelector('.ov-fleet-row'));
+  const prod = document.querySelector('[data-focus-key="overview:fleet:prod"]').closest('.ov-fleet-row');
+  assert.match(prod.querySelectorAll('.ov-fleet-usage')[1].textContent, /400 MBMemory · Partial/);
 });
 
 test('changing scope updates the mounted view immediately, preserves focus and keeps sidebar apps global', async () => {
