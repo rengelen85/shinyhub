@@ -1448,6 +1448,7 @@ body[data-auth="out"] {
 }
 
 .app-card {
+  container-type: inline-size;
   display: flex;
   flex-direction: column;
   background: var(--surface-2);
@@ -1580,6 +1581,12 @@ body[data-auth="out"] {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+}
+
+/* Give names the card's width instead of squeezing them beside a long status. */
+@container (max-width: 360px) {
+  .app-header { grid-template-columns: minmax(0, 1fr); }
+  .app-header-badges { justify-content: flex-start; padding-left: calc(40px + 0.75rem); }
 }
 
 /* Status is information, not decoration. A dot-and-label reads consistently
@@ -4189,6 +4196,7 @@ fieldset.settings-block { min-width: 0; }
 .deploy-summary li {
   display: contents;
 }
+.deploy-summary li[hidden] { display: none; }
 
 .deploy-summary li span {
   color: var(--text);

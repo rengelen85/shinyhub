@@ -340,6 +340,7 @@
       <div class="toolbar">
         <div><h1 id="identity-heading">Identity</h1><p class="identity-page-intro">Manage people, their roles, and service accounts for automation.</p></div>
         <div class="toolbar-actions">
+          <button id="new-user-button" class="btn-primary" type="button" hidden>Invite person</button>
           <button id="users-refresh" class="toolbar-btn-quiet" type="button">Refresh</button>
         </div>
       </div>
@@ -369,7 +370,6 @@
           <p id="people-onboarding" class="identity-page-intro" hidden></p>
           <div class="people-joining-actions">
             <button id="people-signin-copy" type="button" hidden>Copy sign-in link</button>
-            <button id="new-user-button" type="button" hidden>Invite person</button>
           </div>
           <p id="people-onboarding-status" class="profile-hint" role="status"></p>
         </details>
@@ -1083,7 +1083,7 @@
                 <input id="grant-username" type="text" placeholder="username" autocomplete="off" aria-describedby="grant-error">
                 <button id="grant-btn" type="button" class="btn-primary">Grant</button>
               </div>
-              <p id="grant-error" class="error" hidden></p>
+              <p id="grant-error" class="error" role="alert" hidden></p>
             </div>
           </section>
 
@@ -1109,6 +1109,11 @@
       </div>
     </section>
 
+  </main>
+    </div>
+  </div>
+  <!-- Keep the log dialog outside app-shell: modalTrap makes that background
+       inert, so a dialog nested inside it cannot receive clicks or focus. -->
   <!-- Log pane: hidden overlay that shows SSE log output for one app. Modal
        semantics match the other overlays (role=dialog, focus trap on open,
        closes on navigate/Escape/backdrop-adjacent close button). The stream
@@ -1122,9 +1127,6 @@
     </div>
     <p id="log-pane-status" class="log-pane-status" role="status" hidden></p>
     <pre id="log-pane-body" class="log-pane-body"></pre>
-  </div>
-  </main>
-    </div>
   </div>
   <!-- New-app modal: create-only; hand-off to CLI for the first deploy -->
   <div id="new-app-modal" class="modal-overlay" hidden
@@ -1238,10 +1240,11 @@
           <ul id="deploy-result-list" class="deploy-result-list" aria-label="Manifest changes applied"></ul>
         </div>
 
-        <p id="deploy-error" class="error" hidden></p>
+        <p id="deploy-error" class="error" role="alert" hidden></p>
 
         <div class="modal-actions">
           <button type="button" id="deploy-cancel">Cancel</button>
+          <button type="button" id="deploy-error-logs" hidden>View app logs</button>
           <button type="button" id="deploy-submit" class="btn-primary" disabled>Deploy</button>
         </div>
 
@@ -1407,7 +1410,7 @@
           </select>
           <p class="profile-hint">An expired token stops authenticating; create a new one to replace it.</p>
 
-          <p id="new-token-error" class="error" hidden></p>
+          <p id="new-token-error" class="error" role="alert" hidden></p>
 
           <div class="modal-actions">
             <button type="button" id="new-token-cancel">Cancel</button>

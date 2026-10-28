@@ -84,7 +84,7 @@ import { auditDetailEntries } from '/static/views/audit-detail.js';
 import { readAutoscaleForm, parseReplicaBound, renderAutoscaleSummary, summariseAutoscale } from '/static/views/autoscale.js';
 import { workerCapacityLine, keepWarmInertNote } from '/static/views/worker-isolation.js';
 import { parseRenderSeconds, renderPacingAdvice } from '/static/views/render-pacing.js';
-import { runInFlight } from '/static/views/in-flight.js';
+import { isInFlight, runInFlight } from '/static/views/in-flight.js';
 import { initTheme, getThemePreference, setThemePreference } from '/static/views/theme.js';
 import { backendLabel, metricsText, reasonLabel } from '/static/views/replica-display.js';
 import { formatStatus } from '/static/views/status-label.js';
@@ -215,8 +215,10 @@ document.addEventListener('DOMContentLoaded', () => {
   // login card) by the unit-tested views/branding.js.
   applyBranding(document, window.__SHINYHUB_BRANDING__);
 
+  let sessionVersion = 0;
   const state = {
     user: null,
+    sessionIdentity: {},
     apps: [],
     auditPage: 0,
     auditHasMore: false,
@@ -478,6 +480,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const deployResult       = document.getElementById('deploy-result');
   const deployResultList   = document.getElementById('deploy-result-list');
   const deployError        = document.getElementById('deploy-error');
+  const deployErrorLogs    = document.getElementById('deploy-error-logs');
   const deployCancel       = document.getElementById('deploy-cancel');
   const deploySubmit       = document.getElementById('deploy-submit');
   const deployCliSnippet   = document.getElementById('deploy-cli-snippet');
@@ -1056,6 +1059,11 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function showLoggedOut() {
+    sessionVersion += 1;
+    state.sessionIdentity = {};
+    closeNewTokenModal(true);
+    closeNewAppModal(true);
+    closeDeployModal();
     sessionController.stop();
     workersLoadVersion += 1;
     tokensLoadVersion += 1;
@@ -1146,6 +1154,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function showLoggedIn(payload) {
+    state.sessionIdentity = {};
     sessionController.start(payload);
     applySessionCapabilities(payload);
     setHidden(logoutButton, false);
@@ -3077,7 +3086,8 @@ document.addEventListener('DOMContentLoaded', () => {
     newTokenName.focus();
   }
 
-  function closeNewTokenModal() {
+  function closeNewTokenModal(force = false) {
+    if (force !== true && isInFlight(newTokenSubmit)) return;
     newTokenModal.hidden = true;
     modalTrap(newTokenModal).release();
     newTokenForm.reset();
@@ -3090,39 +3100,55 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function submitNewToken(event) {
     event.preventDefault();
+    if (newTokenForm.hidden || isInFlight(newTokenSubmit)) return;
     const name = newTokenName.value.trim();
     if (!name) { setError(newTokenError, 'A token name is required'); return; }
     await runInFlight(newTokenSubmit, async () => {
+      const version = sessionVersion;
       const payload = { name };
       const expiryDays = parseInt(document.getElementById('new-token-expiry').value, 10);
       if (Number.isFinite(expiryDays)) payload.expires_in_days = expiryDays;
-      let resp;
+      setError(newTokenError, '');
+      newTokenForm.setAttribute('aria-busy', 'true');
+      for (const control of newTokenForm.elements) control.disabled = true;
+      newTokenClose.disabled = true;
+      newTokenSubmit.textContent = 'Creating token…';
       try {
-        resp = await api('/api/tokens', { method: 'POST', body: JSON.stringify(payload) });
-      } catch {
-        setError(newTokenError, 'Network error');
-        return;
-      }
-      if (resp.status === 401) { await handleUnauthorized(); return; }
-      if (!resp.ok) {
-        let msg = 'Failed to create token';
-        if (resp.status === 409) {
-          msg = 'You already have a token with that name';
-        } else {
-          try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch {}
+        let resp;
+        try {
+          resp = await api('/api/tokens', { method: 'POST', body: JSON.stringify(payload) });
+        } catch {
+          if (version === sessionVersion) setError(newTokenError, 'Could not create the token. Check your connection and try again.');
+          return;
         }
-        setError(newTokenError, msg);
-        return;
+        if (version !== sessionVersion) return;
+        if (resp.status === 401) { await handleUnauthorized(); return; }
+        if (!resp.ok) {
+          let msg = 'Failed to create token';
+          if (resp.status === 409) {
+            msg = 'You already have a token with that name';
+          } else {
+            try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch {}
+          }
+          setError(newTokenError, msg);
+          return;
+        }
+        let body = {};
+        try { body = await resp.json(); } catch {}
+        if (version !== sessionVersion) return;
+        // Reveal the raw token ONCE: swap the form for the reveal panel. The value is
+        // never re-fetchable (only the hash is stored server-side).
+        newTokenForm.hidden = true;
+        tokenRevealValue.textContent = body.token || '';
+        tokenReveal.hidden = false;
+        if (tokenRevealDone) tokenRevealDone.focus();
+        loadTokens(); // refresh the list behind the modal
+      } finally {
+        newTokenForm.removeAttribute('aria-busy');
+        for (const control of newTokenForm.elements) control.disabled = false;
+        newTokenClose.disabled = false;
+        newTokenSubmit.textContent = 'Create token';
       }
-      let body = {};
-      try { body = await resp.json(); } catch {}
-      // Reveal the raw token ONCE: swap the form for the reveal panel. The value is
-      // never re-fetchable (only the hash is stored server-side).
-      newTokenForm.hidden = true;
-      tokenRevealValue.textContent = body.token || '';
-      tokenReveal.hidden = false;
-      if (tokenRevealDone) tokenRevealDone.focus();
-      loadTokens(); // refresh the list behind the modal
     });
   }
 
@@ -4955,13 +4981,22 @@ document.addEventListener('DOMContentLoaded', () => {
       revokeBtn.addEventListener('click', () => runInFlight(revokeBtn, async () => {
         const slug = settingsSlug;
         if (!slug) return;
+        const error = document.getElementById('grant-error');
+        setError(error, '');
         try {
           const r = await api(`/api/apps/${slug}/members`, {
             method: 'DELETE',
             body: JSON.stringify({ user_id: m.user_id }),
           });
-          if (r.ok) li.remove();
-        } catch { /* network error, leave row in place */ }
+          if (slug !== settingsSlug) return;
+          if (r.status === 401) { await handleUnauthorized(); return; }
+          if (!r.ok) throw new Error('request failed');
+          li.remove();
+          flashToast(`Revoked access for ${m.username}`, 'success');
+          document.getElementById('grant-username').focus();
+        } catch {
+          if (slug === settingsSlug) setError(error, `Could not revoke access for ${m.username}. Refresh this page to check their access, then try again.`);
+        }
       }));
       li.appendChild(nameSpan);
       li.appendChild(roleSelect);
@@ -5025,6 +5060,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!slug) return;
     const newRole = selectEl.value;
     const previous = selectEl.dataset.previous || '';
+    const error = document.getElementById('grant-error');
+    setError(error, '');
     selectEl.disabled = true;
     let resp;
     try {
@@ -5035,15 +5072,19 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch {
       selectEl.disabled = false;
       if (previous) selectEl.value = previous;
+      if (slug === settingsSlug) setError(error, `Could not update the role for ${username}. Check your connection and try again.`);
       return;
     }
     selectEl.disabled = false;
+    if (slug !== settingsSlug) return;
     if (resp.status === 401) { await handleUnauthorized(); return; }
     if (!resp.ok) {
       if (previous) selectEl.value = previous; // revert to last-known role
+      setError(error, `Could not update the role for ${username}. Refresh this page to check their role, then try again.`);
       return;
     }
     selectEl.dataset.previous = newRole;
+    flashToast(`Updated ${username} to ${newRole}`, 'success');
   }
 
   logPaneClose.addEventListener('click', closeLogs);
@@ -5505,6 +5546,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // Grant button.
   document.getElementById('grant-btn').addEventListener('click', async () => {
     const grantBtn = document.getElementById('grant-btn');
+    if (grantBtn.disabled || !settingsSlug) return;
+    const slug = settingsSlug;
     const username = document.getElementById('grant-username').value.trim();
     const errEl = document.getElementById('grant-error');
     errEl.hidden = true;
@@ -5516,10 +5559,12 @@ document.addEventListener('DOMContentLoaded', () => {
       // Grant by username: the server resolves it to a user id under the same
       // manage-app authorization, so the UI never needs a separate user-lookup
       // (which would require broader privilege than managing this app).
-      const grantResp = await api(`/api/apps/${settingsSlug}/members`, {
+      const grantResp = await api(`/api/apps/${slug}/members`, {
         method: 'POST',
         body: JSON.stringify({ username }),
       });
+      if (slug !== settingsSlug) return;
+      if (grantResp.status === 401) { await handleUnauthorized(); return; }
       if (!grantResp.ok) {
         let grantMsg = grantResp.status === 404 ? 'User not found' : 'Grant failed';
         try {
@@ -5534,6 +5579,8 @@ document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('grant-username').value = '';
       await refreshMemberList();
       flashToast(`Granted ${username} as viewer`, 'success');
+    } catch {
+      if (slug === settingsSlug) setError(errEl, 'Could not grant access. Check your connection and try again.');
     } finally {
       grantBtn.disabled = false;
       grantBtn.textContent = 'Grant';
@@ -5645,7 +5692,8 @@ document.addEventListener('DOMContentLoaded', () => {
     newAppName.focus();
   }
 
-  function closeNewAppModal() {
+  function closeNewAppModal(force = false) {
+    if (force !== true && isInFlight(newAppSubmit)) return;
     newAppModal.hidden = true;
     modalTrap(newAppModal).release();
     resetNewAppModal();
@@ -5665,6 +5713,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function submitNewApp(event) {
     event.preventDefault();
+    if (newAppForm.hidden || isInFlight(newAppSubmit)) return;
     setError(newAppError, '');
 
     const slug = newAppSlug.value.trim();
@@ -5682,56 +5731,60 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    newAppSubmit.disabled = true;
-    newAppSubmit.textContent = 'Creating…';
-
-    let resp;
-    try {
-      resp = await api('/api/apps', {
-        method: 'POST',
-        body: JSON.stringify({ slug, name, project_slug: projectSlug }),
-      });
-    } catch {
-      setError(newAppError, 'Network error');
-      newAppSubmit.disabled = false;
-      newAppSubmit.textContent = 'Create';
-      return;
-    }
-
-    if (resp.status === 401) { await handleUnauthorized(); return; }
-    if (resp.status === 409) {
-      setError(newAppError, 'Slug already taken. Pick another.');
-      newAppSubmit.disabled = false;
-      newAppSubmit.textContent = 'Create';
-      return;
-    }
-    if (resp.status === 403) {
-      setError(newAppError, 'You do not have permission to create apps.');
-      newAppSubmit.disabled = false;
-      newAppSubmit.textContent = 'Create';
-      return;
-    }
-    if (!resp.ok) {
-      let message = 'Failed to create app.';
+    await runInFlight(newAppSubmit, async () => {
+      const version = sessionVersion;
+      newAppForm.setAttribute('aria-busy', 'true');
+      for (const control of newAppForm.elements) control.disabled = true;
+      newAppClose.disabled = true;
+      newAppSubmit.textContent = 'Creating…';
       try {
-        const body = await resp.json();
-        if (body && body.error) message = body.error;
-      } catch { /* non-JSON response */ }
-      setError(newAppError, message);
-      newAppSubmit.disabled = false;
-      newAppSubmit.textContent = 'Create';
-      return;
-    }
+        let resp;
+        try {
+          resp = await api('/api/apps', {
+            method: 'POST',
+            body: JSON.stringify({ slug, name, project_slug: projectSlug }),
+          });
+        } catch {
+          if (version === sessionVersion) setError(newAppError, 'Could not create the app. Check your connection and try again.');
+          return;
+        }
+        if (version !== sessionVersion) return;
+        if (resp.status === 401) { await handleUnauthorized(); return; }
+        if (resp.status === 409) {
+          setError(newAppError, 'Slug already taken. Pick another.');
+          return;
+        }
+        if (resp.status === 403) {
+          setError(newAppError, 'You do not have permission to create apps.');
+          return;
+        }
+        if (!resp.ok) {
+          let message = 'Failed to create app.';
+          try {
+            const body = await resp.json();
+            if (body && body.error) message = body.error;
+          } catch { /* non-JSON response */ }
+          setError(newAppError, message);
+          return;
+        }
 
-    let createdApp = { slug, name };
-    try {
-      const body = await resp.json();
-      if (body && typeof body.slug === 'string' && body.slug) {
-        createdApp = body;
+        let createdApp = { slug, name };
+        try {
+          const body = await resp.json();
+          if (body && typeof body.slug === 'string' && body.slug) {
+            createdApp = body;
+          }
+        } catch { /* the submitted values are a complete fallback */ }
+        if (version !== sessionVersion) return;
+        await loadApps();
+        if (version === sessionVersion) showNewAppHandoff(createdApp);
+      } finally {
+        newAppForm.removeAttribute('aria-busy');
+        for (const control of newAppForm.elements) control.disabled = false;
+        newAppClose.disabled = false;
+        newAppSubmit.textContent = 'Create';
       }
-    } catch { /* the submitted values are a complete fallback */ }
-    showNewAppHandoff(createdApp);
-    await loadApps();
+    });
   }
 
   function formatBytes(n) {
@@ -5741,6 +5794,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function resetDeployModal() {
+    deployErrorLogs.hidden = true;
+    deployPick.disabled = deployFileInput.disabled = false;
     deploySummary.hidden = true;
     deployIgnoredRow.hidden = true;
     deployProgressWrap.hidden = true;
@@ -5786,6 +5841,23 @@ document.addEventListener('DOMContentLoaded', () => {
     modalTrap(deployModal).release();
   }
 
+  // Every selection owns its asynchronous preparation. A replaced file or a
+  // closed dialog must never restore an earlier bundle or enable its upload.
+  function beginDeploySelection() {
+    const selection = deployState;
+    const version = selection.selectionVersion = (selection.selectionVersion || 0) + 1;
+    selection.blob = null;
+    selection.completed = false;
+    deploySubmit.disabled = true;
+    deploySubmit.textContent = 'Deploy';
+    deploySummary.hidden = true;
+    deployProgressWrap.hidden = true;
+    deployResult.hidden = true;
+    deployErrorLogs.hidden = true;
+    setError(deployError, '');
+    return () => deployState === selection && selection.selectionVersion === version;
+  }
+
   function renderDeploySummary(sourceName, blobSize, fileCount, rejections, rules) {
     deploySourceName.textContent = sourceName;
     deployFileCount.textContent = fileCount == null ? '—' : String(fileCount);
@@ -5822,16 +5894,19 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function acceptZipFile(file) {
+    const current = beginDeploySelection();
     // Pre-built .zip — counting files would require parsing the central
     // directory, so leave the file count unknown and render it as "—".
     let rules;
     try {
       rules = await loadBundleRules();
     } catch (err) {
+      if (!current()) return;
       console.error('loadBundleRules failed:', err);
       setError(deployError, 'Failed to load bundle rules from server.');
       return;
     }
+    if (!current()) return;
     deployState.blob = file;
     deployState.fileCount = null;
     deployState.rejections = new Map();
@@ -5848,9 +5923,11 @@ document.addEventListener('DOMContentLoaded', () => {
       deployFileInput.click();
     });
     deployFileInput.addEventListener('change', async () => {
+      if (!deployState || deployState.uploading) return;
       const file = deployFileInput.files && deployFileInput.files[0];
       if (!file) return;
       if (!file.name.toLowerCase().endsWith('.zip')) {
+        beginDeploySelection();
         setError(deployError, 'File picker only accepts .zip. Drop a folder to zip it in the browser.');
         return;
       }
@@ -5872,6 +5949,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function handleDrop(e) {
+    if (!deployState || deployState.uploading) return;
+    beginDeploySelection();
     const items = [...(e.dataTransfer?.items || [])];
     if (items.length === 0) {
       setError(deployError, 'Nothing to upload.');
@@ -6003,8 +6082,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function zipFolderEntry(rootEntry) {
-    setError(deployError, '');
-    deploySubmit.disabled = true;
+    const current = beginDeploySelection();
     deploySourceName.textContent = rootEntry.name + '/';
     deployFileCount.textContent = 'Reading…';
     deployBundleSize.textContent = '—';
@@ -6014,20 +6092,24 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       rules = await loadBundleRules();
     } catch (err) {
+      if (!current()) return;
       console.error('loadBundleRules failed:', err);
       setError(deployError, 'Failed to load bundle rules from server.');
       return;
     }
+    if (!current()) return;
 
     const rejections = new Map();
     const fileList = [];
     try {
       for await (const item of walkFolder(rootEntry, rules, rejections)) fileList.push(item);
     } catch (err) {
+      if (!current()) return;
       console.error('walkFolder failed:', err);
       setError(deployError, 'Failed to read folder contents.');
       return;
     }
+    if (!current()) return;
 
     if (fileList.length === 0) {
       setError(deployError, 'Folder is empty after filtering excluded paths.');
@@ -6047,11 +6129,12 @@ document.addEventListener('DOMContentLoaded', () => {
         ? await buildZipNative(fileList)
         : await buildZipJSZip(fileList);
     } catch (err) {
+      if (!current()) return;
       console.error('zip build failed:', err);
       setError(deployError, 'Failed to build zip archive.');
       return;
     }
-
+    if (!current()) return;
     deployState.blob = blob;
     deployState.fileCount = fileList.length;
     deployState.rejections = rejections;
@@ -6107,7 +6190,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   deploySubmit.addEventListener('click', async () => {
-    if (!deployState || !deployState.blob) return;
+    if (!deployState || !deployState.blob || deployState.uploading) return;
 
     // Re-entry: after a successful deploy this button becomes "View logs".
     if (deployState.completed) {
@@ -6119,29 +6202,42 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setError(deployError, '');
     deploySubmit.disabled = true;
+    deployErrorLogs.hidden = true;
     deployCancel.textContent = 'Close';
     deployProgressWrap.hidden = false;
     deployProgressBar.value = 0;
     deployProgressText.textContent = '0%';
 
     const { slug, blob } = deployState;
+    const upload = deployState;
+    const selectionVersion = upload.selectionVersion;
+    upload.uploading = true;
+    deployPick.disabled = deployFileInput.disabled = true;
 
     let body;
     try {
       body = await uploadBundle(slug, blob);
     } catch (err) {
+      if (deployState !== upload) return;
       if (err.code === 'UPLOAD_CANCELLED') {
         return; // closeDeployModal resets state
       }
       if (err.status === 401) { await handleUnauthorized(); return; }
       setError(deployError, err.message || 'Deploy failed');
+      deployErrorLogs.hidden = false;
       deploySubmit.disabled = false;
       deployCancel.textContent = 'Cancel';
       return;
+    } finally {
+      if (deployState === upload) {
+        upload.uploading = false;
+        deployPick.disabled = deployFileInput.disabled = false;
+      }
     }
-
+    if (deployState !== upload) return;
     deployProgressText.textContent = 'Deployed';
     await loadApps();
+    if (deployState !== upload || upload.selectionVersion !== selectionVersion) return;
 
     // body.manifest is set when the bundle's shinyhub.toml applied [app]
     // settings or [[schedule]] blocks; show it inside the modal so the
@@ -6162,6 +6258,12 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   deployModalClose.addEventListener('click', closeDeployModal);
+  deployErrorLogs.addEventListener('click', () => {
+    if (!deployState) return;
+    const slug = deployState.slug;
+    closeDeployModal();
+    openLogs(slug);
+  });
   deployCancel.addEventListener('click', closeDeployModal);
   deployModal.addEventListener('click', (e) => {
     if (e.target === e.currentTarget) closeDeployModal();
