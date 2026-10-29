@@ -206,7 +206,10 @@ func runSchedules(ctx context.Context, w *workspace, slug string, userEnv []stri
 		}
 		fmt.Fprintf(stdout, "==> schedule %s: initialized successfully\n", schedule.Name)
 	}
-	if !sel.explicit() && len(selected) > 0 {
+	// Both startup seeding and an explicit batch must leave every selected
+	// producer's output in the current data generation. A later producer can
+	// replace the whole directory even though each command exits successfully.
+	if sel.name == "" && len(selected) > 0 {
 		generation, err := dataGeneration(w.DataDir)
 		if err != nil {
 			return err
@@ -214,7 +217,11 @@ func runSchedules(ctx context.Context, w *workspace, slug string, userEnv []stri
 		for _, schedule := range selected {
 			key, _ := seedIdentity(slug, schedule)
 			if state.Records[key].Generation != generation {
-				return validationErrorf("schedule %q initialization was invalidated by a later producer replacing app data; keep producer writes scoped to their own output directories and rerun --seed=missing", schedule.Name)
+				retry := "--seed=missing"
+				if sel.all {
+					retry = "--all-schedules"
+				}
+				return validationErrorf("schedule %q initialization was invalidated by a later producer replacing app data; keep producer writes scoped to their own output directories and rerun %s", schedule.Name, retry)
 			}
 		}
 	}

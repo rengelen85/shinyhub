@@ -154,6 +154,64 @@ func TestScheduleLocalAllSchedulesFleetPreflightsEveryApp(t *testing.T) {
 	}
 }
 
+func TestScheduleLocalAllSchedulesRejectsInvalidatedData(t *testing.T) {
+	dir := t.TempDir()
+	body := `[app]
+command = ["sh", "-c", "exit 99"]
+[[schedule]]
+name = "latest"
+cron = "*/5 * * * *"
+cmd = "sh -c 'echo latest > $SHINYHUB_APP_DATA/latest'"
+[[schedule]]
+name = "history"
+cron = "0 3 * * *"
+cmd = "sh history.sh"
+`
+	if err := os.WriteFile(filepath.Join(dir, "shinyhub.toml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	producer := filepath.Join(dir, "history.sh")
+	script := `rm -rf "$SHINYHUB_APP_DATA"
+mkdir -p "$SHINYHUB_APP_DATA"
+echo history > "$SHINYHUB_APP_DATA/history"
+`
+	if err := os.WriteFile(producer, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state := t.TempDir()
+	args := []string{"schedule", "run", "--local", "--all-schedules", dir, "--no-sync", "--state-dir", state}
+	out, err := execCLI(t, args...)
+	var exit *ExitCodeError
+	if !errors.As(err, &exit) || exit.Code != 1 || exit.Kind != KindValidation {
+		t.Fatalf("expected validation failure, got %v\n%s", err, out)
+	}
+	for _, want := range []string{`schedule "latest"`, "invalidated", "--all-schedules"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("missing %q in error: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "--seed") {
+		t.Fatalf("batch failure suggested startup seeding: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "data", "latest")); !os.IsNotExist(err) {
+		t.Fatalf("expected the earlier output to be erased: %v", err)
+	}
+	// Fix the producer to preserve the other job's output, then verify a new
+	// explicit batch repairs the data despite the previous success records.
+	if err := os.WriteFile(producer, []byte("echo history > \"$SHINYHUB_APP_DATA/history\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := execCLI(t, args...); err != nil {
+		t.Fatalf("repaired batch failed: %v\n%s", err, out)
+	}
+	for _, name := range []string{"latest", "history"} {
+		got, err := os.ReadFile(filepath.Join(state, "data", name))
+		if err != nil || string(got) != name+"\n" {
+			t.Fatalf("%s output=%q error=%v", name, got, err)
+		}
+	}
+}
+
 func TestScheduleRunRejectsMixedModes(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "demo", "fetch", "--env", "X=y"},

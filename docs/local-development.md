@@ -231,6 +231,11 @@ Disabled schedules are skipped with a note, the first failing job stops the
 run with its exit code, and an app with no enabled schedules is a validation
 error. Cron timing and server-side replica activation are not applied locally.
 
+Keep each job's writes scoped to its own output directory. If a later job
+replaces the app data directory and invalidates an earlier job's output,
+`--all-schedules` fails even when every command exited successfully. Fix the
+producer commands, then rerun `--all-schedules` to refresh the complete batch.
+
 To run enabled schedules whose `deploy_trigger` is `first_deploy` or
 `bundle_change` before starting the app, opt in on each invocation:
 
