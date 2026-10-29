@@ -572,6 +572,37 @@ func convergeAppFromSpec(cfg *cliConfig, d fleet.AppDiff, entry fleet.AppEntry, 
 		return res
 	}
 	finish := func(status applyStatus, attempts int) applyResult {
+		var declaredSchedules map[string]bool
+		if opt.verifySchedules || opt.refreshStale {
+			var err error
+			declaredSchedules, err = fleetDeclaredSchedules(spec)
+			if err != nil {
+				res.failureKind = failureScheduleStateMissing
+				return fail(fmt.Errorf("verify schedule declarations: %w", err), attempts)
+			}
+			if declaredSchedules != nil && (opt.waitForWarm || opt.refreshStale) {
+				ctx := opt.context
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				if res.warmDeadline.IsZero() {
+					res.warmDeadline = time.Now().Add(warmTimeoutDuration(opt.warmTimeout))
+				}
+				ctx, cancel := context.WithDeadline(ctx, res.warmDeadline)
+				err := verifyScheduleDeclarationsContext(ctx, cfg, d.Slug, declaredSchedules, &res)
+				if errors.Is(err, context.DeadlineExceeded) {
+					res.failureKind = failureWarmWaitTimeout
+					if opt.refreshStale {
+						res.failureKind = failureScheduleRefreshTimeout
+					}
+					err = fmt.Errorf("verify schedule declarations within --warm-timeout %s: %w", warmTimeoutDuration(opt.warmTimeout), err)
+				}
+				cancel()
+				if err != nil {
+					return fail(err, attempts)
+				}
+			}
+		}
 		if opt.waitForWarm {
 			warmBudget := warmTimeoutDuration(opt.warmTimeout)
 			if res.warmDeadline.IsZero() {
@@ -600,14 +631,14 @@ func convergeAppFromSpec(cfg *cliConfig, d fleet.AppDiff, entry fleet.AppEntry, 
 			if opt.refreshStale {
 				ctx, cancel = context.WithDeadline(ctx, res.warmDeadline)
 			}
-			err := verifyEnabledScheduleFreshnessContext(ctx, cfg, d.Slug, &res)
+			err := verifyEnabledScheduleFreshnessAndDeclarationsContext(ctx, cfg, d.Slug, &res, declaredSchedules)
 			if err == nil && opt.refreshStale {
 				var waited bool
 				waited, err = waitForAppCompatibilityClearObserved(ctx, cfg, d.Slug, &res, out)
 				if err == nil && waited {
 					// A concurrent bundle or schedule edit can invalidate the
 					// freshness snapshot taken before the compatibility wait.
-					err = verifyEnabledScheduleFreshnessContext(ctx, cfg, d.Slug, &res)
+					err = verifyEnabledScheduleFreshnessAndDeclarationsContext(ctx, cfg, d.Slug, &res, declaredSchedules)
 				}
 				if err != nil {
 					var quarantine *appCompatibilityQuarantineError

@@ -720,10 +720,17 @@ func verifyEnabledScheduleFreshness(cfg *cliConfig, slug string, res *applyResul
 }
 
 func verifyEnabledScheduleFreshnessContext(ctx context.Context, cfg *cliConfig, slug string, res *applyResult) error {
+	return verifyEnabledScheduleFreshnessAndDeclarationsContext(ctx, cfg, slug, res, nil)
+}
+
+func verifyEnabledScheduleFreshnessAndDeclarationsContext(ctx context.Context, cfg *cliConfig, slug string, res *applyResult, declared map[string]bool) error {
 	schedules, err := listSchedulesContext(ctx, cfg, slug)
 	if err != nil {
 		res.failureKind = failureScheduleStateMissing
 		return fmt.Errorf("verify schedule freshness: %w", err)
+	}
+	if err := verifyScheduleDeclarations(schedules, declared, res); err != nil {
+		return err
 	}
 	var failures []string
 	producerMismatch := false

@@ -973,10 +973,10 @@ var schemaAnnotations = map[string]cmdAnnotation{
 	"fleet init": {Mutating: mut},
 	"fleet apply": {Mutating: mut, Cardinality: "bounded", OutputFields: []fieldSpec{
 		{Name: "recovery_reason", Type: "string", Desc: "recover-failed when matching content requires corrective deployment to repair an unresolved deployment compatibility barrier"},
-		{Name: "failure_kind", Type: "string", Desc: "stable failed-app classification: deploy kinds plus producer_in_progress, warm_wait_timeout, warm_state_unavailable, warm_deploy_run_failed, warm_bundle_not_ready, warm_restart_failed, schedule_stale, schedule_producer_mismatch, and schedule_state_unavailable"},
+		{Name: "failure_kind", Type: "string", Desc: "stable failed-app classification: deploy kinds plus producer_in_progress, warm_wait_timeout, warm_state_unavailable, warm_deploy_run_failed, warm_bundle_not_ready, warm_restart_failed, schedule_stale, schedule_producer_mismatch, schedule_manifest_mismatch, and schedule_state_unavailable"},
 		{Name: "attempt_details", Type: "array", Desc: "one entry per failed deploy attempt {attempt int, failure_kind string, error string}; present whenever any attempt failed, including a deploy that succeeded on retry"},
 		{Name: "warm_gate", Type: "array", Desc: "deploy-trigger policies not proven for the current bundle"},
-		{Name: "schedule_verification", Type: "array", Desc: "schedules rejected for enabled cron/convergence policy or unresolved producer-write uncertainty by --verify-schedules"},
+		{Name: "schedule_verification", Type: "array", Desc: "schedules rejected by --verify-schedules for enabled cron/convergence policy, unresolved producer-write uncertainty, or enabled schedules absent from a full app manifest (state: undeclared)"},
 		{Name: "schedule_logs", Type: "array", Desc: "relevant failing schedule runs and best-effort log tails"},
 		{Name: "warm_restarted", Type: "boolean", Desc: "True when --restart-after-warm cycled this app after bundle data convergence"},
 		{Name: "reason", Type: "string", Desc: "human-readable explanation for a skipped or self-healed result"},

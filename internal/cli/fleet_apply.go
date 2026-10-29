@@ -87,7 +87,7 @@ func newFleetApplyCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&f.warmTimeout, "warm-timeout", fleetWarmTimeout, "Maximum total time per app for bundle convergence and stale schedule refreshes")
 	cmd.Flags().BoolVar(&f.waitForWarm, "wait-for-warm", false, "Require deploy-triggered schedules to satisfy their policy for the current bundle")
 	cmd.Flags().BoolVar(&f.refreshStale, "refresh-stale", false, "Refresh stale enabled schedules and wait for success (implies --verify-schedules; uses --warm-timeout)")
-	cmd.Flags().BoolVar(&f.verifySchedules, "verify-schedules", false, "After applying, require schedule freshness/convergence and reject unresolved producer writes")
+	cmd.Flags().BoolVar(&f.verifySchedules, "verify-schedules", false, "After applying, reject enabled schedules absent from the app manifest and require schedule freshness/convergence without unresolved producer writes")
 	cmd.Flags().BoolVar(&f.verifyHealth, "verify-health", false, "Require every non-stopped app to be serving or parked (hibernated/suspended), including unchanged apps")
 	cmd.Flags().BoolVar(&f.restartAfterWarm, "restart-after-warm", false, "Wait for bundle data convergence, then restart serving replicas")
 	cmd.Flags().DurationVar(&f.waitForServer, "wait-for-server", 0, "Poll /api/server-info until the server is ready (e.g. 2m) before proceeding")

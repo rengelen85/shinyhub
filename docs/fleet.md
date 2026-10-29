@@ -536,7 +536,7 @@ inputs as well as the app source.
 | `--retries N` | Retry attempts *after* the first for deploys and transient config PATCH failures. Default 1 (so two attempts total). |
 | `--wait-for-warm` | Ask the server to reconcile every persisted enabled deploy-triggered schedule, including on unchanged apps; wait for each exact durable obligation and require the authoritative producer state to match the current digest and command. |
 | `--warm-timeout DURATION` | Per-app deadline shared by deploy-run waits, bundle-convergence checks, running-producer compatibility waits, and stale-schedule recovery. Default 15 minutes. |
-| `--verify-schedules` | Read-only: require cron freshness and authoritative producer convergence for every enabled schedule, and reject unresolved producer-write uncertainty even if its schedule was later disabled; never dispatches work. |
+| `--verify-schedules` | Read-only: reject enabled server schedules absent from the app's full `shinyhub.toml`, require cron freshness and authoritative producer convergence for every enabled schedule, and reject unresolved producer-write uncertainty even if its schedule was later disabled; never dispatches work. |
 | `--refresh-stale` | Refresh persisted enabled schedules whose cron freshness is overdue, including on unchanged apps, then verify schedules. Joins an existing run or starts one when still stale. Requires server support; implies `--verify-schedules`. |
 | `--verify-health` | Require every app, unchanged as well as changed, to be in a state it serves from without operator action: `running`, `idle`, or parked (`hibernated` after its idle timeout, `suspended`). A parked app wakes on its first request and passes in one poll; the gate never wakes it, so a broken bundle in a hibernated app surfaces on wake, not here. Intentionally stopped apps remain excluded. The post-deploy wait for changed apps is stricter and still requires a serving replica. |
 | `--restart-after-warm` | After convergence repairs an already-running or unchanged app, cycle replicas so startup-loaded caches see the new data. Pre-start deploy/rollback producers already run before replica boot and do not cause a redundant cycle. Deliberately stopped apps stay stopped. |
@@ -544,6 +544,23 @@ inputs as well as the app source.
 | `--json` | Emit the machine-readable result envelope. |
 | `-q/--quiet` | Collapse to the summary plus result line. |
 | `--provenance auto\|none` | Detect CI attribution (default) or intentionally omit it. |
+
+Schedule verification checks unchanged apps too. When an app has a full manifest,
+removing or renaming a `[[schedule]]` declaration makes any old enabled server
+schedule fail verification with `schedule_manifest_mismatch` and an `undeclared`
+entry in the JSON `schedule_verification` array. This includes removing every
+schedule from the manifest. Declare intentional manual schedules in the manifest,
+or disable/remove obsolete schedules with `shinyhub schedule disable <slug> <name>`
+or `shinyhub schedule rm <slug> <name>`. Verification does not delete schedules;
+`--prune` still only removes apps. Disabled extras are allowed, but unresolved
+producer writes still fail verification.
+
+Apps without an uploaded manifest, with an ignored manifest, or with only a sparse
+environment manifest retain their existing manual-schedule behavior. When combined
+with `--wait-for-warm` or `--refresh-stale`, verification checks for undeclared
+enabled schedules before those CLI actions can trigger them, and again afterward.
+This is a post-deployment check: server deployment actions and scheduled runs may
+already have occurred, and a failed check does not roll back the deployment.
 
 With `--wait-for-warm`, a compatibility quarantine caused only by running data
 producers waits within the same `--warm-timeout`, including for unchanged apps.
