@@ -85,9 +85,79 @@ cmd = "sh -c 'exit 7'"
 	}
 }
 
+func TestScheduleLocalAllSchedulesRunsEverySchedule(t *testing.T) {
+	_, requests, _ := setupCLITest(t)
+	dir := t.TempDir()
+	body := `[app]
+command = ["sh", "-c", "exit 99"]
+[[schedule]]
+name = "latest"
+cron = "*/5 * * * *"
+cmd = "sh -c 'echo latest >> $SHINYHUB_APP_DATA/ran'"
+[[schedule]]
+name = "history"
+cron = "0 3 * * *"
+cmd = "sh -c 'echo history >> $SHINYHUB_APP_DATA/ran'"
+`
+	if err := os.WriteFile(filepath.Join(dir, "shinyhub.toml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state := t.TempDir()
+	cmd := newScheduleCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"run", "--local", "--all-schedules", dir, "--no-sync", "--state-dir", state})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("%v\n%s", err, &out)
+	}
+	if len(*requests) != 0 {
+		t.Fatal("local schedule contacted server")
+	}
+	got, err := os.ReadFile(filepath.Join(state, "data", "ran"))
+	if err != nil || string(got) != "latest\nhistory\n" {
+		t.Fatalf("ran=%q error=%v\n%s", got, err, &out)
+	}
+}
+
+func TestScheduleLocalAllSchedulesFleetPreflightsEveryApp(t *testing.T) {
+	root := t.TempDir()
+	for slug, body := range map[string]string{
+		"a": "[[schedule]]\nname = \"fetch\"\ncron = \"0 * * * *\"\ncmd = \"sh -c 'touch $SHINYHUB_APP_DATA/ran'\"\n",
+		"b": "",
+	} {
+		app := filepath.Join(root, slug)
+		if err := os.Mkdir(app, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(app, "shinyhub.toml"), []byte("[app]\ncommand = [\"sh\", \"-c\", \"exit 99\"]\n"+body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fleet := "fleet_id = \"test\"\n[[app]]\nslug = \"a\"\nsource = \"./a\"\n[[app]]\nslug = \"b\"\nsource = \"./b\"\n"
+	if err := os.WriteFile(filepath.Join(root, "fleet.toml"), []byte(fleet), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(t.TempDir(), "state")
+	cmd := newScheduleCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"run", "--local", "--all-schedules", root, "--all", "--state-dir", state, "--no-sync"})
+	err := cmd.Execute()
+	var exit *ExitCodeError
+	if !errors.As(err, &exit) || exit.Kind != KindValidation || !strings.Contains(err.Error(), "b: no enabled schedules") {
+		t.Fatalf("error=%v\n%s", err, &out)
+	}
+	if _, err := os.Stat(state); !os.IsNotExist(err) {
+		t.Fatalf("invalid fleet started producing: %v", err)
+	}
+}
+
 func TestScheduleRunRejectsMixedModes(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "demo", "fetch", "--env", "X=y"},
+		{"run", "demo", "fetch", "--all-schedules"},
 		{"run", "--local", "fetch", "--follow"},
 		{"run", "--local", ""},
 	} {
