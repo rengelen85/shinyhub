@@ -59,8 +59,10 @@ For a stop-first deployment, deploy proceeds in this order:
    are recorded before any consumer can start.
 6. **Phase B - `[[schedule]]` blocks** reconcile atomically by name into the
    schedules table, and the exact declaration set is snapshotted with the
-   deployment for rollback. The scheduler is reloaded so new cron expressions
-   take effect immediately.
+   deployment for rollback. In the same transaction, schedules an earlier
+   manifest declared and this one omits are disabled (see
+   [Upsert semantics](#upsert-semantics)). The scheduler is reloaded so new
+   cron expressions take effect immediately.
 7. Producer state is revalidated under the publication fence. If a writer from
    a retiring server completed in the meantime, the candidate producer runs
    again. Only then are the new app processes started and proxy-registered.
@@ -68,8 +70,8 @@ For a stop-first deployment, deploy proceeds in this order:
    materialized.
 9. **Phase C - `[access]` group rules** reconcile into the per-app group
    access table as `source = manifest`, preserving any manually-managed
-   rules. Unlike schedules, this is declarative: a group removed from the
-   manifest loses its manifest rule on the next deploy.
+   rules. This is declarative: a group removed from the manifest loses its
+   manifest rule on the next deploy.
 
 Multiplex and grouped apps can hand off code and safe manifest changes without
 stopping the serving generation. Display metadata, resource limits, hibernation,
@@ -470,11 +472,30 @@ name **creates** the schedule (audit: `schedule_create`); subsequent
 deploys that include the same name **update** it in place, preserving its
 ID and audit trail (audit: `schedule_update`).
 
-Schedules **not** present in the manifest are left alone - removing a
-`[[schedule]]` block does NOT delete the schedule from the database. Use
-`shinyhub schedule delete` or the UI to remove a schedule. This avoids
-silently dropping schedules that were created interactively while the
-manifest was being authored.
+Every schedule records who owns it, shown as `source` in the schedules API:
+
+- `manifest`: a `shinyhub.toml` declared it. Declaring a schedule that was
+  created by hand adopts it.
+- `manual`: it was created with `shinyhub schedule add`, the dashboard, or
+  the API.
+
+When a deploy's manifest no longer declares a `manifest` schedule (the block
+was removed or renamed), the deploy **disables** it. It stops firing and no
+longer runs on deploy, and the deploy summary lists it as `disabled` (audit:
+`schedule_update` with `"enabled":false`). The row, its ID, and its run history
+are kept, so declaring the name again re-enables the same schedule. A failed
+deploy or a rollback to a deployment that declared it enables it again. A
+rename is therefore a disable of the old name plus a create of the new one.
+To delete a disabled schedule and its history, run
+`shinyhub schedule rm <slug> <name>`. `shinyhub fleet plan` lists the schedules
+a deploy would disable as warnings before anything changes.
+
+Deploys never disable `manual` schedules. A bundle without a `shinyhub.toml`, and
+a `sparse` manifest, declare nothing about schedules and disable nothing.
+
+Schedules created before schedule ownership existed are `manual` until a
+manifest declares them. A leftover from an earlier manifest that the current
+one no longer declares therefore needs one `shinyhub schedule rm`.
 
 ### Deploy-triggered runs
 

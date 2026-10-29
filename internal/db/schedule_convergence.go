@@ -121,10 +121,7 @@ func (s *Store) ReconcileDeployObligationsForDeployment(appID, deploymentID int6
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
-		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds,
-		       created_at, updated_at
+		SELECT `+scheduleColumns+`
 		FROM app_schedules WHERE app_id = ? ORDER BY id`, appID)
 	if err != nil {
 		return nil, fmt.Errorf("reconcile deploy obligations: list schedules: %w", err)

@@ -53,6 +53,15 @@ func TestFormatManifestSummary_FromServerShape(t *testing.T) {
 			want: []string{"Schedules: 1 created, 1 updated"},
 		},
 		{
+			name: "schedules removed from manifest are disabled",
+			body: `{"manifest":{"schedules":[{"name":"new","action":"created"},{"name":"refresh-data","action":"disabled"},{"name":"old","action":"disabled"}]}}`,
+			want: []string{
+				"Schedules: 1 created, 0 updated, 2 disabled",
+				"Note: disabled schedule(s) no longer declared in shinyhub.toml: refresh-data, old.\n" +
+					"      Run history is kept. Delete one with: shinyhub schedule rm <slug> <name>",
+			},
+		},
+		{
 			name: "both",
 			body: `{"manifest":{"app":{"replicas":3},"schedules":[{"name":"x","action":"created"}]}}`,
 			want: []string{

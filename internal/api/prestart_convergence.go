@@ -14,12 +14,16 @@ import (
 )
 
 type prestartSchedulePlan struct {
-	bundleDir                string
-	producers                []*db.Schedule
-	gateIDs                  []int64
-	placeholder              map[string]int64
-	candidates               map[string]*db.Schedule
-	previousDeclarations     []*db.Schedule
+	bundleDir            string
+	producers            []*db.Schedule
+	gateIDs              []int64
+	placeholder          map[string]int64
+	candidates           map[string]*db.Schedule
+	previousDeclarations []*db.Schedule
+	// undeclared are the enabled manifest-owned schedules this full manifest
+	// no longer declares. Their candidates are projected disabled, so they
+	// neither gate this deploy as producers nor survive a handoff enabled.
+	undeclared               []*db.Schedule
 	deploymentRepairRequired bool
 	repairBlocker            *db.DeploymentSummary
 	deploymentRepairComplete bool
@@ -83,12 +87,37 @@ func (s *Server) planPrestartSchedules(app *db.App, manifest *deploy.Manifest, d
 			byName[spec.Name] = candidate
 		}
 	}
+	plan.undeclared = undeclaredManifestSchedules(existing, manifest)
+	for _, schedule := range plan.undeclared {
+		byName[schedule.Name].Enabled = false
+	}
 	if err := s.populateUnsatisfiedProducers(plan, byName, digest); err != nil {
 		return nil, err
 	}
 	plan.candidates = byName
 	completed = true
 	return plan, nil
+}
+
+// undeclaredManifestSchedules returns the enabled manifest-owned schedules
+// that a full manifest no longer declares, ordered as existing is. A deploy
+// disables them. A missing or sparse manifest declares nothing about
+// schedules, so it prunes nothing.
+func undeclaredManifestSchedules(existing []*db.Schedule, manifest *deploy.Manifest) []*db.Schedule {
+	if manifest == nil || manifest.Sparse {
+		return nil
+	}
+	declared := make(map[string]bool, len(manifest.Schedules))
+	for _, spec := range manifest.Schedules {
+		declared[spec.Name] = true
+	}
+	var out []*db.Schedule
+	for _, schedule := range existing {
+		if schedule.Source == db.ScheduleSourceManifest && schedule.Enabled && !declared[schedule.Name] {
+			out = append(out, schedule)
+		}
+	}
+	return out
 }
 
 // planRollbackPrestartSchedules projects the rollback target's immutable
@@ -305,6 +334,7 @@ func projectedManifestSchedule(appID int64, base *db.Schedule, spec deploy.Sched
 	}
 	out.AppID = appID
 	out.Name = spec.Name
+	out.Source = db.ScheduleSourceManifest
 	out.CronExpr = spec.Cron
 	command, err := json.Marshal(spec.Command)
 	if err != nil {

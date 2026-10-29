@@ -53,6 +53,9 @@ type deployPreflightResponse struct {
 		Stage   string `json:"stage"`
 		Message string `json:"message"`
 	} `json:"problems"`
+	// DisabledSchedules is absent from servers that predate schedule
+	// ownership, which never disable a schedule on deploy.
+	DisabledSchedules []string `json:"disabled_schedules"`
 }
 
 // fleetBundleFacts is what the rehearsal knows about one resolved bundle: the
@@ -134,15 +137,19 @@ func ownershipOnlyAdopt(d fleet.AppDiff, preconditions bool) bool {
 // the deploy does; a stale lock is listed beside that problem rather than
 // ordered against it, since both must be fixed before the deploy succeeds.
 //
-// Returns the problems found. A question the server did not answer (transport
-// failure, refusal, undecodable reply) is returned as a typed error, never as
-// a problem, so the caller reports it with its own kind and exit code rather
-// than as a rejection the operator would go and fix in the manifest.
+// Returns the problems found, plus per-slug notices for accepted deploys with
+// a side effect the operator should see in the plan (a schedule the manifest
+// no longer declares being disabled). A question the server did not answer
+// (transport failure, refusal, undecodable reply) is returned as a typed
+// error, never as a problem, so the caller reports it with its own kind and
+// exit code rather than as a rejection the operator would go and fix in the
+// manifest.
 func fleetServerPreflight(cfg *cliConfig, caps serverCaps, m *fleet.Manifest, diff []fleet.AppDiff,
-	bundles map[string]fleetBundleFacts) ([]fleetServerPreflightProblem, error) {
+	bundles map[string]fleetBundleFacts) ([]fleetServerPreflightProblem, map[string][]string, error) {
 	if !caps.DeployPreflight && !caps.RuntimeCapabilities && !caps.StaleUVLockRefusal {
-		return nil, nil
+		return nil, nil, nil
 	}
+	notices := map[string][]string{}
 	entries := make(map[string]*fleet.AppEntry, len(m.Apps))
 	for i := range m.Apps {
 		entries[m.Apps[i].Slug] = &m.Apps[i]
@@ -164,19 +171,22 @@ func fleetServerPreflight(cfg *cliConfig, caps serverCaps, m *fleet.Manifest, di
 		case caps.DeployPreflight:
 			req, err := buildDeployPreflightRequest(facts, entry)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			reply, err := postDeployPreflight(cfg, d.Slug, req)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			for _, p := range reply.Problems {
 				problems = append(problems, fleetServerPreflightProblem{Slug: d.Slug, Stage: p.Stage, Message: p.Message})
 			}
+			for _, name := range reply.DisabledSchedules {
+				notices[d.Slug] = append(notices[d.Slug], disabledScheduleNotice(d.Slug, name))
+			}
 		case caps.RuntimeCapabilities:
 			fallback, err := runtimeTopologyFallback(cfg, d.Slug, facts.Manifest)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			problems = append(problems, fallback...)
 		}
@@ -184,7 +194,14 @@ func fleetServerPreflight(cfg *cliConfig, caps serverCaps, m *fleet.Manifest, di
 			problems = append(problems, fleetServerPreflightProblem{Slug: d.Slug, Stage: "deploy", Message: facts.StaleLock.Error()})
 		}
 	}
-	return problems, nil
+	return problems, notices, nil
+}
+
+// disabledScheduleNotice tells the operator that a deploy will disable a
+// schedule an earlier shinyhub.toml declared, and how to remove it for good.
+func disabledScheduleNotice(slug, schedule string) string {
+	return fmt.Sprintf("schedule %q is no longer declared in shinyhub.toml and will be disabled; `shinyhub schedule rm %s %s` deletes it and its run history",
+		schedule, slug, schedule)
 }
 
 // buildDeployPreflightRequest reads the bundle manifest from the resolved

@@ -72,6 +72,9 @@ type deployPreflightResponse struct {
 	Valid     bool                     `json:"valid"`
 	Isolation string                   `json:"isolation"`
 	Problems  []deployPreflightProblem `json:"problems"`
+	// DisabledSchedules names the enabled manifest-owned schedules the deploy
+	// would disable because the manifest no longer declares them.
+	DisabledSchedules []string `json:"disabled_schedules,omitempty"`
 }
 
 // rOnFargateDeployMsg is the 400 body for an R bundle placed on a Fargate
@@ -210,12 +213,22 @@ func (s *Server) deployPreflight(app *db.App, req deployPreflightRequest) (deplo
 	}
 	reply.Valid = len(reply.Problems) == 0
 	reply.Isolation = deploy.ResolveWorkerIsolation(projected.WorkerIsolation, s.cfg.Runtime.DefaultWorkerIsolation)
+	if app.ID != 0 && manifest != nil && !manifest.Sparse {
+		existing, err := s.store.ListSchedulesByApp(app.ID)
+		if err != nil {
+			return reply, err
+		}
+		for _, schedule := range undeclaredManifestSchedules(existing, manifest) {
+			reply.DisabledSchedules = append(reply.DisabledSchedules, schedule.Name)
+		}
+	}
 	return reply, nil
 }
 
 // targetHasRepairProducer mirrors the declaration overlay in
 // planPrestartSchedules without creating placeholder rows or scheduling work.
-// Schedules omitted by a manifest retain their stored declarations.
+// Manual schedules omitted by a manifest retain their stored declarations;
+// undeclared manifest-owned ones are disabled by the deploy.
 func (s *Server) targetHasRepairProducer(appID int64, manifest *deploy.Manifest) (bool, error) {
 	schedules, err := s.store.ListSchedulesByApp(appID)
 	if err != nil {
@@ -233,6 +246,9 @@ func (s *Server) targetHasRepairProducer(appID int64, manifest *deploy.Manifest)
 			}
 			byName[spec.Name] = candidate
 		}
+	}
+	for _, schedule := range undeclaredManifestSchedules(schedules, manifest) {
+		delete(byName, schedule.Name)
 	}
 	for _, schedule := range byName {
 		if schedule.Enabled && schedule.DeployTrigger != schedulespec.DeployTriggerNever {

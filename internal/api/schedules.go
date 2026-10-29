@@ -41,6 +41,9 @@ type scheduleDTO struct {
 	RollFallback           string   `json:"roll_fallback"`
 	MaxDeferAgeSeconds     int      `json:"max_defer_age_seconds"`
 	DeployTrigger          string   `json:"deploy_trigger"`
+	// Source is "manifest" when a bundle's shinyhub.toml declared the schedule
+	// (a later manifest that omits it disables it) and "manual" otherwise.
+	Source string `json:"source"`
 	// Timezone is the raw stored value; null/nil means "inherit server default".
 	Timezone *string `json:"timezone"`
 	// EffectiveTimezone is the resolved IANA zone name that will actually be
@@ -165,8 +168,8 @@ func toScheduleDTO(sc *db.Schedule, next *time.Time, serverDefaultLoc *time.Loca
 		ID: sc.ID, AppID: sc.AppID, Name: sc.Name, CronExpr: sc.CronExpr,
 		Command: cmd, Inputs: inputs, Enabled: sc.Enabled, TimeoutSeconds: sc.TimeoutSeconds,
 		OverlapPolicy: sc.OverlapPolicy, MissedPolicy: sc.MissedPolicy,
-		DeployTrigger: sc.DeployTrigger,
-		OnSuccess:     sc.OnSuccess, MinRollIntervalSeconds: sc.MinRollIntervalSeconds,
+		DeployTrigger: sc.DeployTrigger, Source: sc.Source,
+		OnSuccess: sc.OnSuccess, MinRollIntervalSeconds: sc.MinRollIntervalSeconds,
 		RollFallback: sc.RollFallback, MaxDeferAgeSeconds: sc.MaxDeferAgeSeconds,
 		Timezone:          sc.Timezone,
 		EffectiveTimezone: loc.String(),

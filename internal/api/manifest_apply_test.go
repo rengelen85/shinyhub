@@ -204,7 +204,7 @@ func TestApplyManifestSchedules_UpsertsAndReusesID(t *testing.T) {
 		Overlap:        "skip",
 		Missed:         "skip",
 	}}
-	results, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs)
+	results, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestApplyManifestSchedules_UpsertsAndReusesID(t *testing.T) {
 	}
 
 	specs[0].Cron = "0 1 * * *"
-	results, err = srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs)
+	results, err = srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestApplyManifestSchedules_AuditDetailIncludesEffectiveTimezone(t *testing.
 		Missed:         "skip",
 		Timezone:       tz,
 	}}
-	if _, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs); err != nil {
+	if _, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -304,7 +304,7 @@ func TestApplyManifestSchedules_AuditDetailEffectiveTimezoneInherited(t *testing
 		Overlap:        "skip",
 		Missed:         "skip",
 	}}
-	if _, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs); err != nil {
+	if _, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -353,7 +353,7 @@ func TestApplyManifestSchedules_LeavesOrphansAlone(t *testing.T) {
 		Overlap:        "skip",
 		Missed:         "skip",
 	}}
-	if _, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs); err != nil {
+	if _, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs, false); err != nil {
 		t.Fatal(err)
 	}
 	all, _ := store.ListSchedulesByApp(app.ID)
@@ -432,7 +432,7 @@ func TestApplyManifestSchedules_SchedulerNotStartedIsWarn(t *testing.T) {
 		Overlap:        "skip",
 		Missed:         "skip",
 	}}
-	if _, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs); err != nil {
+	if _, err := srv.applyManifestSchedules(r, app, manifestTestDeployment(app), specs, false); err != nil {
 		t.Errorf("scheduler-not-started must not fail apply: %v", err)
 	}
 

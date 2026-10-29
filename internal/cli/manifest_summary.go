@@ -31,6 +31,7 @@ func formatManifestSummary(raw any) []string {
 	lines = append(lines, formatManifestWarnings(raw)...)
 	if schedules, ok := m["schedules"].([]any); ok && len(schedules) > 0 {
 		created, updated := 0, 0
+		var disabled []string
 		for _, s := range schedules {
 			entry, ok := s.(map[string]any)
 			if !ok {
@@ -41,9 +42,21 @@ func formatManifestSummary(raw any) []string {
 				created++
 			case "updated":
 				updated++
+			case "disabled":
+				if name, _ := entry["name"].(string); name != "" {
+					disabled = append(disabled, name)
+				}
 			}
 		}
-		lines = append(lines, fmt.Sprintf("Schedules: %d created, %d updated", created, updated))
+		line := fmt.Sprintf("Schedules: %d created, %d updated", created, updated)
+		if len(disabled) > 0 {
+			line += fmt.Sprintf(", %d disabled", len(disabled))
+		}
+		lines = append(lines, line)
+		if len(disabled) > 0 {
+			lines = append(lines, fmt.Sprintf("Note: disabled schedule(s) no longer declared in shinyhub.toml: %s.\n"+
+				"      Run history is kept. Delete one with: shinyhub schedule rm <slug> <name>", strings.Join(disabled, ", ")))
+		}
 	}
 	return lines
 }

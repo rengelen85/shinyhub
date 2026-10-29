@@ -529,7 +529,7 @@ inputs as well as the app source.
 |---|---|
 | `--dry-run` | Identical to `fleet plan`; makes no changes. |
 | `--adopt` | Take ownership of in-scope apps that exist but are not yet fleet-managed. Without it, an un-owned app in scope is reported, not modified. |
-| `--prune` | Delete fleet-owned apps that are absent from the manifest. **This also removes their persistent data directory and all bundles.** |
+| `--prune` | Delete fleet-owned apps that are absent from the manifest. **This also removes their persistent data directory and all bundles.** Schedules need no flag: every deploy disables the schedules its `shinyhub.toml` no longer declares, and `fleet plan` lists them (see [manifest schedules](manifest.md#upsert-semantics)). |
 | `-y/--yes` | Skip the interactive destructive-action confirmation. `--prune` in a non-interactive shell requires `--yes`. |
 | `--environment NAME` | Select a declared environment for an unbound host; a conflicting bound host is rejected. Also available on `fleet plan`. |
 | `--capacity-wait DURATION` | Wait up to this duration per app for CPU pressure or draining predecessors to clear. Default `5m`; `0` disables waiting. Retries use the server retry delay independently of `--retries`. Permanent accounting shortages fail immediately. |

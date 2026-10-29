@@ -3121,7 +3121,10 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 	// satisfied now can be invalidated by a writer admitted on a retiring server;
 	// activation therefore revalidates after acquiring the cross-process
 	// publication fence and may need to republish before consumer startup.
-	needsPreactivationConfig := generationHandoff || prestartPlan.deploymentRepairRequired || len(prestartPlan.gateIDs) > 0 || (manifest != nil && len(manifest.Schedules) > 0)
+	// A full manifest that drops every schedule still has declarations to
+	// apply: disabling the manifest-owned schedules it no longer declares.
+	manifestSchedulesApply := manifest != nil && (len(manifest.Schedules) > 0 || len(prestartPlan.undeclared) > 0)
+	needsPreactivationConfig := generationHandoff || prestartPlan.deploymentRepairRequired || len(prestartPlan.gateIDs) > 0 || manifestSchedulesApply
 	if needsPreactivationConfig {
 		prepared := deployParams
 		prepared.PrepareOnly = true
@@ -3153,14 +3156,14 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 				prestartPlan.deploymentRepairComplete = true
 			}
 		}
-		if err == nil && !generationHandoff && manifest != nil && len(manifest.Schedules) > 0 {
+		if err == nil && !generationHandoff && manifestSchedulesApply {
 			if err == nil {
 				deployResponse.event(deployevent.Phase("configuration", deployevent.StatusStarted, "Applying manifest configuration"))
 				targetDeployment := &db.Deployment{
 					ID: pendingDep.ID, AppID: app.ID, Version: version, BundleDir: bundleDir,
 					Status: db.DeploymentPending, ContentDigest: digest,
 				}
-				manifestSummary.Schedules, err = s.applyManifestSchedules(r, app, targetDeployment, manifest.Schedules, prestartPlan.placeholder)
+				manifestSummary.Schedules, err = s.applyManifestSchedules(r, app, targetDeployment, manifest.Schedules, !manifest.Sparse, prestartPlan.placeholder)
 				if err != nil {
 					err = fmt.Errorf("manifest schedule apply: %w", err)
 				} else {
@@ -3572,6 +3575,10 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 		if manifest != nil && !manifest.App.IsZero() {
 			s.audit(r, "update_app", "app", slug, manifestAppDetail(manifest.App))
 		}
+		// Promotion published the staged declarations, in which the plan
+		// already projected undeclared manifest schedules disabled.
+		manifestSummary.Schedules = append(manifestSummary.Schedules,
+			s.recordUndeclaredSchedulesDisabled(r, app, prestartPlan.undeclared)...)
 		placeholdersCommitted = true
 		if schedules, reloadErr := s.store.ListSchedulesByApp(app.ID); reloadErr != nil {
 			deployWarning = "deployment is serving but schedule reload requires reconciliation: " + reloadErr.Error()

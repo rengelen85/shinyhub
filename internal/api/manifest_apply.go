@@ -140,7 +140,15 @@ func (s *Server) validateManifestActivationTopology(app *db.App, manifest *deplo
 		if err != nil {
 			return newValidationError("validate existing schedules: %v", err)
 		}
+		// Schedules this deploy disables impose no activation topology.
+		undeclared := map[string]bool{}
+		for _, schedule := range undeclaredManifestSchedules(existing, manifest) {
+			undeclared[schedule.Name] = true
+		}
 		for _, schedule := range existing {
+			if undeclared[schedule.Name] {
+				continue
+			}
 			policyOrder = append(policyOrder, schedule.Name)
 			policies[schedule.Name] = projectedPolicy{
 				name: schedule.Name, deployTrigger: schedule.DeployTrigger,
@@ -356,8 +364,10 @@ func (s *Server) applyManifestAppSettings(r *http.Request, app *db.App, m deploy
 // ManifestScheduleResult records the outcome of one [[schedule]] upsert so
 // callers can surface a per-schedule action in their response.
 type ManifestScheduleResult struct {
-	Name       string        `json:"name"`
-	Action     string        `json:"action"` // "created" or "updated"
+	Name string `json:"name"`
+	// Action is "created", "updated", or "disabled". A disabled schedule was
+	// declared by an earlier manifest and is absent from this one.
+	Action     string        `json:"action"`
 	ScheduleID int64         `json:"schedule_id,omitempty"`
 	DeployRun  *DeployRunRef `json:"deploy_run,omitempty"`
 }
@@ -376,9 +386,14 @@ type DeployRunRef struct {
 // scheduler.ErrNotStarted is logged but does not fail the apply: the
 // persisted row activates on the next Start.
 //
-// Returns one result entry per spec in input order. On error the slice
-// contains the results processed so far.
-func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment *db.Deployment, specs []deploy.ScheduleSpec, plannedCreates ...map[string]int64) ([]ManifestScheduleResult, error) {
+// With pruneUndeclared (a full, non-sparse manifest), every enabled
+// manifest-owned schedule the specs no longer declare is disabled in the same
+// transaction. Manual schedules are never touched.
+//
+// Returns one result entry per spec in input order, followed by one
+// "disabled" entry per pruned schedule. On error the slice contains the
+// results processed so far.
+func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment *db.Deployment, specs []deploy.ScheduleSpec, pruneUndeclared bool, plannedCreates ...map[string]int64) ([]ManifestScheduleResult, error) {
 	if deployment == nil || deployment.AppID != app.ID || deployment.ContentDigest == "" {
 		return nil, errors.New("manifest schedule apply requires the target deployment")
 	}
@@ -431,7 +446,7 @@ func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment
 		})
 		timezones = append(timezones, tzPtr)
 	}
-	upserts, err := s.store.UpsertSchedulesByName(params)
+	upserts, disabled, err := s.store.ApplyManifestScheduleDeclarations(app.ID, params, pruneUndeclared)
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +468,7 @@ func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment
 
 		results = append(results, ManifestScheduleResult{Name: spec.Name, Action: resultAction, ScheduleID: id})
 	}
+	results = append(results, s.recordUndeclaredSchedulesDisabled(r, app, disabled)...)
 	// Persistence is already atomic. Reload every committed row; if one reload
 	// fails the caller keeps the app stopped rather than exposing this new
 	// declaration set against the previous bundle.
@@ -461,7 +477,29 @@ func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment
 			return results, fmt.Errorf("scheduler reload (%s): %w", spec.Name, err)
 		}
 	}
+	for _, schedule := range disabled {
+		if err := s.reloadScheduler(schedule.ID, app.Slug, schedule.Name); err != nil {
+			return results, fmt.Errorf("scheduler reload (%s): %w", schedule.Name, err)
+		}
+	}
 	return results, nil
+}
+
+// manifestScheduleDisabled is the ManifestScheduleResult action for a schedule
+// a deploy disabled because its manifest no longer declares it.
+const manifestScheduleDisabled = "disabled"
+
+// recordUndeclaredSchedulesDisabled audits each schedule a manifest deploy
+// disabled because the manifest no longer declares it, and returns the
+// matching "disabled" results for the deploy summary.
+func (s *Server) recordUndeclaredSchedulesDisabled(r *http.Request, app *db.App, disabled []*db.Schedule) []ManifestScheduleResult {
+	results := make([]ManifestScheduleResult, 0, len(disabled))
+	for _, schedule := range disabled {
+		s.audit(r, "schedule_update", "schedule", fmt.Sprintf("%d", schedule.ID),
+			fmt.Sprintf(`{"app":%q,"name":%q,"enabled":false,"reason":"not declared in manifest"}`, app.Slug, schedule.Name))
+		results = append(results, ManifestScheduleResult{Name: schedule.Name, Action: manifestScheduleDisabled, ScheduleID: schedule.ID})
+	}
+	return results
 }
 
 // reloadScheduler re-registers a schedule with the cron engine after a create or

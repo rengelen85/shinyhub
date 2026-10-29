@@ -212,12 +212,29 @@ func TestFleetRecoveryPlanReasonAndOwnershipOnlyPreflight(t *testing.T) {
 	fake.preflightReply = `{"valid":false,"problems":[{"stage":"deploy","message":"repair-blocked-no-producer"}]}`
 	cfg := fake.httptest(t)
 	d.Action, d.RecoveryReason = fleet.ActionAdopt, ""
-	problems, err := fleetServerPreflight(cfg, serverCaps{FleetPreconditions: true, DeployPreflight: true}, m, []fleet.AppDiff{d}, map[string]fleetBundleFacts{"app": {Dir: t.TempDir(), AppType: "python"}})
+	problems, _, err := fleetServerPreflight(cfg, serverCaps{FleetPreconditions: true, DeployPreflight: true}, m, []fleet.AppDiff{d}, map[string]fleetBundleFacts{"app": {Dir: t.TempDir(), AppType: "python"}})
 	if err != nil || len(problems) != 0 || len(fake.preflights) != 0 {
 		t.Fatalf("ownership-only adoption rehearsed a nonexistent deploy: problems=%v err=%v", problems, err)
 	}
 	if !ownershipOnlyAdopt(d, true) {
 		t.Fatal("matching adoption no longer shares execution shortcut")
+	}
+}
+
+func TestFleetServerPreflightReportsDisabledSchedulesAsNotices(t *testing.T) {
+	m := &fleet.Manifest{FleetID: "eu", Apps: []fleet.AppEntry{{Slug: "app"}}}
+	d := fleet.AppDiff{Slug: "app", Action: fleet.ActionUpdateSource, LocalDigest: "sha256:new", ServerDigest: "sha256:old"}
+	fake := newFleetFake(true)
+	fake.deployPreflight = true
+	fake.preflightReply = `{"valid":true,"problems":[],"disabled_schedules":["refresh-data"]}`
+	cfg := fake.httptest(t)
+	problems, notices, err := fleetServerPreflight(cfg, serverCaps{FleetPreconditions: true, DeployPreflight: true}, m, []fleet.AppDiff{d}, map[string]fleetBundleFacts{"app": {Dir: t.TempDir(), AppType: "python"}})
+	if err != nil || len(problems) != 0 {
+		t.Fatalf("problems=%v err=%v, want an accepted deploy", problems, err)
+	}
+	if len(notices["app"]) != 1 || !strings.Contains(notices["app"][0], `schedule "refresh-data" is no longer declared in shinyhub.toml and will be disabled`) ||
+		!strings.Contains(notices["app"][0], "shinyhub schedule rm app refresh-data") {
+		t.Fatalf("notices = %v, want the refresh-data disable notice", notices)
 	}
 }
 

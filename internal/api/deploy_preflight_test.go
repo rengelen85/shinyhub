@@ -39,6 +39,7 @@ type deployPreflightReply struct {
 		Stage   string `json:"stage"`
 		Message string `json:"message"`
 	} `json:"problems"`
+	DisabledSchedules []string `json:"disabled_schedules"`
 }
 
 func postDeployPreflight(t *testing.T, srv *Server, token, slug string, body string) *httptest.ResponseRecorder {

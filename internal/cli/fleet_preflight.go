@@ -279,7 +279,7 @@ func fleetPreflight(file string, errOut io.Writer, cmdName string, waitFor time.
 	// with a data-producing schedule, replicas above the server ceiling) is
 	// reported here with the deploy's message, before plan prints a diff that
 	// apply could never complete and before apply converges any app.
-	serverProblems, sperr := fleetServerPreflight(cfg, caps, m, diff, bundleFacts)
+	serverProblems, serverNotices, sperr := fleetServerPreflight(cfg, caps, m, diff, bundleFacts)
 	if sperr != nil {
 		// The error is typed by what went wrong (transport, credential,
 		// server failure, undecodable reply), so the envelope kind and exit
@@ -297,6 +297,9 @@ func fleetPreflight(file string, errOut io.Writer, cmdName string, waitFor time.
 		fmt.Fprintf(errOut, "\n%d problem(s) the server would reject at deploy. Nothing was changed.\n", len(serverProblems))
 		runCleanups()
 		return nil, &ExitCodeError{Code: 1, Kind: KindValidation, Err: fmt.Errorf("%d server preflight problem(s)", len(serverProblems)), Reported: true}
+	}
+	for i := range diff {
+		diff[i].Warnings = append(diff[i].Warnings, serverNotices[diff[i].Slug]...)
 	}
 
 	return &preflightResult{

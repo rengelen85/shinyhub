@@ -43,7 +43,24 @@ type Schedule struct {
 	Timezone  *string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// Source is ScheduleSourceManifest for a row a bundle manifest declared
+	// and ScheduleSourceManual for one created through the API. Empty in a
+	// declaration snapshot that predates ownership; restores then keep the
+	// stored owner.
+	Source string
 }
+
+// Schedule owners. A full-manifest deploy disables manifest-owned schedules it
+// no longer declares and never touches manual ones.
+const (
+	ScheduleSourceManual   = "manual"
+	ScheduleSourceManifest = "manifest"
+)
+
+// scheduleColumns is the app_schedules projection scanSchedule reads.
+const scheduleColumns = `id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
+		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
+		       roll_fallback, max_defer_age_seconds, created_at, updated_at, source`
 
 // resolveLocation resolves an optional per-entity IANA timezone against a
 // server default. nil/empty or an unloadable zone falls back to def (UTC if
@@ -152,9 +169,7 @@ func (s *Store) CreateSchedule(p CreateScheduleParams) (int64, error) {
 
 func (s *Store) GetSchedule(id int64) (*Schedule, error) {
 	row := s.db.QueryRow(`
-		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
-		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
-		       roll_fallback, max_defer_age_seconds, created_at, updated_at
+		SELECT `+scheduleColumns+`
 		FROM app_schedules WHERE id = ?`, id)
 	return scanSchedule(row)
 }
@@ -163,18 +178,14 @@ func (s *Store) GetSchedule(id int64) (*Schedule, error) {
 // or ErrNotFound when no such schedule exists.
 func (s *Store) GetScheduleByName(appID int64, name string) (*Schedule, error) {
 	row := s.db.QueryRow(`
-		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
-		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
-		       roll_fallback, max_defer_age_seconds, created_at, updated_at
+		SELECT `+scheduleColumns+`
 		FROM app_schedules WHERE app_id = ? AND name = ?`, appID, name)
 	return scanSchedule(row)
 }
 
 func (s *Store) ListSchedulesByApp(appID int64) ([]*Schedule, error) {
 	rows, err := s.db.Query(`
-		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
-		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
-		       roll_fallback, max_defer_age_seconds, created_at, updated_at
+		SELECT `+scheduleColumns+`
 		FROM app_schedules WHERE app_id = ? ORDER BY name`, appID)
 	if err != nil {
 		return nil, err
@@ -193,9 +204,7 @@ func (s *Store) ListSchedulesByApp(appID int64) ([]*Schedule, error) {
 
 func (s *Store) ListEnabledSchedules() ([]*Schedule, error) {
 	rows, err := s.db.Query(`
-		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
-		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
-		       roll_fallback, max_defer_age_seconds, created_at, updated_at
+		SELECT ` + scheduleColumns + `
 		FROM app_schedules WHERE enabled = 1`)
 	if err != nil {
 		return nil, err
@@ -816,12 +825,69 @@ type UpsertScheduleByNameResult struct {
 
 // UpsertSchedulesByName atomically applies a complete manifest schedule batch.
 // No caller can observe a partially new declaration set if a later row fails.
+// Every upserted row becomes manifest-owned, adopting a same-name manual row.
 func (s *Store) UpsertSchedulesByName(params []UpsertScheduleByNameParams) ([]UpsertScheduleByNameResult, error) {
+	results, _, err := s.ApplyManifestScheduleDeclarations(0, params, false)
+	return results, err
+}
+
+// ApplyManifestScheduleDeclarations is UpsertSchedulesByName plus, when
+// pruneUndeclared is set, disabling every enabled manifest-owned schedule of
+// appID that params no longer declares, in the same transaction. Disabling
+// rather than deleting keeps run history and stable IDs, so failure recovery
+// and rollback restore the row by name exactly as before. Returns the disabled
+// rows as they were before the change, ordered by name.
+func (s *Store) ApplyManifestScheduleDeclarations(appID int64, params []UpsertScheduleByNameParams, pruneUndeclared bool) ([]UpsertScheduleByNameResult, []*Schedule, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("begin schedule batch: %w", err)
+		return nil, nil, fmt.Errorf("begin schedule batch: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
+	results, err := upsertManifestSchedulesTx(tx, params)
+	if err != nil {
+		return nil, nil, err
+	}
+	var disabled []*Schedule
+	if pruneUndeclared {
+		declared := make(map[string]bool, len(params))
+		for _, p := range params {
+			if p.AppID != appID {
+				return nil, nil, fmt.Errorf("schedule %q belongs to app %d, not %d", p.Name, p.AppID, appID)
+			}
+			declared[p.Name] = true
+		}
+		rows, err := tx.Query(`SELECT `+scheduleColumns+`
+		FROM app_schedules WHERE app_id = ? AND source = ? AND enabled = 1 ORDER BY name`, appID, ScheduleSourceManifest)
+		if err != nil {
+			return nil, nil, fmt.Errorf("list manifest schedules: %w", err)
+		}
+		for rows.Next() {
+			schedule, err := scanSchedule(rows)
+			if err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			if !declared[schedule.Name] {
+				disabled = append(disabled, schedule)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, nil, err
+		}
+		for _, schedule := range disabled {
+			if _, err := tx.Exec(`UPDATE app_schedules SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, schedule.ID); err != nil {
+				return nil, nil, fmt.Errorf("disable undeclared schedule %q: %w", schedule.Name, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit schedule batch: %w", err)
+	}
+	return results, disabled, nil
+}
+
+func upsertManifestSchedulesTx(tx *boundTx, params []UpsertScheduleByNameParams) ([]UpsertScheduleByNameResult, error) {
 	results := make([]UpsertScheduleByNameResult, 0, len(params))
 	for _, p := range params {
 		var tz sql.NullString
@@ -832,14 +898,14 @@ func (s *Store) UpsertSchedulesByName(params []UpsertScheduleByNameParams) ([]Up
 		scanErr := tx.QueryRow(`
 INSERT INTO app_schedules
   (app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds, overlap_policy, missed_policy, deploy_trigger, timezone,
-   on_success, min_roll_interval_seconds, roll_fallback, max_defer_age_seconds)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   on_success, min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, source)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(app_id, name) DO NOTHING
 RETURNING id`,
 			p.AppID, p.Name, p.CronExpr, p.CommandJSON, p.InputsJSON, boolToInt(p.Enabled),
 			p.TimeoutSeconds, p.OverlapPolicy, p.MissedPolicy, normalizeDeployTrigger(p.DeployTrigger), tz,
 			normalizeScheduleAction(p.OnSuccess), p.MinRollIntervalSeconds,
-			normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds).Scan(&id)
+			normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds, ScheduleSourceManifest).Scan(&id)
 		created := scanErr == nil
 		if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 			return nil, fmt.Errorf("insert schedule %q: %w", p.Name, scanErr)
@@ -849,21 +915,18 @@ RETURNING id`,
 UPDATE app_schedules
    SET cron_expr = ?, command_json = ?, inputs_json = ?, enabled = ?, timeout_seconds = ?,
 	   overlap_policy = ?, missed_policy = ?, deploy_trigger = ?, timezone = ?, on_success = ?,
-	   min_roll_interval_seconds = ?, roll_fallback = ?, max_defer_age_seconds = ?, updated_at = CURRENT_TIMESTAMP
+	   min_roll_interval_seconds = ?, roll_fallback = ?, max_defer_age_seconds = ?, source = ?, updated_at = CURRENT_TIMESTAMP
  WHERE app_id = ? AND name = ?
 RETURNING id`,
 				p.CronExpr, p.CommandJSON, p.InputsJSON, boolToInt(p.Enabled), p.TimeoutSeconds,
 				p.OverlapPolicy, p.MissedPolicy, normalizeDeployTrigger(p.DeployTrigger), tz,
 				normalizeScheduleAction(p.OnSuccess), p.MinRollIntervalSeconds,
-				normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds,
+				normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds, ScheduleSourceManifest,
 				p.AppID, p.Name).Scan(&id); err != nil {
 				return nil, fmt.Errorf("update schedule (app=%d, name=%q): %w", p.AppID, p.Name, err)
 			}
 		}
 		results = append(results, UpsertScheduleByNameResult{ID: id, Created: created})
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit schedule batch: %w", err)
 	}
 	return results, nil
 }
@@ -1033,9 +1096,10 @@ func (s *Store) RestoreScheduleDeclarations(appID int64, snapshots []*Schedule) 
 			INSERT INTO app_schedules
 				(app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 				 overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-				 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, source)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(app_id, name) DO UPDATE SET
+				source = CASE WHEN ? = '' THEN app_schedules.source ELSE excluded.source END,
 				cron_expr = excluded.cron_expr, command_json = excluded.command_json, inputs_json = excluded.inputs_json,
 				enabled = excluded.enabled, timeout_seconds = excluded.timeout_seconds,
 				overlap_policy = excluded.overlap_policy, missed_policy = excluded.missed_policy,
@@ -1049,7 +1113,7 @@ func (s *Store) RestoreScheduleDeclarations(appID int64, snapshots []*Schedule) 
 			schedule.TimeoutSeconds, schedule.OverlapPolicy, schedule.MissedPolicy,
 			schedule.DeployTrigger, timezone, schedule.OnSuccess,
 			schedule.MinRollIntervalSeconds, schedule.RollFallback,
-			schedule.MaxDeferAgeSeconds); err != nil {
+			schedule.MaxDeferAgeSeconds, scheduleSourceOrManual(schedule.Source), schedule.Source); err != nil {
 			return nil, fmt.Errorf("restore schedule %q: %w", schedule.Name, err)
 		}
 	}
@@ -1057,6 +1121,15 @@ func (s *Store) RestoreScheduleDeclarations(appID int64, snapshots []*Schedule) 
 		return nil, err
 	}
 	return s.ListSchedulesByApp(appID)
+}
+
+// scheduleSourceOrManual is the owner a restored row is inserted with: the
+// recorded owner, or manual for a snapshot that predates ownership.
+func scheduleSourceOrManual(source string) string {
+	if source == "" {
+		return ScheduleSourceManual
+	}
+	return source
 }
 
 // UpsertScheduleByName performs an atomic insert-or-update keyed on
@@ -1560,7 +1633,7 @@ func scanSchedule(s rowScanner) (*Schedule, error) {
 	err := s.Scan(&sched.ID, &sched.AppID, &sched.Name, &sched.CronExpr, &sched.CommandJSON, &sched.InputsJSON,
 		&enabled, &sched.TimeoutSeconds, &sched.OverlapPolicy, &sched.MissedPolicy,
 		&sched.DeployTrigger, &tz, &sched.OnSuccess, &sched.MinRollIntervalSeconds, &sched.RollFallback,
-		&sched.MaxDeferAgeSeconds, &sched.CreatedAt, &sched.UpdatedAt)
+		&sched.MaxDeferAgeSeconds, &sched.CreatedAt, &sched.UpdatedAt, &sched.Source)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

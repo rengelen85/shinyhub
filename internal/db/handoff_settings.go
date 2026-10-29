@@ -114,13 +114,15 @@ func publishHandoffSettingsTx(tx writeTx, id int64, revert bool) error {
 		}
 	}
 	for _, schedule := range schedules {
-		_, err := tx.Exec(`INSERT INTO app_schedules (app_id,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds)
-  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(app_id,name) DO UPDATE SET
+		_, err := tx.Exec(`INSERT INTO app_schedules (app_id,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds,source)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(app_id,name) DO UPDATE SET
+  source=CASE WHEN ?='' THEN app_schedules.source ELSE excluded.source END,
   cron_expr=excluded.cron_expr,command_json=excluded.command_json,inputs_json=excluded.inputs_json,enabled=excluded.enabled,timeout_seconds=excluded.timeout_seconds,
   overlap_policy=excluded.overlap_policy,missed_policy=excluded.missed_policy,deploy_trigger=excluded.deploy_trigger,timezone=excluded.timezone,on_success=excluded.on_success,
   min_roll_interval_seconds=excluded.min_roll_interval_seconds,roll_fallback=excluded.roll_fallback,max_defer_age_seconds=excluded.max_defer_age_seconds,updated_at=CURRENT_TIMESTAMP`,
 			app.ID, schedule.Name, schedule.CronExpr, schedule.CommandJSON, schedule.InputsJSON, boolToInt(schedule.Enabled), schedule.TimeoutSeconds, schedule.OverlapPolicy, schedule.MissedPolicy,
-			schedule.DeployTrigger, schedule.Timezone, schedule.OnSuccess, schedule.MinRollIntervalSeconds, schedule.RollFallback, schedule.MaxDeferAgeSeconds)
+			schedule.DeployTrigger, schedule.Timezone, schedule.OnSuccess, schedule.MinRollIntervalSeconds, schedule.RollFallback, schedule.MaxDeferAgeSeconds,
+			scheduleSourceOrManual(schedule.Source), schedule.Source)
 		if err != nil {
 			return err
 		}

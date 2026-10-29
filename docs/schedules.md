@@ -149,10 +149,13 @@ quarantined while preserving its serving status. `apps show` names producers
 requiring repair, including disabled schedules, and running data producers;
 `plan` warns about quarantine and names the required producer reruns.
 
-Manifest schedule reconciliation retains schedules omitted from `shinyhub.toml`.
-If a retained producer forces a stop-first deploy, the refusal names it, says it
-is absent from the manifest, and provides `shinyhub schedule rm APP SCHEDULE`.
-Remove it explicitly when it is no longer intended to run.
+Manifest schedule reconciliation disables schedules that an earlier
+`shinyhub.toml` declared and the deployed one omits, so they never gate the
+deploy as producers. Manual schedules (created with `schedule add`, the
+dashboard, or the API) omitted from `shinyhub.toml` are retained. If a retained
+producer forces a stop-first deploy, the refusal names it, says it is absent from
+the manifest, and provides `shinyhub schedule rm APP SCHEDULE`. Remove it
+explicitly when it is no longer intended to run.
 
 For legacy-upgrade uncertainty, the original schedule may have
 `deploy_trigger = "never"` and `on_success = "none"`. Run it explicitly with

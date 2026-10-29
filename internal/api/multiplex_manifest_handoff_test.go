@@ -54,7 +54,10 @@ on_success = "roll"
 		{name: "malformed-previous-manifest", status: http.StatusConflict, refusal: manifestRefusal},
 		{name: "hooks", status: http.StatusConflict, refusal: manifestRefusal},
 		{name: "bundle-change", status: http.StatusConflict, refusal: producerRefusal},
-		{name: "omitted-producer", status: http.StatusConflict, refusal: "not in the manifest"},
+		// A producer an earlier manifest declared is disabled by the omission,
+		// so it no longer blocks the handoff. A manual one is retained and does.
+		{name: "omitted-producer", status: http.StatusOK, handoff: true},
+		{name: "omitted-manual-producer", status: http.StatusConflict, refusal: "not in the manifest"},
 		{name: "missing-producer-state", status: http.StatusConflict, refusal: producerRefusal},
 		{name: "capacity", status: http.StatusConflict, refusal: "need 256 MiB for 16 parallel-generation replicas"},
 		{name: "provider", status: http.StatusConflict, refusal: "uses provider \"docker\""},
@@ -70,7 +73,7 @@ on_success = "roll"
 			srv.SetAvailableMemoryForTest(func() (int, error) { return 16 * 16, nil })
 			app := createGenerationTestApp(t, store, "multiplex-manifest", 16, 16)
 			manifest := baseManifest
-			if tc.name == "bundle-change" || tc.name == "omitted-producer" {
+			if tc.name == "bundle-change" || strings.HasPrefix(tc.name, "omitted-") && strings.HasSuffix(tc.name, "producer") {
 				manifest = strings.Replace(manifest, "first_deploy", "bundle_change", 1)
 			}
 			if tc.name == "hooks" {
@@ -106,6 +109,9 @@ on_success = "roll"
 			switch tc.name {
 			case "omitted-producer":
 				manifest = strings.Split(manifest, "[[schedule]]")[0]
+			case "omitted-manual-producer":
+				manifest = strings.Split(manifest, "[[schedule]]")[0]
+				driftSQL = "UPDATE app_schedules SET source='manual' WHERE app_id=?"
 			case "format-only":
 				manifest = "# Same declarations\n\n" + manifest
 			case "live-drift":
@@ -187,7 +193,7 @@ on_success = "roll"
 			beforeProducers := len(runtime.producerCommands)
 			runtime.mu.Unlock()
 			rec := upload("print('app') # v2", manifest, tc.allowDowntime)
-			if tc.name == "omitted-producer" && !strings.Contains(rec.Body.String(), "shinyhub schedule rm multiplex-manifest refresh") {
+			if tc.name == "omitted-manual-producer" && !strings.Contains(rec.Body.String(), "shinyhub schedule rm multiplex-manifest refresh") {
 				t.Fatalf("missing orphan removal guidance: %s", rec.Body.String())
 			}
 			if rec.Code != tc.status {
@@ -219,6 +225,18 @@ on_success = "roll"
 				}
 				if status, body := proxyGenerationBody(srv, app.Slug, ""); status != http.StatusOK || body != candidate.Version {
 					t.Fatalf("candidate route unavailable: %d %s", status, body)
+				}
+				if tc.name == "omitted-producer" {
+					refresh, err := store.GetScheduleByName(app.ID, "refresh")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if refresh.Enabled || refresh.Source != "manifest" {
+						t.Fatalf("undeclared manifest producer after handoff: enabled=%v source=%q, want disabled manifest row", refresh.Enabled, refresh.Source)
+					}
+					if !strings.Contains(rec.Body.String(), `"action":"disabled"`) {
+						t.Fatalf("deploy summary does not report the disabled schedule: %s", rec.Body.String())
+					}
 				}
 			} else {
 				if active.DeploymentID != previous.DeploymentID {
