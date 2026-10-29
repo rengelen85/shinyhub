@@ -84,7 +84,7 @@ import { auditDetailEntries } from '/static/views/audit-detail.js';
 import { readAutoscaleForm, parseReplicaBound, renderAutoscaleSummary, summariseAutoscale } from '/static/views/autoscale.js';
 import { workerCapacityLine, keepWarmInertNote } from '/static/views/worker-isolation.js';
 import { parseRenderSeconds, renderPacingAdvice } from '/static/views/render-pacing.js';
-import { runInFlight } from '/static/views/in-flight.js';
+import { isInFlight, runInFlight } from '/static/views/in-flight.js';
 import { initTheme, getThemePreference, setThemePreference } from '/static/views/theme.js';
 import { backendLabel, metricsText, reasonLabel } from '/static/views/replica-display.js';
 import { formatStatus } from '/static/views/status-label.js';
@@ -103,6 +103,7 @@ import { createSupportSessionRecovery } from '/static/views/support-session-reco
 import { shouldShowAppIsolationBanner, wireAppIsolationBanner } from '/static/views/app-isolation-banner.js';
 import { userRowCaps, userRolePresentation, RESERVED_USER_HINT } from '/static/views/user-row.js';
 import { identityModel } from '/static/views/user-identity.js';
+import { renderUserAvatar, prepareUserAvatar, avatarPickerColor } from '/static/views/user-avatar.js';
 import { createServerInfoLoader, renderAbout } from '/static/views/about.js';
 import { groupAppsForGrid } from '/static/views/app-grid-groups.js';
 import { GRID_PAGE, windowCount, createShowMore } from '/static/views/render-window.js';
@@ -214,8 +215,10 @@ document.addEventListener('DOMContentLoaded', () => {
   // login card) by the unit-tested views/branding.js.
   applyBranding(document, window.__SHINYHUB_BRANDING__);
 
+  let sessionVersion = 0;
   const state = {
     user: null,
+    sessionIdentity: {},
     apps: [],
     auditPage: 0,
     auditHasMore: false,
@@ -256,15 +259,28 @@ document.addEventListener('DOMContentLoaded', () => {
   const refreshButton = document.getElementById('refresh-button');
   const fleetHealthEl = document.getElementById('fleet-health');
   const logoutButton = document.getElementById('logout-button');
-  // Sidebar identity card + profile modal (self-service display name + password).
+  // Sidebar identity card + profile modal (photo, display name, and password).
   const identityCard    = document.getElementById('identity-card');
   const identityAvatar  = document.getElementById('identity-avatar');
   const identityName    = document.getElementById('identity-name');
   const identityRole    = document.getElementById('identity-role');
   const profileModal    = document.getElementById('profile-modal');
   const profileClose    = document.getElementById('profile-close');
+  const profileCancel = document.getElementById('profile-cancel');
   const profileForm     = document.getElementById('profile-form');
   const profileAvatar   = document.getElementById('profile-avatar');
+  const profilePhotoControls = document.getElementById('profile-photo-controls');
+  const profilePhotoChange = document.getElementById('profile-photo-change');
+  const profilePhotoRemove = document.getElementById('profile-photo-remove');
+  const profilePhotoFile = document.getElementById('profile-photo-file');
+  const profilePhotoStatus = document.getElementById('profile-photo-status');
+  const profileAvatarColor = document.getElementById('profile-avatar-color');
+  const profileColorReset = document.getElementById('profile-color-reset');
+  let pendingAvatarColor;
+  let pendingAvatar;
+  let photoGeneration = 0;
+  let photoPreparing = false;
+  let profileSaving = false;
   const profileUsername = document.getElementById('profile-username');
   const profileRole     = document.getElementById('profile-role');
   const profileLogin    = document.getElementById('profile-login');
@@ -464,6 +480,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const deployResult       = document.getElementById('deploy-result');
   const deployResultList   = document.getElementById('deploy-result-list');
   const deployError        = document.getElementById('deploy-error');
+  const deployErrorLogs    = document.getElementById('deploy-error-logs');
   const deployCancel       = document.getElementById('deploy-cancel');
   const deploySubmit       = document.getElementById('deploy-submit');
   const deployCliSnippet   = document.getElementById('deploy-cli-snippet');
@@ -1042,7 +1059,27 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function showLoggedOut() {
+    sessionVersion += 1;
+    state.sessionIdentity = {};
+    closeNewTokenModal(true);
+    closeNewAppModal(true);
+    closeDeployModal();
     sessionController.stop();
+    workersLoadVersion += 1;
+    tokensLoadVersion += 1;
+    workersLoaded = false;
+    tokensLoaded = false;
+    workersBody.replaceChildren();
+    tokensList.replaceChildren();
+    workersTable.hidden = true;
+    workersEmpty.hidden = true;
+    document.getElementById('workers-summary').hidden = true;
+    document.getElementById('workers-loading').hidden = true;
+    document.getElementById('tokens-loading').hidden = true;
+    workersBody.removeAttribute('aria-busy');
+    tokensList.removeAttribute('aria-busy');
+    document.getElementById('workers-refresh').disabled = false;
+    tokensRefresh.disabled = false;
     closeLogs();
     metrics.setTargets([]);
     state.user = null;
@@ -1072,6 +1109,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setHidden(appsView, true);
     setHidden(projectDetailView, true);
     setHidden(usersView, true);
+    setHidden(tokensView, true);
+    setHidden(document.getElementById('workers-view'), true);
     setHidden(auditView, true);
     setHidden(appDetailView, true);
     document.body.dataset.auth = 'out';
@@ -1115,6 +1154,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function showLoggedIn(payload) {
+    state.sessionIdentity = {};
     sessionController.start(payload);
     applySessionCapabilities(payload);
     setHidden(logoutButton, false);
@@ -1145,19 +1185,64 @@ document.addEventListener('DOMContentLoaded', () => {
   function renderIdentity(user) {
     if (!identityCard) return;
     const m = identityModel(user);
-    identityAvatar.textContent = m.initials;
-    identityAvatar.style.setProperty('--avatar-hue', m.hue);
+    renderUserAvatar(identityAvatar, user);
     identityName.textContent = m.name;
     identityRole.textContent = m.roleLabel;
     identityCard.setAttribute('aria-label', user ? `Open your profile, ${m.name}` : 'Open your profile');
   }
 
+  function profilePreviewUser() {
+    return { ...state.user, avatar_color: pendingAvatarColor !== undefined ? pendingAvatarColor : state.user?.avatar_color };
+  }
+
+  function renderProfileAvatar() {
+    renderUserAvatar(profileAvatar, profilePreviewUser(), pendingAvatar !== undefined ? pendingAvatar : state.user?.avatar_url || '');
+  }
+
+  function profileHasChanges() {
+    if (!state.user || state.user.can_manage_self === false) return false;
+    return pendingAvatar !== undefined ||
+      (pendingAvatarColor !== undefined && pendingAvatarColor !== (state.user.avatar_color || '')) ||
+      (state.user.can_set_password && (profileDisplayName.value.trim() !== (state.user.display_name || '') ||
+        profileCurrentPw.value !== '' || profileNewPw.value !== ''));
+  }
+
+  function syncProfileSave() {
+    const dirty = profileHasChanges();
+    const hadSaveFocus = document.activeElement === profileSubmit;
+    profileSubmit.disabled = profileSaving || photoPreparing || !dirty;
+    if (!dirty && !profileSaving && !photoPreparing && hadSaveFocus && profileCancel) profileCancel.focus({ preventScroll: true });
+    if (profilePhotoStatus) {
+      profilePhotoStatus.textContent = !profileError.hidden && !photoPreparing ? '' :
+        photoPreparing ? 'Preparing photo…' : profileSaving ? 'Saving…' : dirty ? 'Unsaved changes' : '';
+    }
+  }
+
+  function syncProfileColor() {
+    const user = profilePreviewUser();
+    if (profileAvatarColor) {
+      profileAvatarColor.value = avatarPickerColor(user);
+      profileAvatarColor.disabled = profileSaving;
+    }
+    if (profileColorReset) profileColorReset.disabled = profileSaving || !user.avatar_color;
+  }
+
   function openProfileModal() {
     if (!profileModal || !state.user) return;
+    if (sidebarDrawer) sidebarDrawer.close();
     const u = state.user;
     const m = identityModel(u);
-    profileAvatar.textContent = m.initials;
-    profileAvatar.style.setProperty('--avatar-hue', m.hue);
+    photoGeneration++;
+    pendingAvatar = undefined;
+    pendingAvatarColor = undefined;
+    syncProfileColor();
+    photoPreparing = false;
+    if (profilePwSection) profilePwSection.open = false;
+    if (profilePhotoStatus) profilePhotoStatus.textContent = '';
+    if (profilePhotoFile) profilePhotoFile.value = '';
+    renderUserAvatar(profileAvatar, u);
+    setHidden(profilePhotoControls, u.can_manage_self === false);
+    setHidden(profilePhotoRemove, !u.avatar_url);
     profileUsername.textContent = m.name;
     profileRole.textContent = m.roleLabel;
     // When a display name is set, show the underlying @username (normal case, so
@@ -1179,16 +1264,20 @@ document.addEventListener('DOMContentLoaded', () => {
       profilePwManaged.textContent = 'Your name and password are managed by your identity provider.';
     }
     setHidden(profileTokensLink, !selfService);
-    setHidden(profileSubmit, !isLocalAccount);
+    setHidden(profileSubmit, !selfService);
     profileDisplayName.value = u.display_name || '';
     profileCurrentPw.value = '';
     profileNewPw.value = '';
     setError(profileError, '');
+    syncProfileSave();
+    if (profileCancel) profileCancel.textContent = selfService ? 'Cancel' : 'Close';
     setHidden(profileSuccess, true);
     reflectThemeRadios();
     profileModal.hidden = false;
     modalTrap(profileModal).activate();
-    (isLocalAccount ? profileDisplayName : (profileClose || logoutButton)).focus();
+    (selfService ? profilePhotoChange : (profileClose || logoutButton)).focus({ preventScroll: true });
+    const body = profileModal.querySelector('.profile-body');
+    if (body) body.scrollTop = 0;
   }
 
   // reflectThemeRadios checks the radio matching the stored theme preference, so
@@ -1203,6 +1292,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function closeProfileModal() {
     if (!profileModal || profileModal.hidden) return;
     profileModal.hidden = true;
+    photoGeneration++;
     modalTrap(profileModal).release();
     setError(profileError, '');
     setHidden(profileSuccess, true);
@@ -1232,53 +1322,91 @@ document.addEventListener('DOMContentLoaded', () => {
     event.preventDefault();
     if (!state.user) return;
     const canSetPw = state.user.can_manage_self !== false && !!state.user.can_set_password;
-    // SSO accounts have nothing to save (name + password are IdP-managed); the
-    // Save button is hidden, but guard against an Enter-key submit anyway.
-    if (!canSetPw) { closeProfileModal(); return; }
+    if (state.user.can_manage_self === false || photoPreparing || profileSaving || !profileHasChanges()) return;
     setError(profileError, '');
     setHidden(profileSuccess, true);
 
-    const body = { display_name: profileDisplayName.value.trim() };
+    const body = canSetPw ? { display_name: profileDisplayName.value.trim() } : {};
+    if (pendingAvatar !== undefined) body.avatar = pendingAvatar;
+    if (pendingAvatarColor !== undefined) body.avatar_color = pendingAvatarColor;
     const wantsPwChange = canSetPw &&
       (profileNewPw.value.length > 0 || profileCurrentPw.value.length > 0);
     if (wantsPwChange) {
       if (profileNewPw.value.length < 15) {
         setError(profileError, 'New password must be at least 15 characters');
+        syncProfileSave();
         return;
       }
       body.current_password = profileCurrentPw.value;
       body.new_password = profileNewPw.value;
     }
 
-    await runInFlight(profileSubmit, async () => {
-      let resp;
-      try {
-        resp = await api('/api/auth/me', { method: 'PATCH', body: JSON.stringify(body) });
-      } catch {
-        setError(profileError, 'Network error');
-        return;
-      }
-      if (resp.status === 401) { await handleUnauthorized(); return; }
-      if (!resp.ok) {
-        let msg = 'Failed to save profile';
-        try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch {}
-        setError(profileError, msg);
-        return;
-      }
-      let data = null;
-      try { data = await resp.json(); } catch {}
-      if (data && data.user) {
-        state.user = data.user;
-        renderIdentity(data.user);
-      }
-      profileCurrentPw.value = '';
-      profileNewPw.value = '';
-      profileSuccess.textContent = wantsPwChange ? 'Profile and password updated' : 'Profile updated';
-      setHidden(profileSuccess, false);
-      // If the admin Users table is on screen, refresh it so this user's display
-      // name updates there too.
-      if (usersView && !usersView.hidden) loadUsers();
-    });
+    const generation = photoGeneration;
+    profileSaving = true;
+    syncProfileColor();
+    for (const input of [profileDisplayName, profileCurrentPw, profileNewPw]) input.disabled = true;
+    if (profilePhotoStatus) profilePhotoStatus.textContent = 'Saving…';
+    if (profilePhotoChange) profilePhotoChange.disabled = true;
+    if (profilePhotoRemove) profilePhotoRemove.disabled = true;
+    try {
+      await runInFlight(profileSubmit, async () => {
+        let resp;
+        try {
+          resp = await api('/api/auth/me', { method: 'PATCH', body: JSON.stringify(body) });
+        } catch {
+          setError(profileError, 'Network error');
+          return;
+        }
+        if (resp.status === 401) { await handleUnauthorized(); return; }
+        if (!resp.ok) {
+          let msg = 'Failed to save profile';
+          try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch {}
+          setError(profileError, msg);
+          return;
+        }
+        let data = null;
+        try { data = await resp.json(); } catch {}
+        if (data && data.user) {
+          state.user = data.user;
+          renderIdentity(data.user);
+          // Reopening during a save discards the draft. Refresh that view too,
+          // so it cannot show the old photo after the sidebar has updated.
+          if (generation === photoGeneration || (pendingAvatar === undefined && pendingAvatarColor === undefined)) {
+            pendingAvatar = undefined;
+            pendingAvatarColor = undefined;
+            renderProfileAvatar();
+            syncProfileColor();
+            // Text fields are disabled during saves, including after reopening.
+            // Keep the reopened form aligned with the committed name too.
+            profileDisplayName.value = data.user.display_name || '';
+            const identity = identityModel(data.user);
+            profileUsername.textContent = identity.name;
+            profileLogin.textContent = identity.secondary ? `@${identity.secondary}` : '';
+            setHidden(profilePhotoRemove, !data.user.avatar_url);
+          }
+          if (generation === photoGeneration) {
+            profileUsername.textContent = identityModel(data.user).name;
+            if (profilePhotoStatus) profilePhotoStatus.textContent = '';
+          }
+        }
+        if (generation !== photoGeneration) return;
+        profileCurrentPw.value = '';
+        profileNewPw.value = '';
+        if (wantsPwChange && profilePwSection) profilePwSection.open = false;
+        profileSuccess.textContent = wantsPwChange ? 'Profile and password updated' : 'Changes saved';
+        setHidden(profileSuccess, false);
+        // If the admin Users table is on screen, refresh it so this user's display
+        // name updates there too.
+        if (usersView && !usersView.hidden) loadUsers();
+      });
+    } finally {
+      profileSaving = false;
+      for (const input of [profileDisplayName, profileCurrentPw, profileNewPw]) input.disabled = false;
+      syncProfileColor();
+      syncProfileSave();
+      if (profilePhotoChange) profilePhotoChange.disabled = false;
+      if (profilePhotoRemove) profilePhotoRemove.disabled = false;
+    }
   }
 
   async function handleUnauthorized() {
@@ -1615,26 +1743,55 @@ document.addEventListener('DOMContentLoaded', () => {
     syncSidebar();
   }
 
+  let workersLoadVersion = 0;
+  let workersLoaded = false;
   async function loadWorkers() {
+    const version = ++workersLoadVersion;
+    const owner = state.user?.id;
+    const current = () => version === workersLoadVersion && owner === state.user?.id;
+    const refresh = document.getElementById('workers-refresh');
+    const loading = document.getElementById('workers-loading');
+    const summary = document.getElementById('workers-summary');
+    refresh.disabled = true;
+    loading.hidden = false;
+    workersBody.setAttribute('aria-busy', 'true');
     setError(workersError, '');
-    let resp;
     try {
-      resp = await api('/api/workers');
+      const resp = await api('/api/workers');
+      if (!current()) return;
+      if (resp.status === 401) { await handleUnauthorized(); return; }
+      if (resp.status === 403) {
+        workersBody.replaceChildren();
+        workersTable.hidden = true;
+        workersEmpty.hidden = true;
+        summary.hidden = true;
+        workersLoaded = false;
+        setError(workersError, 'Administrator access is required to view workers.');
+        return;
+      }
+      if (!resp.ok) throw new Error('request failed');
+      const workers = await resp.json();
+      if (!current()) return;
+      if (!Array.isArray(workers)) throw new Error('invalid response');
+      renderWorkers(workers);
+      workersLoaded = true;
+      const available = workers.filter(w => w.status === 'up' && !w.revoked).length;
+      summary.textContent = `${workers.length} ${workers.length === 1 ? 'worker' : 'workers'} registered · ${available} available`;
+      summary.hidden = false;
     } catch {
-      setError(workersError, 'Network error');
-      return;
+      if (!current()) return;
+      workersEmpty.hidden = true;
+      summary.hidden = true;
+      setError(workersError, workersLoaded
+        ? 'Could not refresh workers. Showing the last loaded list. Select Refresh to try again.'
+        : 'Could not load workers. Check your connection and select Refresh to try again.');
+    } finally {
+      if (current()) {
+        refresh.disabled = false;
+        loading.hidden = true;
+        workersBody.removeAttribute('aria-busy');
+      }
     }
-    if (resp.status === 401) { await handleUnauthorized(); return; }
-    if (resp.status === 403) { setError(workersError, 'Admin access required'); return; }
-    if (!resp.ok) { setError(workersError, 'Failed to load workers'); return; }
-    let workers;
-    try {
-      workers = await resp.json();
-    } catch {
-      setError(workersError, 'Invalid response from server');
-      return;
-    }
-    renderWorkers(Array.isArray(workers) ? workers : []);
   }
 
   function renderWorkers(workers) {
@@ -1646,7 +1803,16 @@ document.addEventListener('DOMContentLoaded', () => {
       const tr = document.createElement('tr');
 
       const node = document.createElement('td');
-      node.textContent = d.node;
+      const name = document.createElement('strong');
+      name.className = 'worker-name';
+      name.textContent = w.name || w.node_id || 'Unknown worker';
+      node.appendChild(name);
+      if (w.name && w.node_id) {
+        const id = document.createElement('span');
+        id.className = 'worker-node';
+        id.textContent = w.node_id;
+        node.appendChild(id);
+      }
       tr.appendChild(node);
 
       const tier = document.createElement('td');
@@ -1669,6 +1835,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (w.last_heartbeat) {
         const dt = new Date(w.last_heartbeat);
         hbText = isNaN(dt.getTime()) ? String(w.last_heartbeat) : relativeTime(dt);
+        if (!isNaN(dt.getTime())) hb.title = dt.toLocaleString();
       }
       hb.textContent = hbText;
       tr.appendChild(hb);
@@ -2794,31 +2961,50 @@ document.addEventListener('DOMContentLoaded', () => {
   function submitNewUser(event) { return newPerson.submit(event); }
 
   // ── API tokens (self-service, /tokens page) ────────────────────────────────
+  let tokensLoadVersion = 0;
+  let tokensLoaded = false;
   async function loadTokens() {
     if (!tokensList) return;
+    const version = ++tokensLoadVersion;
+    const owner = state.user?.id;
+    const current = () => version === tokensLoadVersion && owner === state.user?.id;
+    const loading = document.getElementById('tokens-loading');
+    tokensRefresh.disabled = true;
+    loading.hidden = false;
+    tokensList.setAttribute('aria-busy', 'true');
     const selfService = !state.user || state.user.can_manage_self !== false;
     if (newTokenButton) newTokenButton.hidden = !selfService;
     setError(tokensError, '');
-    let resp;
     try {
-      resp = await api('/api/tokens');
+      const resp = await api('/api/tokens');
+      if (!current()) return;
+      if (resp.status === 401) { await handleUnauthorized(); return; }
+      if (resp.status === 403) {
+        tokensList.replaceChildren();
+        tokensLoaded = false;
+        setError(tokensError, 'This account does not have access to personal API tokens.');
+        return;
+      }
+      if (!resp.ok) throw new Error('request failed');
+      const body = await resp.json();
+      if (!current()) return;
+      const tokens = Array.isArray(body) ? body : body?.items;
+      if (!Array.isArray(tokens)) throw new Error('invalid response');
+      renderTokenList(tokensList, tokenListModels(tokens), document, {mutable: selfService});
+      tokensLoaded = true;
     } catch {
-      setError(tokensError, 'Network error loading tokens');
-      renderTokenList(tokensList, [], document, {mutable: selfService});
-      return;
+      if (!current()) return;
+      tokensList.querySelector('[data-tokens-empty]')?.remove();
+      setError(tokensError, tokensLoaded
+        ? 'Could not refresh tokens. Showing the last loaded list. Select Refresh to try again.'
+        : 'Could not load tokens. Check your connection and select Refresh to try again.');
+    } finally {
+      if (current()) {
+        tokensRefresh.disabled = false;
+        loading.hidden = true;
+        tokensList.removeAttribute('aria-busy');
+      }
     }
-    if (resp.status === 401) { await handleUnauthorized(); return; }
-    if (!resp.ok) {
-      setError(tokensError, 'Failed to load tokens');
-      renderTokenList(tokensList, [], document, {mutable: selfService});
-      return;
-    }
-    let body = [];
-    try { body = await resp.json(); } catch {}
-    // The server returns the standard {items,...} list envelope; tolerate a bare
-    // array for resilience across versions.
-    const tokens = Array.isArray(body) ? body : (body && Array.isArray(body.items) ? body.items : []);
-    renderTokenList(tokensList, tokenListModels(tokens), document, {mutable: selfService});
   }
 
   // The code-entry form has no state carried on the URL or in storage: a
@@ -2900,7 +3086,8 @@ document.addEventListener('DOMContentLoaded', () => {
     newTokenName.focus();
   }
 
-  function closeNewTokenModal() {
+  function closeNewTokenModal(force = false) {
+    if (force !== true && isInFlight(newTokenSubmit)) return;
     newTokenModal.hidden = true;
     modalTrap(newTokenModal).release();
     newTokenForm.reset();
@@ -2913,39 +3100,55 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function submitNewToken(event) {
     event.preventDefault();
+    if (newTokenForm.hidden || isInFlight(newTokenSubmit)) return;
     const name = newTokenName.value.trim();
     if (!name) { setError(newTokenError, 'A token name is required'); return; }
     await runInFlight(newTokenSubmit, async () => {
+      const version = sessionVersion;
       const payload = { name };
       const expiryDays = parseInt(document.getElementById('new-token-expiry').value, 10);
       if (Number.isFinite(expiryDays)) payload.expires_in_days = expiryDays;
-      let resp;
+      setError(newTokenError, '');
+      newTokenForm.setAttribute('aria-busy', 'true');
+      for (const control of newTokenForm.elements) control.disabled = true;
+      newTokenClose.disabled = true;
+      newTokenSubmit.textContent = 'Creating token…';
       try {
-        resp = await api('/api/tokens', { method: 'POST', body: JSON.stringify(payload) });
-      } catch {
-        setError(newTokenError, 'Network error');
-        return;
-      }
-      if (resp.status === 401) { await handleUnauthorized(); return; }
-      if (!resp.ok) {
-        let msg = 'Failed to create token';
-        if (resp.status === 409) {
-          msg = 'You already have a token with that name';
-        } else {
-          try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch {}
+        let resp;
+        try {
+          resp = await api('/api/tokens', { method: 'POST', body: JSON.stringify(payload) });
+        } catch {
+          if (version === sessionVersion) setError(newTokenError, 'Could not create the token. Check your connection and try again.');
+          return;
         }
-        setError(newTokenError, msg);
-        return;
+        if (version !== sessionVersion) return;
+        if (resp.status === 401) { await handleUnauthorized(); return; }
+        if (!resp.ok) {
+          let msg = 'Failed to create token';
+          if (resp.status === 409) {
+            msg = 'You already have a token with that name';
+          } else {
+            try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch {}
+          }
+          setError(newTokenError, msg);
+          return;
+        }
+        let body = {};
+        try { body = await resp.json(); } catch {}
+        if (version !== sessionVersion) return;
+        // Reveal the raw token ONCE: swap the form for the reveal panel. The value is
+        // never re-fetchable (only the hash is stored server-side).
+        newTokenForm.hidden = true;
+        tokenRevealValue.textContent = body.token || '';
+        tokenReveal.hidden = false;
+        if (tokenRevealDone) tokenRevealDone.focus();
+        loadTokens(); // refresh the list behind the modal
+      } finally {
+        newTokenForm.removeAttribute('aria-busy');
+        for (const control of newTokenForm.elements) control.disabled = false;
+        newTokenClose.disabled = false;
+        newTokenSubmit.textContent = 'Create token';
       }
-      let body = {};
-      try { body = await resp.json(); } catch {}
-      // Reveal the raw token ONCE: swap the form for the reveal panel. The value is
-      // never re-fetchable (only the hash is stored server-side).
-      newTokenForm.hidden = true;
-      tokenRevealValue.textContent = body.token || '';
-      tokenReveal.hidden = false;
-      if (tokenRevealDone) tokenRevealDone.focus();
-      loadTokens(); // refresh the list behind the modal
     });
   }
 
@@ -4778,13 +4981,22 @@ document.addEventListener('DOMContentLoaded', () => {
       revokeBtn.addEventListener('click', () => runInFlight(revokeBtn, async () => {
         const slug = settingsSlug;
         if (!slug) return;
+        const error = document.getElementById('grant-error');
+        setError(error, '');
         try {
           const r = await api(`/api/apps/${slug}/members`, {
             method: 'DELETE',
             body: JSON.stringify({ user_id: m.user_id }),
           });
-          if (r.ok) li.remove();
-        } catch { /* network error, leave row in place */ }
+          if (slug !== settingsSlug) return;
+          if (r.status === 401) { await handleUnauthorized(); return; }
+          if (!r.ok) throw new Error('request failed');
+          li.remove();
+          flashToast(`Revoked access for ${m.username}`, 'success');
+          document.getElementById('grant-username').focus();
+        } catch {
+          if (slug === settingsSlug) setError(error, `Could not revoke access for ${m.username}. Refresh this page to check their access, then try again.`);
+        }
       }));
       li.appendChild(nameSpan);
       li.appendChild(roleSelect);
@@ -4848,6 +5060,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!slug) return;
     const newRole = selectEl.value;
     const previous = selectEl.dataset.previous || '';
+    const error = document.getElementById('grant-error');
+    setError(error, '');
     selectEl.disabled = true;
     let resp;
     try {
@@ -4858,15 +5072,19 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch {
       selectEl.disabled = false;
       if (previous) selectEl.value = previous;
+      if (slug === settingsSlug) setError(error, `Could not update the role for ${username}. Check your connection and try again.`);
       return;
     }
     selectEl.disabled = false;
+    if (slug !== settingsSlug) return;
     if (resp.status === 401) { await handleUnauthorized(); return; }
     if (!resp.ok) {
       if (previous) selectEl.value = previous; // revert to last-known role
+      setError(error, `Could not update the role for ${username}. Refresh this page to check their role, then try again.`);
       return;
     }
     selectEl.dataset.previous = newRole;
+    flashToast(`Updated ${username} to ${newRole}`, 'success');
   }
 
   logPaneClose.addEventListener('click', closeLogs);
@@ -5008,6 +5226,71 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Profile modal: open from the sidebar identity card; close/submit wiring.
   if (identityCard) identityCard.addEventListener('click', openProfileModal);
+  function previewAvatarColor(color) {
+    if (!state.user || profileSaving || state.user.can_manage_self === false) return;
+    pendingAvatarColor = color;
+    renderProfileAvatar();
+    syncProfileColor();
+    setError(profileError, '');
+    setHidden(profileSuccess, true);
+    syncProfileSave();
+  }
+  if (profileAvatarColor) profileAvatarColor.addEventListener('input', () => previewAvatarColor(profileAvatarColor.value));
+  if (profileColorReset) profileColorReset.addEventListener('click', () => {
+    previewAvatarColor('');
+    profileAvatarColor.focus();
+  });
+  if (profilePhotoChange) profilePhotoChange.addEventListener('click', () => profilePhotoFile.click());
+  if (profilePhotoFile) profilePhotoFile.addEventListener('change', async () => {
+    const file = profilePhotoFile.files?.[0];
+    profilePhotoFile.value = '';
+    if (!file || profileSaving || state.user?.can_manage_self === false) return;
+    const generation = ++photoGeneration;
+    photoPreparing = true;
+    profileSubmit.disabled = true;
+    profilePhotoStatus.textContent = 'Preparing photo…';
+    setError(profileError, '');
+    setHidden(profileSuccess, true);
+    try {
+      const photo = await prepareUserAvatar(file, window);
+      if (generation !== photoGeneration) return;
+      pendingAvatar = photo;
+      renderProfileAvatar();
+      setHidden(profilePhotoRemove, false);
+      profilePhotoStatus.textContent = 'Unsaved changes';
+    } catch (err) {
+      if (generation !== photoGeneration) return;
+      profilePhotoStatus.textContent = '';
+      setError(profileError, err.message);
+    } finally {
+      if (generation === photoGeneration) {
+        photoPreparing = false;
+        syncProfileSave();
+      }
+    }
+  });
+  if (profilePhotoRemove) profilePhotoRemove.addEventListener('click', () => {
+    if (profileSaving) return;
+    photoGeneration++;
+    photoPreparing = false;
+    profileSubmit.disabled = false;
+    pendingAvatar = '';
+    renderProfileAvatar();
+    setHidden(profilePhotoRemove, true);
+    profilePhotoChange.focus();
+    profilePhotoStatus.textContent = 'Unsaved changes';
+    setError(profileError, '');
+    setHidden(profileSuccess, true);
+    syncProfileSave();
+  });
+  for (const input of [profileDisplayName, profileCurrentPw, profileNewPw]) {
+    if (input) input.addEventListener('input', () => {
+      setError(profileError, '');
+      setHidden(profileSuccess, true);
+      syncProfileSave();
+    });
+  }
+  if (profileCancel) profileCancel.addEventListener('click', closeProfileModal);
   if (profileClose) profileClose.addEventListener('click', closeProfileModal);
   if (profileForm)  profileForm.addEventListener('submit', submitProfile);
   if (profileModal) profileModal.addEventListener('click', e => {
@@ -5263,6 +5546,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // Grant button.
   document.getElementById('grant-btn').addEventListener('click', async () => {
     const grantBtn = document.getElementById('grant-btn');
+    if (grantBtn.disabled || !settingsSlug) return;
+    const slug = settingsSlug;
     const username = document.getElementById('grant-username').value.trim();
     const errEl = document.getElementById('grant-error');
     errEl.hidden = true;
@@ -5274,10 +5559,12 @@ document.addEventListener('DOMContentLoaded', () => {
       // Grant by username: the server resolves it to a user id under the same
       // manage-app authorization, so the UI never needs a separate user-lookup
       // (which would require broader privilege than managing this app).
-      const grantResp = await api(`/api/apps/${settingsSlug}/members`, {
+      const grantResp = await api(`/api/apps/${slug}/members`, {
         method: 'POST',
         body: JSON.stringify({ username }),
       });
+      if (slug !== settingsSlug) return;
+      if (grantResp.status === 401) { await handleUnauthorized(); return; }
       if (!grantResp.ok) {
         let grantMsg = grantResp.status === 404 ? 'User not found' : 'Grant failed';
         try {
@@ -5292,6 +5579,8 @@ document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('grant-username').value = '';
       await refreshMemberList();
       flashToast(`Granted ${username} as viewer`, 'success');
+    } catch {
+      if (slug === settingsSlug) setError(errEl, 'Could not grant access. Check your connection and try again.');
     } finally {
       grantBtn.disabled = false;
       grantBtn.textContent = 'Grant';
@@ -5403,7 +5692,8 @@ document.addEventListener('DOMContentLoaded', () => {
     newAppName.focus();
   }
 
-  function closeNewAppModal() {
+  function closeNewAppModal(force = false) {
+    if (force !== true && isInFlight(newAppSubmit)) return;
     newAppModal.hidden = true;
     modalTrap(newAppModal).release();
     resetNewAppModal();
@@ -5423,6 +5713,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function submitNewApp(event) {
     event.preventDefault();
+    if (newAppForm.hidden || isInFlight(newAppSubmit)) return;
     setError(newAppError, '');
 
     const slug = newAppSlug.value.trim();
@@ -5440,56 +5731,60 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    newAppSubmit.disabled = true;
-    newAppSubmit.textContent = 'Creating…';
-
-    let resp;
-    try {
-      resp = await api('/api/apps', {
-        method: 'POST',
-        body: JSON.stringify({ slug, name, project_slug: projectSlug }),
-      });
-    } catch {
-      setError(newAppError, 'Network error');
-      newAppSubmit.disabled = false;
-      newAppSubmit.textContent = 'Create';
-      return;
-    }
-
-    if (resp.status === 401) { await handleUnauthorized(); return; }
-    if (resp.status === 409) {
-      setError(newAppError, 'Slug already taken. Pick another.');
-      newAppSubmit.disabled = false;
-      newAppSubmit.textContent = 'Create';
-      return;
-    }
-    if (resp.status === 403) {
-      setError(newAppError, 'You do not have permission to create apps.');
-      newAppSubmit.disabled = false;
-      newAppSubmit.textContent = 'Create';
-      return;
-    }
-    if (!resp.ok) {
-      let message = 'Failed to create app.';
+    await runInFlight(newAppSubmit, async () => {
+      const version = sessionVersion;
+      newAppForm.setAttribute('aria-busy', 'true');
+      for (const control of newAppForm.elements) control.disabled = true;
+      newAppClose.disabled = true;
+      newAppSubmit.textContent = 'Creating…';
       try {
-        const body = await resp.json();
-        if (body && body.error) message = body.error;
-      } catch { /* non-JSON response */ }
-      setError(newAppError, message);
-      newAppSubmit.disabled = false;
-      newAppSubmit.textContent = 'Create';
-      return;
-    }
+        let resp;
+        try {
+          resp = await api('/api/apps', {
+            method: 'POST',
+            body: JSON.stringify({ slug, name, project_slug: projectSlug }),
+          });
+        } catch {
+          if (version === sessionVersion) setError(newAppError, 'Could not create the app. Check your connection and try again.');
+          return;
+        }
+        if (version !== sessionVersion) return;
+        if (resp.status === 401) { await handleUnauthorized(); return; }
+        if (resp.status === 409) {
+          setError(newAppError, 'Slug already taken. Pick another.');
+          return;
+        }
+        if (resp.status === 403) {
+          setError(newAppError, 'You do not have permission to create apps.');
+          return;
+        }
+        if (!resp.ok) {
+          let message = 'Failed to create app.';
+          try {
+            const body = await resp.json();
+            if (body && body.error) message = body.error;
+          } catch { /* non-JSON response */ }
+          setError(newAppError, message);
+          return;
+        }
 
-    let createdApp = { slug, name };
-    try {
-      const body = await resp.json();
-      if (body && typeof body.slug === 'string' && body.slug) {
-        createdApp = body;
+        let createdApp = { slug, name };
+        try {
+          const body = await resp.json();
+          if (body && typeof body.slug === 'string' && body.slug) {
+            createdApp = body;
+          }
+        } catch { /* the submitted values are a complete fallback */ }
+        if (version !== sessionVersion) return;
+        await loadApps();
+        if (version === sessionVersion) showNewAppHandoff(createdApp);
+      } finally {
+        newAppForm.removeAttribute('aria-busy');
+        for (const control of newAppForm.elements) control.disabled = false;
+        newAppClose.disabled = false;
+        newAppSubmit.textContent = 'Create';
       }
-    } catch { /* the submitted values are a complete fallback */ }
-    showNewAppHandoff(createdApp);
-    await loadApps();
+    });
   }
 
   function formatBytes(n) {
@@ -5499,6 +5794,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function resetDeployModal() {
+    deployErrorLogs.hidden = true;
+    deployPick.disabled = deployFileInput.disabled = false;
     deploySummary.hidden = true;
     deployIgnoredRow.hidden = true;
     deployProgressWrap.hidden = true;
@@ -5544,6 +5841,23 @@ document.addEventListener('DOMContentLoaded', () => {
     modalTrap(deployModal).release();
   }
 
+  // Every selection owns its asynchronous preparation. A replaced file or a
+  // closed dialog must never restore an earlier bundle or enable its upload.
+  function beginDeploySelection() {
+    const selection = deployState;
+    const version = selection.selectionVersion = (selection.selectionVersion || 0) + 1;
+    selection.blob = null;
+    selection.completed = false;
+    deploySubmit.disabled = true;
+    deploySubmit.textContent = 'Deploy';
+    deploySummary.hidden = true;
+    deployProgressWrap.hidden = true;
+    deployResult.hidden = true;
+    deployErrorLogs.hidden = true;
+    setError(deployError, '');
+    return () => deployState === selection && selection.selectionVersion === version;
+  }
+
   function renderDeploySummary(sourceName, blobSize, fileCount, rejections, rules) {
     deploySourceName.textContent = sourceName;
     deployFileCount.textContent = fileCount == null ? '—' : String(fileCount);
@@ -5580,16 +5894,19 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function acceptZipFile(file) {
+    const current = beginDeploySelection();
     // Pre-built .zip — counting files would require parsing the central
     // directory, so leave the file count unknown and render it as "—".
     let rules;
     try {
       rules = await loadBundleRules();
     } catch (err) {
+      if (!current()) return;
       console.error('loadBundleRules failed:', err);
       setError(deployError, 'Failed to load bundle rules from server.');
       return;
     }
+    if (!current()) return;
     deployState.blob = file;
     deployState.fileCount = null;
     deployState.rejections = new Map();
@@ -5606,9 +5923,11 @@ document.addEventListener('DOMContentLoaded', () => {
       deployFileInput.click();
     });
     deployFileInput.addEventListener('change', async () => {
+      if (!deployState || deployState.uploading) return;
       const file = deployFileInput.files && deployFileInput.files[0];
       if (!file) return;
       if (!file.name.toLowerCase().endsWith('.zip')) {
+        beginDeploySelection();
         setError(deployError, 'File picker only accepts .zip. Drop a folder to zip it in the browser.');
         return;
       }
@@ -5630,6 +5949,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function handleDrop(e) {
+    if (!deployState || deployState.uploading) return;
+    beginDeploySelection();
     const items = [...(e.dataTransfer?.items || [])];
     if (items.length === 0) {
       setError(deployError, 'Nothing to upload.');
@@ -5761,8 +6082,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function zipFolderEntry(rootEntry) {
-    setError(deployError, '');
-    deploySubmit.disabled = true;
+    const current = beginDeploySelection();
     deploySourceName.textContent = rootEntry.name + '/';
     deployFileCount.textContent = 'Reading…';
     deployBundleSize.textContent = '—';
@@ -5772,20 +6092,24 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       rules = await loadBundleRules();
     } catch (err) {
+      if (!current()) return;
       console.error('loadBundleRules failed:', err);
       setError(deployError, 'Failed to load bundle rules from server.');
       return;
     }
+    if (!current()) return;
 
     const rejections = new Map();
     const fileList = [];
     try {
       for await (const item of walkFolder(rootEntry, rules, rejections)) fileList.push(item);
     } catch (err) {
+      if (!current()) return;
       console.error('walkFolder failed:', err);
       setError(deployError, 'Failed to read folder contents.');
       return;
     }
+    if (!current()) return;
 
     if (fileList.length === 0) {
       setError(deployError, 'Folder is empty after filtering excluded paths.');
@@ -5805,11 +6129,12 @@ document.addEventListener('DOMContentLoaded', () => {
         ? await buildZipNative(fileList)
         : await buildZipJSZip(fileList);
     } catch (err) {
+      if (!current()) return;
       console.error('zip build failed:', err);
       setError(deployError, 'Failed to build zip archive.');
       return;
     }
-
+    if (!current()) return;
     deployState.blob = blob;
     deployState.fileCount = fileList.length;
     deployState.rejections = rejections;
@@ -5865,7 +6190,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   deploySubmit.addEventListener('click', async () => {
-    if (!deployState || !deployState.blob) return;
+    if (!deployState || !deployState.blob || deployState.uploading) return;
 
     // Re-entry: after a successful deploy this button becomes "View logs".
     if (deployState.completed) {
@@ -5877,29 +6202,42 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setError(deployError, '');
     deploySubmit.disabled = true;
+    deployErrorLogs.hidden = true;
     deployCancel.textContent = 'Close';
     deployProgressWrap.hidden = false;
     deployProgressBar.value = 0;
     deployProgressText.textContent = '0%';
 
     const { slug, blob } = deployState;
+    const upload = deployState;
+    const selectionVersion = upload.selectionVersion;
+    upload.uploading = true;
+    deployPick.disabled = deployFileInput.disabled = true;
 
     let body;
     try {
       body = await uploadBundle(slug, blob);
     } catch (err) {
+      if (deployState !== upload) return;
       if (err.code === 'UPLOAD_CANCELLED') {
         return; // closeDeployModal resets state
       }
       if (err.status === 401) { await handleUnauthorized(); return; }
       setError(deployError, err.message || 'Deploy failed');
+      deployErrorLogs.hidden = false;
       deploySubmit.disabled = false;
       deployCancel.textContent = 'Cancel';
       return;
+    } finally {
+      if (deployState === upload) {
+        upload.uploading = false;
+        deployPick.disabled = deployFileInput.disabled = false;
+      }
     }
-
+    if (deployState !== upload) return;
     deployProgressText.textContent = 'Deployed';
     await loadApps();
+    if (deployState !== upload || upload.selectionVersion !== selectionVersion) return;
 
     // body.manifest is set when the bundle's shinyhub.toml applied [app]
     // settings or [[schedule]] blocks; show it inside the modal so the
@@ -5920,6 +6258,12 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   deployModalClose.addEventListener('click', closeDeployModal);
+  deployErrorLogs.addEventListener('click', () => {
+    if (!deployState) return;
+    const slug = deployState.slug;
+    closeDeployModal();
+    openLogs(slug);
+  });
   deployCancel.addEventListener('click', closeDeployModal);
   deployModal.addEventListener('click', (e) => {
     if (e.target === e.currentTarget) closeDeployModal();

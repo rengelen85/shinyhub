@@ -52,8 +52,8 @@ test('SSO-only, mixed, local, and unavailable onboarding show only usable action
   assert.equal(document.getElementById('people-signin-copy').hidden,!share);
   assert.equal(document.getElementById('people-joining').hidden,mode===null);
   assert.equal(document.getElementById('people-joining').open,false);
-  assert.equal(document.querySelector('#users-view > .toolbar #new-user-button'),null);
-  assert.equal(document.getElementById('new-user-button').closest('details').id,'people-joining');
+  assert.equal(document.getElementById('new-user-button').closest('details'),null,
+   'inviting a person must not require expanding sign-in guidance');
  }
  applyPeopleOnboarding(document,{local:true,sso:true},true);
  assert.equal(document.getElementById('new-user-button').hidden,true);

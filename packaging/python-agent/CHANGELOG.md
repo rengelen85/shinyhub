@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.5.1...shinyhub-agent-v0.5.2) - 2026-10-26
+
+### Fixed
+
+- **bookmarks**: keep private inputs and agent payloads out of view URLs ([5ca0c99](https://github.com/rvben/shinyhub/commit/5ca0c99597bda072c05a29d547df59245cb77068))
+
 ## [0.5.1](https://github.com/rvben/shinyhub/compare/shinyhub-agent-v0.5.0...shinyhub-agent-v0.5.1) - 2026-10-23
 
 ### Fixed

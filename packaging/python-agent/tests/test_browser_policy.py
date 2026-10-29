@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from shiny import Inputs, reactive
@@ -27,6 +28,7 @@ def test_registered_browser_write_policy_is_enforced_in_shiny_session(monkeypatc
             ns = Root
 
             def __init__(self):
+                self.bookmark = SimpleNamespace(exclude=[])
                 self.messages = []
                 self.flushed = []
                 self.ended = []

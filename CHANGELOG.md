@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.21.5](https://github.com/rvben/shinyhub/compare/v0.21.4...v0.21.5) - 2026-10-28
+
+### Added
+
+- Customize your profile avatar and color from the profile editor.
+- **profile**: add customizable avatars and refine profile editing ([235ef3e](https://github.com/rvben/shinyhub/commit/235ef3e89bb4d9ac44ccb801867832c0a3a56bc3))
+
+### Fixed
+
+- Distinguish measured app CPU and memory usage, available host or container capacity, and per-app limit checks on Overview. Missing readings and unenforced limits now identify the affected apps and offer recovery guidance; unset optional limits no longer produce a warning when all replicas report.
+- Keep Overview resources and recent changes in balanced full-width sections, preserve fleet and disclosure context during app inspection, and retain keyboard focus through polling and retry flows without interrupting interaction during loading.
+- Improve dashboard recovery states and creation and deployment journeys, and include the avatar endpoint and frontend module in the demo route allowlist.
+- Keep private bookmark inputs and agent payloads out of view URLs.
+- **overview**: clarify capacity warnings and recovery flows ([7b946d9](https://github.com/rvben/shinyhub/commit/7b946d9805bff6f754cd7428b6f8ffcfc02bbf81))
+- **ui**: harden creation and deployment journeys ([c76e8f9](https://github.com/rvben/shinyhub/commit/c76e8f963a79c5822b7207e65470a06ab1cff2b6))
+- **ui**: polish dashboard pages and recovery states ([2aab626](https://github.com/rvben/shinyhub/commit/2aab626243eda2acd743ab66a906d0b4d451dd10))
+- **overview**: distinguish app usage from host capacity ([75a2b61](https://github.com/rvben/shinyhub/commit/75a2b616afbd4b3cc5f30ab832a753ec470db3cd))
+- **bookmarks**: keep private inputs and agent payloads out of view URLs ([5ca0c99](https://github.com/rvben/shinyhub/commit/5ca0c99597bda072c05a29d547df59245cb77068))
+- **security**: patch HTML parser resource exhaustion ([af1485d](https://github.com/rvben/shinyhub/commit/af1485da839c03c4489f5687a03c08a516b0eeeb))
+
+### Security
+
+- Update go-jose to 4.1.6 to fix excessive resource use while parsing RSA JSON Web Keys (CVE-2026-116587).
+- Update golang.org/x/net to 0.62.0 and its required Go dependencies to fix quadratic resource use when parsing HTML with repeated short text runs (CVE-2026-78661).
+
+### Upgrade notice
+
+This release adds profile-avatar database columns. Back up the database before upgrading; older binaries reject the newer schema, so downgrading requires restoring the pre-upgrade database.
+
+The patched JWK parser rejects RSA keys larger than 4096 bits by default. Check your identity provider's signing-key size before upgrading if it uses unusually large RSA keys.
+
 ## [0.21.4](https://github.com/rvben/shinyhub/compare/v0.21.3...v0.21.4) - 2026-10-26
 
 ### Fixed

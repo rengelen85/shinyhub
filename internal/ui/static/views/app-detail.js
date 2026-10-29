@@ -945,7 +945,7 @@ function renderOverview(panel, app, replicasStatus, envelope, ctx) {
         <p class="lead">Your app isn't running yet. Upload a <code>.zip</code>
            or use the CLI snippet below.</p>
         <div class="snippet">
-          <pre><code id="overview-cli-snippet"></code></pre>
+          <pre role="region" tabindex="0" aria-label="CLI deployment commands"><code id="overview-cli-snippet"></code></pre>
         </div>
         <div class="emptystate-actions">
           <button type="button" class="btn-primary" id="overview-deploy-btn">Deploy</button>
@@ -973,7 +973,7 @@ function renderOverview(panel, app, replicasStatus, envelope, ctx) {
            running version yet. The startup output, including any traceback,
            is on the Logs tab.</p>
         <div class="snippet" id="overview-failed-error" hidden>
-          <pre><code id="overview-failed-error-text"></code></pre>
+          <pre role="region" tabindex="0" aria-label="Deployment failure details"><code id="overview-failed-error-text"></code></pre>
         </div>
         <div class="emptystate-actions">
           <a class="emptystate-btn emptystate-btn-primary" href="/apps/${app.slug}/logs" data-nav>View logs</a>

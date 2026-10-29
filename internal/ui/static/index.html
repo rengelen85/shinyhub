@@ -340,6 +340,7 @@
       <div class="toolbar">
         <div><h1 id="identity-heading">Identity</h1><p class="identity-page-intro">Manage people, their roles, and service accounts for automation.</p></div>
         <div class="toolbar-actions">
+          <button id="new-user-button" class="btn-primary" type="button" hidden>Invite person</button>
           <button id="users-refresh" class="toolbar-btn-quiet" type="button">Refresh</button>
         </div>
       </div>
@@ -369,7 +370,6 @@
           <p id="people-onboarding" class="identity-page-intro" hidden></p>
           <div class="people-joining-actions">
             <button id="people-signin-copy" type="button" hidden>Copy sign-in link</button>
-            <button id="new-user-button" type="button" hidden>Invite person</button>
           </div>
           <p id="people-onboarding-status" class="profile-hint" role="status"></p>
         </details>
@@ -390,7 +390,7 @@
         <h1 id="tokens-heading">API tokens</h1>
         <div class="toolbar-actions">
           <button id="new-token-button" type="button" class="btn-primary">+ New token</button>
-          <button id="tokens-refresh" type="button">Refresh</button>
+          <button id="tokens-refresh" class="toolbar-btn-quiet" type="button">Refresh</button>
         </div>
       </div>
       <section id="cli-connect-panel" class="cli-connect-panel" aria-labelledby="cli-connect-heading">
@@ -408,21 +408,25 @@
           <p id="cli-connect-success" class="cli-connect-success" role="status" hidden></p>
         </div>
       </section>
+      <h2 class="list-heading">Personal tokens</h2>
       <p class="tokens-intro">Personal tokens for the CLI and API. Use with <code>Authorization: token &lt;value&gt;</code> or <code>SHINYHUB_TOKEN</code>. A token is shown once at creation, so store it somewhere safe.</p>
+      <p id="tokens-loading" class="list-status" role="status" hidden>Loading tokens…</p>
       <p id="tokens-error" class="error" role="alert" hidden></p>
       <div id="tokens-list" class="tokens-list"></div>
     </section>
 
-    <section id="workers-view" hidden>
+    <section id="workers-view" hidden aria-labelledby="workers-heading">
       <div class="toolbar">
-        <h1>Workers</h1>
+        <div><h1 id="workers-heading">Workers</h1><p class="page-description">Worker availability and the last heartbeat received by this hub.</p></div>
         <div class="toolbar-actions">
-          <button id="workers-refresh" type="button">Refresh</button>
+          <button id="workers-refresh" class="toolbar-btn-quiet" type="button">Refresh</button>
         </div>
       </div>
+      <p id="workers-loading" class="list-status" role="status" hidden>Loading workers…</p>
+      <p id="workers-summary" class="list-status" role="status" hidden></p>
       <p id="workers-error" class="error" role="alert" hidden></p>
       <p id="workers-empty" class="env-empty" hidden>No workers have joined. Workers appear here when worker hosting is enabled and a <code>shinyhub worker</code> node joins over mTLS.</p>
-      <table id="workers-table" hidden>
+      <table id="workers-table" tabindex="0" aria-label="Registered workers" hidden>
         <thead>
           <tr>
             <th scope="col">Node</th>
@@ -460,7 +464,7 @@
       <p id="audit-loading" class="env-empty" role="status" hidden>Loading audit events…</p>
       <p id="audit-error" class="error" role="alert" hidden></p>
       <p id="audit-empty" class="env-empty" hidden>No audit events recorded yet. Every mutating action will appear here.</p>
-      <table id="audit-table">
+      <table id="audit-table" tabindex="0" aria-label="Audit events">
         <thead>
           <tr>
             <th scope="col">Time</th>
@@ -1079,7 +1083,7 @@
                 <input id="grant-username" type="text" placeholder="username" autocomplete="off" aria-describedby="grant-error">
                 <button id="grant-btn" type="button" class="btn-primary">Grant</button>
               </div>
-              <p id="grant-error" class="error" hidden></p>
+              <p id="grant-error" class="error" role="alert" hidden></p>
             </div>
           </section>
 
@@ -1105,6 +1109,11 @@
       </div>
     </section>
 
+  </main>
+    </div>
+  </div>
+  <!-- Keep the log dialog outside app-shell: modalTrap makes that background
+       inert, so a dialog nested inside it cannot receive clicks or focus. -->
   <!-- Log pane: hidden overlay that shows SSE log output for one app. Modal
        semantics match the other overlays (role=dialog, focus trap on open,
        closes on navigate/Escape/backdrop-adjacent close button). The stream
@@ -1118,9 +1127,6 @@
     </div>
     <p id="log-pane-status" class="log-pane-status" role="status" hidden></p>
     <pre id="log-pane-body" class="log-pane-body"></pre>
-  </div>
-  </main>
-    </div>
   </div>
   <!-- New-app modal: create-only; hand-off to CLI for the first deploy -->
   <div id="new-app-modal" class="modal-overlay" hidden
@@ -1168,7 +1174,7 @@
           <div>
             <p class="handoff-section-label" id="new-app-snippet-label">Deploy from your machine after creating</p>
             <div class="snippet">
-              <pre><code id="new-app-snippet"></code></pre>
+              <pre role="region" tabindex="0" aria-labelledby="new-app-snippet-label"><code id="new-app-snippet"></code></pre>
               <button type="button" id="new-app-snippet-copy" class="copy-btn"
                       aria-label="Copy CLI commands to clipboard">
                 <svg class="copy-icon-clipboard" viewBox="0 0 16 16" fill="none"
@@ -1234,10 +1240,11 @@
           <ul id="deploy-result-list" class="deploy-result-list" aria-label="Manifest changes applied"></ul>
         </div>
 
-        <p id="deploy-error" class="error" hidden></p>
+        <p id="deploy-error" class="error" role="alert" hidden></p>
 
         <div class="modal-actions">
           <button type="button" id="deploy-cancel">Cancel</button>
+          <button type="button" id="deploy-error-logs" hidden>View app logs</button>
           <button type="button" id="deploy-submit" class="btn-primary" disabled>Deploy</button>
         </div>
 
@@ -1246,7 +1253,7 @@
         <div>
           <p class="handoff-section-label">Or deploy from your CLI</p>
           <div class="snippet">
-            <pre><code id="deploy-cli-snippet"></code></pre>
+            <pre role="region" tabindex="0" aria-label="CLI deployment commands"><code id="deploy-cli-snippet"></code></pre>
             <button type="button" id="deploy-cli-snippet-copy" class="copy-btn"
                     aria-label="Copy CLI commands to clipboard">
               <svg class="copy-icon-clipboard" viewBox="0 0 16 16" fill="none"
@@ -1268,7 +1275,7 @@
       </div>
     </div>
   </div>
-  <!-- Profile modal: self-service display name + own password, plus logout -->
+  <!-- Profile modal: photo, display name, own password, and logout -->
   <div id="profile-modal" class="modal-overlay" hidden
        role="dialog" aria-modal="true" aria-labelledby="profile-heading">
     <div class="modal-card">
@@ -1276,57 +1283,75 @@
         <h2 id="profile-heading" class="modal-title">Your profile</h2>
         <button id="profile-close" type="button" aria-label="Close profile"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="3" x2="13" y2="13"/><line x1="13" y1="3" x2="3" y2="13"/></svg></button>
       </div>
-      <div class="modal-body">
-        <div class="profile-identity">
-          <span id="profile-avatar" class="identity-avatar identity-avatar-lg" aria-hidden="true">?</span>
-          <div class="profile-identity-meta">
-            <span id="profile-username" class="profile-username"></span>
-            <span id="profile-role" class="profile-role"></span>
-            <span id="profile-login" class="profile-login"></span>
-          </div>
-        </div>
+      <form id="profile-form">
+        <div class="modal-body profile-body">
+          <section class="profile-identity" aria-label="Your avatar">
+            <span id="profile-avatar" class="identity-avatar identity-avatar-lg" aria-hidden="true">?</span>
+            <div class="profile-identity-meta">
+              <span id="profile-username" class="profile-username"></span>
+              <span id="profile-role" class="profile-role"></span>
+              <span id="profile-login" class="profile-login"></span>
+            </div>
+            <div id="profile-photo-controls" class="profile-photo-controls">
+              <div class="modal-actions profile-photo-actions">
+                <button id="profile-photo-change" type="button" aria-describedby="profile-photo-hint">Change photo</button>
+                <button id="profile-photo-remove" type="button" hidden>Use initials</button>
+              </div>
+              <input id="profile-photo-file" type="file" aria-label="Profile photo" accept="image/png,image/jpeg,image/webp" hidden>
+              <div class="modal-actions profile-color-actions">
+                <label for="profile-avatar-color">Initials color</label>
+                <input id="profile-avatar-color" type="color">
+                <button id="profile-color-reset" type="button">Use default</button>
+              </div>
+              <p id="profile-photo-hint" class="profile-hint">PNG, JPEG or WebP · 5 MB max · Square crop</p>
+            </div>
+          </section>
 
-        <fieldset id="theme-picker" class="profile-appearance">
-          <legend>Appearance</legend>
-          <div class="theme-options">
-            <label class="theme-option"><input type="radio" name="theme-pref" value="system"> System</label>
-            <label class="theme-option"><input type="radio" name="theme-pref" value="light"> Light</label>
-            <label class="theme-option"><input type="radio" name="theme-pref" value="dark"> Dark</label>
-          </div>
-        </fieldset>
-
-        <form id="profile-form">
           <div id="profile-name-field">
             <label for="profile-display-name">Display name</label>
             <input id="profile-display-name" type="text" maxlength="80"
-                   autocomplete="name" spellcheck="false" placeholder="Your name">
-            <p class="profile-hint">Shown across the dashboard. Leave blank to use your username.</p>
+                   autocomplete="name" spellcheck="false" placeholder="Your name" aria-describedby="profile-name-hint">
+            <p id="profile-name-hint" class="profile-hint">Leave blank to use your username.</p>
           </div>
 
-          <fieldset id="profile-password-section" class="profile-password">
-            <legend>Change password</legend>
-            <label for="profile-current-password">Current password</label>
-            <input id="profile-current-password" type="password"
-                   autocomplete="current-password" placeholder="Your current password">
-            <label for="profile-new-password">New password</label>
-            <input id="profile-new-password" type="password" minlength="15"
-                   autocomplete="new-password" placeholder="At least 15 characters">
+          <fieldset id="theme-picker" class="profile-appearance">
+            <legend>Appearance <span>Applies immediately</span></legend>
+            <div class="theme-options">
+              <label class="theme-option"><input type="radio" name="theme-pref" value="system"> System</label>
+              <label class="theme-option"><input type="radio" name="theme-pref" value="light"> Light</label>
+              <label class="theme-option"><input type="radio" name="theme-pref" value="dark"> Dark</label>
+            </div>
           </fieldset>
-          <p id="profile-password-managed" class="profile-hint" hidden>Your name and password are managed by your identity provider.</p>
 
-          <p class="profile-tokens-link">
-            <a href="/tokens" data-nav id="profile-tokens-link">Manage API tokens &rarr;</a>
-          </p>
-
-          <p id="profile-error" class="error" role="alert" hidden></p>
-          <p id="profile-success" class="profile-success" role="status" aria-live="polite" hidden></p>
-
+          <div class="profile-account">
+            <details id="profile-password-section" class="profile-password">
+              <summary>Change password<svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 3 5 5-5 5"/></svg></summary>
+              <div class="profile-password-fields">
+                <label for="profile-current-password">Current password</label>
+                <input id="profile-current-password" type="password" autocomplete="current-password" placeholder="Your current password">
+                <label for="profile-new-password">New password</label>
+                <input id="profile-new-password" type="password" minlength="15" autocomplete="new-password" placeholder="At least 15 characters">
+              </div>
+            </details>
+            <p id="profile-password-managed" class="profile-hint" hidden>Your name and password are managed by your identity provider.</p>
+            <div class="profile-account-links">
+              <a href="/tokens" data-nav id="profile-tokens-link">Manage API tokens <span aria-hidden="true">&rarr;</span></a>
+              <button id="logout-button" type="button" class="profile-logout">Log out</button>
+            </div>
+          </div>
+        </div>
+        <div class="profile-footer">
+          <div class="profile-feedback">
+            <p id="profile-photo-status" role="status" aria-live="polite"></p>
+            <p id="profile-error" class="error" role="alert" hidden></p>
+            <p id="profile-success" class="profile-success" role="status" aria-live="polite" hidden></p>
+          </div>
           <div class="modal-actions profile-actions">
-            <button id="logout-button" type="button" class="profile-logout">Log out</button>
+            <button id="profile-cancel" type="button">Cancel</button>
             <button id="profile-submit" type="submit" class="btn-primary">Save changes</button>
           </div>
-        </form>
-      </div>
+        </div>
+      </form>
     </div>
   </div>
   <!-- About: which ShinyHub is this, and what can it run. Filled by
@@ -1385,7 +1410,7 @@
           </select>
           <p class="profile-hint">An expired token stops authenticating; create a new one to replace it.</p>
 
-          <p id="new-token-error" class="error" hidden></p>
+          <p id="new-token-error" class="error" role="alert" hidden></p>
 
           <div class="modal-actions">
             <button type="button" id="new-token-cancel">Cancel</button>
@@ -1398,7 +1423,7 @@
             Copy this token now. For security it is <strong>shown only once</strong> and cannot be retrieved again.
           </p>
           <div class="snippet">
-            <pre><code id="token-reveal-value"></code></pre>
+            <pre role="region" tabindex="0" aria-label="Created API token"><code id="token-reveal-value"></code></pre>
             <button type="button" id="token-reveal-copy" class="copy-btn"
                     aria-label="Copy token to clipboard">
               <span class="copy-label">Copy</span>
@@ -1446,7 +1471,7 @@
           <h3 id="new-user-success-heading" tabindex="-1">Invitation ready</h3>
           <p id="new-user-result-detail" class="profile-hint"></p>
           <p>Send this link privately to the intended person. Anyone with the link can create this account.</p>
-          <pre class="person-signin-details" id="new-user-snippet"></pre>
+          <pre role="region" tabindex="0" aria-label="Sign-in details" class="person-signin-details" id="new-user-snippet"></pre>
           <p class="profile-hint">Copy this link before closing. It works once. You can replace it from Pending invitations if you need a new link. No email is sent automatically.</p>
           <p id="new-user-snippet-status" role="status"></p>
           <div class="modal-actions">

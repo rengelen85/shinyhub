@@ -1,0 +1,19 @@
+[project]
+type = "python"
+
+[changelog]
+unconventional = "exclude"
+
+[checks]
+lint = true
+tests = true
+lint_command = "python3 -m compileall -q src && node --check src/shinyhub_bookmarks/www/bridge.js"
+test_command = "make -C ../.. test-py-bookmarks && npm --prefix ../.. test"
+
+[[version_files]]
+glob = "src/shinyhub_bookmarks/__init__.py"
+search = '__version__ = "{prev}"'
+replace = '__version__ = "{version}"'
+
+[verify]
+targets = ["tag", "pypi"]

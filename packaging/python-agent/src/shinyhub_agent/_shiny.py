@@ -152,6 +152,11 @@ def register(
         if chat is not None
         else None
     )
+    # These transport inputs can contain prompts and tool arguments. Shiny
+    # bookmarks serialize dot-prefixed inputs unless explicitly excluded.
+    for input_id in (REQUEST_INPUT, DISCOVER_INPUT, CHAT_INPUT, CHAT_DECISION_INPUT):
+        if input_id not in session.bookmark.exclude:
+            session.bookmark.exclude.append(input_id)
     setattr(session, REGISTRATION_MARKER, registry)
     tasks: set[asyncio.Task[Any]] = set()
     undo_updates: set[asyncio.Task[Any]] = set()

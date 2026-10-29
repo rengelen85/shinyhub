@@ -15,6 +15,8 @@ import { startVisiblePoll } from './visible-poll.js';
 
 const POLL_MS = 10000;
 const REQUEST_TIMEOUT_MS = 8000;
+// Keep navigation context only for this signed-in session, not across users.
+const overviewContexts = new WeakMap();
 
 export function mountOverview(ctx) {
   const view = document.getElementById('overview-view');
@@ -22,10 +24,15 @@ export function mountOverview(ctx) {
   view.hidden = false;
   ctx.updateActiveNav(location.pathname);
 
-  let selectedScope = 'all';
+  const savedContext = overviewContexts.get(ctx.state);
+  const sessionIdentity = ctx.state.sessionIdentity ?? ctx.state.user;
+  const sessionUserID = ctx.state.user?.id;
+  let returnContext = savedContext?.session === sessionIdentity && savedContext?.userID === sessionUserID ? savedContext : null;
+  let selectedScope = returnContext?.scope || 'all';
   let overviewSnapshot = null;
   let overviewStale = false;
   let overviewRetryPending = false;
+  let resourceRetryPending = false;
   let scopeNotice = '';
   const pendingRestarts = new Set();
   let disposed = false;
@@ -56,6 +63,11 @@ export function mountOverview(ctx) {
   // stop ends the liveness poll (on unmount or after a 401), so a logged-out or
   // navigated-away Overview never keeps fetching in the background.
   function stop() {
+    if (!disposed && overviewSnapshot && (ctx.state.sessionIdentity ?? ctx.state.user) === sessionIdentity
+      && ctx.state.user?.id === sessionUserID) overviewContexts.set(ctx.state, {
+      session: sessionIdentity, userID: sessionUserID, scope: selectedScope,
+      focusKey: focusedKey(body), disclosures: expandedDisclosureKeys(body),
+    });
     disposed = true;
     if (stopPoll) { stopPoll(); stopPoll = null; }
     for (const controller of pendingControllers) controller.abort();
@@ -63,6 +75,7 @@ export function mountOverview(ctx) {
   }
 
   body.replaceChildren(skeleton());
+  const initialScrollY = window.scrollY;
 
   function requestJSON(path) {
     return apiWithTimeout(ctx.api, path, REQUEST_TIMEOUT_MS, pendingControllers, async (response) => ({
@@ -75,6 +88,7 @@ export function mountOverview(ctx) {
     if (loadInFlight) return;
     loadInFlight = true;
     if (!initial) live.textContent = '';
+    const wasResourceRetry = resourceRetryPending;
     try {
       let apps = [];
       try {
@@ -108,32 +122,70 @@ export function mountOverview(ctx) {
         ? 'The selected fleet is no longer available. Showing all apps.' : '';
       selectedScope = workspace.selectedKey;
       const model = workspace.model;
+      const announceResourceRetry = wasResourceRetry || resourceRetryPending;
+      resourceRetryPending = false;
+      // Async navigation must not take focus back after the operator has
+      // started using another control or scrolling while readings load.
+      const canRestoreContextFocus = window.scrollY === initialScrollY
+        && (document.activeElement === document.body || document.activeElement === view.querySelector('h1'));
       replaceOverviewContent(body, render(workspace, activitySnapshot));
+      if (returnContext) {
+        restoreDisclosures(body, returnContext.disclosures);
+        revealFocusedRow(body, returnContext.focusKey);
+        if (returnContext.focusKey && canRestoreContextFocus) {
+          if (!restoreFocus(body, returnContext.focusKey)) restoreFocus(body, 'overview:scope');
+          // The skeleton can shrink the document before Back restores its
+          // scroll position. Keep the restored control visible once data lands.
+          if (body.contains(document.activeElement)) document.activeElement.scrollIntoView?.({ block: 'nearest' });
+        }
+        returnContext = null;
+      }
       if (scopeNotice) appendOverviewAnnouncement(live, scopeNotice);
       if (recovered) appendOverviewAnnouncement(live, 'Overview is current again.');
       const signature = resourceLiveSignature(model.resources);
       if (!initial && lastLiveSignature && signature !== lastLiveSignature) {
         appendOverviewAnnouncement(live, resourceLiveSummary(model.resources, lastLiveResources));
       }
+      if (announceResourceRetry) appendOverviewAnnouncement(live, ['stale', 'unavailable'].includes(model.resources.state)
+        ? 'Resource readings could not refresh. Retrying automatically every 10 seconds while this page is visible.'
+        : 'Resource readings refreshed.');
       lastLiveSignature = signature;
       lastLiveResources = model.resources;
     } finally {
       loadInFlight = false;
       overviewRetryPending = false;
+      resourceRetryPending = false;
+      const resourceRetry = body.querySelector('[data-focus-key="usage:retry"]');
+      if (resourceRetry) {
+        resourceRetry.removeAttribute('aria-disabled');
+        resourceRetry.textContent = 'Retry readings';
+        body.querySelector('.ov-resources')?.removeAttribute('aria-busy');
+      }
       const warning = body.querySelector('.ov-refresh-warning');
       if (warning) {
         warning.removeAttribute('aria-busy');
         const retry = warning.querySelector('button');
-        retry.disabled = false;
+        retry.removeAttribute('aria-disabled');
         retry.textContent = 'Retry';
       }
     }
   }
 
+  function retryResources() {
+    if (disposed) return;
+    resourceRetryPending = true;
+    const retry = body.querySelector('[data-focus-key="usage:retry"]');
+    // Keep the initiating control focusable while the guarded request runs.
+    // Native disabled buttons lose focus in Chrome before snapshot replacement.
+    if (retry) { retry.setAttribute('aria-disabled', 'true'); retry.textContent = 'Trying again…'; }
+    body.querySelector('.ov-resources')?.setAttribute('aria-busy', 'true');
+    if (!loadInFlight) void load(false);
+  }
+
   function showRefreshFailure(initial) {
     if (initial || !overviewSnapshot) { body.replaceChildren(errorState()); return; }
     const changed = !overviewStale;
-    const wasRetry = overviewRetryPending;
+    const wasRetry = overviewRetryPending || resourceRetryPending;
     overviewRetryPending = false;
     overviewStale = true;
     const { apps, metrics, history } = overviewSnapshot;
@@ -249,31 +301,33 @@ export function mountOverview(ctx) {
     replaceOverviewContent(body, render(workspace, activitySnapshot));
     restoreFocus(body, 'overview:scope');
     if (bringIntoView) body.querySelector('.ov-scope')?.scrollIntoView?.({ block: 'start' });
-    live.textContent = `${workspace.scopes.find((scope) => scope.key === selectedScope).label}. ${workspace.model.verdict.headline}. ${workspace.model.verdict.detail}`;
+    live.textContent = '';
+    appendOverviewAnnouncement(live, `${workspace.scopes.find((scope) => scope.key === selectedScope).label}. ${workspace.model.verdict.headline}. ${workspace.model.verdict.detail}`);
   }
 
   function render(workspace, activity) {
     const model = workspace.model;
     const root = el('div', 'ov-grid');
     if (overviewStale) {
-      model.verdict = { tone: 'warning', headline: 'Overview data is stale', detail: 'App health, fleet membership, and resources reflect the last successful update.' };
+      model.verdict = { tone: 'warning', headline: 'Overview data is stale', detail: 'App health, fleet membership, and resources reflect the last successful update.'
+        + (model.attention.length ? ` Last reported: ${model.attention.length} ${model.attention.length === 1 ? 'app needs' : 'apps need'} attention.` : '') };
       const notice = el('section', 'ov-panel ov-refresh-warning');
       notice.setAttribute('aria-label', 'Overview refresh status');
       notice.appendChild(el('p', null, 'Overview could not refresh. Showing the last successful update.'));
       const stamp = el('time', 'ov-res-scope', `Last updated ${new Date(overviewSnapshot.updatedAt).toLocaleTimeString()}`);
       stamp.dateTime = overviewSnapshot.updatedAt;
       const retry = el('button', 'ov-btn', overviewRetryPending ? 'Trying again…' : 'Retry');
-      retry.disabled = overviewRetryPending;
+      if (overviewRetryPending) retry.setAttribute('aria-disabled', 'true');
       notice.setAttribute('aria-busy', String(overviewRetryPending));
       retry.type = 'button';
       retry.dataset.focusKey = 'overview:retry';
       retry.addEventListener('click', () => {
-        if (loadInFlight) return;
+        if (retry.getAttribute('aria-disabled') === 'true') return;
         overviewRetryPending = true;
-        retry.disabled = true;
+        retry.setAttribute('aria-disabled', 'true');
         retry.textContent = 'Trying again…';
         notice.setAttribute('aria-busy', 'true');
-        void load(false);
+        if (!loadInFlight) void load(false);
       });
       notice.append(stamp, retry);
       root.appendChild(notice);
@@ -310,9 +364,20 @@ export function mountOverview(ctx) {
     wrap.appendChild(field);
     const selected = workspace.scopes.find((scope) => scope.key === workspace.selectedKey);
     const text = selected.key === 'all'
-      ? `${selected.total} ${selected.total === 1 ? 'app' : 'apps'} across the hub · ${workspace.fleetCount} named ${workspace.fleetCount === 1 ? 'fleet' : 'fleets'}`
+      ? `${selected.total} ${selected.total === 1 ? 'app' : 'apps'} across the hub${workspace.fleetCount ? ` · ${workspace.fleetCount} named ${workspace.fleetCount === 1 ? 'fleet' : 'fleets'}` : ''}`
       : `${selected.total} ${selected.total === 1 ? 'app' : 'apps'} · health and resources for ${selected.label}`;
     wrap.appendChild(el('p', 'ov-scope-summary', text));
+    if (canReadAudit) {
+      const recent = el('button', 'ov-res-toggle ov-recent-jump', 'Recent changes');
+      recent.type = 'button';
+      recent.dataset.focusKey = 'activity:jump';
+      recent.addEventListener('click', () => {
+        const heading = document.getElementById('ov-activity-title');
+        heading?.focus();
+        heading?.scrollIntoView?.({ block: 'start' });
+      });
+      wrap.appendChild(recent);
+    }
     return wrap;
   }
 
@@ -338,9 +403,9 @@ export function mountOverview(ctx) {
       row.appendChild(el('span', `ov-fleet-health ov-fleet-health--${overviewStale ? 'warning' : model.verdict.tone}`, overviewStale ? 'Last reported health · Stale' : model.verdict.headline));
       for (const metric of [model.resources.cpu, model.resources.memory]) {
         const value = el('span', 'ov-fleet-usage');
-        const unavailable = metric.state === 'unavailable';
+        const unavailable = metric.usage.state === 'unavailable';
         value.appendChild(el('b', null, model.resources.state === 'idle' ? '—' : unavailable ? 'Unavailable' : formatResource(metric.kind, metric.observedUsed)));
-        value.appendChild(el('span', null, `${metric.kind === 'cpu' ? 'CPU' : 'Memory'}${metric.state === 'partial' ? ' · Partial' : metric.state === 'stale' ? ' · Stale' : ''}`));
+        value.appendChild(el('span', null, `${metric.kind === 'cpu' ? 'CPU' : 'Memory'}${metric.usage.state === 'partial' ? ' · Partial' : metric.usage.state === 'stale' ? ' · Stale' : ''}`));
         row.appendChild(value);
       }
       list.appendChild(row);
@@ -359,22 +424,55 @@ export function mountOverview(ctx) {
     const vtext = el('div', 'ov-pulse-text');
     vtext.appendChild(el('p', 'ov-pulse-headline', model.verdict.headline));
     vtext.appendChild(el('p', 'ov-pulse-detail', model.verdict.detail));
+    const actions = el('div', 'ov-pulse-actions');
+    const addJump = (label, key, targetID) => {
+      const inspect = el('button', 'ov-btn ov-coverage-jump', label);
+      inspect.type = 'button';
+      inspect.dataset.focusKey = key;
+      inspect.addEventListener('click', () => {
+        const target = document.getElementById(targetID);
+        target?.focus();
+        target?.scrollIntoView({ block: 'center' });
+      });
+      actions.appendChild(inspect);
+    };
+    if (model.attention.length > 0) {
+      addJump(overviewStale ? 'Review last app issues' : 'Review app issues', 'attention:review', 'ov-attention-title');
+    }
+    const highUsage = [model.resources.cpu, model.resources.memory].some((metric) => ['critical', 'warning'].includes(metric.usage.severity));
+    if (highUsage && !['stale', 'unavailable'].includes(model.resources.state)) addJump('Review app usage', 'usage:review', 'ov-resources-title');
+    if (model.resources.hotspots.length > 0 && model.resources.state !== 'stale') {
+      addJump('Review pressure alerts', 'pressure:review', 'ov-pressure-title');
+    } else if (model.resources.state === 'stale') {
+      addJump('Review last readings', 'usage:review', 'ov-resources-title');
+    }
+    if (model.resources.state === 'partial' || model.resources.state === 'unavailable') {
+      addJump('Review resource coverage', 'coverage:review', 'ov-coverage-title');
+    }
+    if (actions.children.length) {
+      actions.firstElementChild.classList.add('ov-primary-response');
+      vtext.appendChild(actions);
+    }
     verdict.appendChild(vtext);
     sec.appendChild(verdict);
 
     const active = model.segments.filter((s) => s.count > 0);
     if (model.total > 0) {
-      const bar = el('div', 'ov-bar');
-      bar.setAttribute('role', 'img');
-      bar.setAttribute('aria-label',
-        active.map((s) => `${s.count} ${s.label.toLowerCase()}`).join(', '));
-      for (const seg of active) {
-        const s = el('span', 'ov-bar-seg');
-        s.style.flexGrow = String(seg.count);
-        s.style.setProperty('--seg', `var(${seg.cssVar})`);
-        bar.appendChild(s);
+      // A single status needs a count, not a full-width decorative bar.
+      // Mixed statuses retain the proportional overview at a quieter weight.
+      if (active.length > 1) {
+        const bar = el('div', 'ov-bar');
+        bar.setAttribute('role', 'img');
+        bar.setAttribute('aria-label',
+          active.map((s) => `${s.count} ${s.label.toLowerCase()}`).join(', '));
+        for (const seg of active) {
+          const s = el('span', 'ov-bar-seg');
+          s.style.flexGrow = String(seg.count);
+          s.style.setProperty('--seg', `var(${seg.cssVar})`);
+          bar.appendChild(s);
+        }
+        sec.appendChild(bar);
       }
-      sec.appendChild(bar);
 
       const legend = el('ul', 'ov-legend');
       for (const seg of active) {
@@ -394,7 +492,12 @@ export function mountOverview(ctx) {
   // ── Attention: actionable rows for crashed / degraded apps. ──
   function renderAttention(items) {
     const sec = el('section', 'ov-panel ov-attention');
-    sec.appendChild(sectionTitle('Needs attention', items.length));
+    const title = sectionTitle('Needs attention', items.length);
+    title.id = 'ov-attention-title';
+    title.tabIndex = -1;
+    title.dataset.focusKey = 'attention:heading';
+    sec.setAttribute('aria-labelledby', title.id);
+    sec.appendChild(title);
     const list = el('ul', 'ov-attn-list');
     for (const a of items) {
       const li = el('li', 'ov-attn-row');
@@ -472,7 +575,10 @@ export function mountOverview(ctx) {
   }
 
   function renderResources(res) {
-    return renderResourcePressure(res);
+    return renderResourcePressure(res, {
+      canManageApp: (app) => ctx.canManageApp(ctx.state.user, app),
+      onRetry: overviewStale ? null : retryResources, retryPending: resourceRetryPending,
+    });
   }
 
   // ── helpers ──
@@ -798,7 +904,7 @@ function safeDOMID(value) {
 
 // Exported as a small, state-complete renderer so its meter semantics and
 // unavailable/partial copy can be verified without mounting the whole SPA.
-export function renderResourcePressure(res) {
+export function renderResourcePressure(res, { canManageApp = () => false, onRetry = null, retryPending = false } = {}) {
   const sec = el('section', 'ov-panel ov-resources');
   sec.setAttribute('aria-labelledby', 'ov-resources-title');
 
@@ -806,21 +912,44 @@ export function renderResourcePressure(res) {
   const titleWrap = el('div', 'ov-res-heading');
   const title = el('h2', 'ov-section-title', panelTitle(res.scale, res.scope));
   title.id = 'ov-resources-title';
+  title.tabIndex = -1;
+  title.dataset.focusKey = 'usage:heading';
   titleWrap.appendChild(title);
-  titleWrap.appendChild(el('p', 'ov-res-scope', panelScope(res.scale, res.scope, res.cpu.scale !== res.memory.scale)));
+  titleWrap.appendChild(el('p', 'ov-res-scope', panelScope(res)));
   head.appendChild(titleWrap);
   head.appendChild(el('p', 'ov-res-updated', updatedText(res)));
   sec.appendChild(head);
+  if (res.state === 'stale' || res.state === 'unavailable') {
+    const recovery = el('div', 'ov-resource-retry');
+    recovery.appendChild(el('p', 'ov-capacity-basis', 'Retries every 10 seconds while this page is visible.'));
+    if (onRetry) {
+      const retry = el('button', 'ov-btn', retryPending ? 'Trying again…' : 'Retry readings');
+      retry.type = 'button';
+      if (retryPending) retry.setAttribute('aria-disabled', 'true');
+      retry.dataset.focusKey = 'usage:retry';
+      retry.addEventListener('click', () => { if (retry.getAttribute('aria-disabled') !== 'true') onRetry(); });
+      recovery.appendChild(retry);
+    }
+    if (retryPending) sec.setAttribute('aria-busy', 'true');
+    sec.appendChild(recovery);
+  }
 
   if (res.state === 'unavailable') {
     const unavailable = el('div', 'ov-res-message ov-res-message--unavailable');
     unavailable.appendChild(el('b', null, 'Metrics unavailable'));
     unavailable.appendChild(el('span', null, 'CPU and memory pressure could not be verified. Health status remains available above.'));
     sec.appendChild(unavailable);
+    const rows = el('div', 'ov-capacity-list');
+    rows.append(renderCapacityRow('CPU', res.cpu, res.runningReplicas), renderCapacityRow('Memory', res.memory, res.runningReplicas));
+    sec.append(rows, renderCapacityHelp(res));
+    sec.appendChild(renderCoverageGaps(res, canManageApp));
     return sec;
   }
   if (res.state === 'idle') {
     sec.appendChild(el('p', 'ov-res-message', 'No running replicas to measure.'));
+    const rows = el('div', 'ov-capacity-list');
+    rows.append(renderCapacityRow('CPU', res.cpu, 0), renderCapacityRow('Memory', res.memory, 0));
+    sec.append(rows, renderCapacityHelp(res));
     return sec;
   }
 
@@ -828,17 +957,23 @@ export function renderResourcePressure(res) {
   rows.appendChild(renderCapacityRow('CPU', res.cpu, res.runningReplicas));
   rows.appendChild(renderCapacityRow('Memory', res.memory, res.runningReplicas));
   sec.appendChild(rows);
+  sec.appendChild(renderCapacityHelp(res));
 
   // With no limits anywhere there are no per-replica thresholds to alert on, so
   // the panel answers the next question instead: which apps account for this.
   if (res.scale !== 'limits') {
+    if (res.state === 'stale' || res.cpu.gaps.length || res.memory.gaps.length) sec.appendChild(renderCoverageGaps(res, canManageApp));
     if (res.topConsumers) sec.appendChild(renderTopConsumers(res.topConsumers, res.scope));
     return sec;
   }
 
   if (res.hotspots.length > 0) {
     const hotspotHead = el('div', 'ov-hotspot-head');
-    hotspotHead.appendChild(el('h3', 'ov-res-subhead', 'Pressure alerts'));
+    const title = el('h3', 'ov-res-subhead', 'Pressure alerts');
+    title.id = 'ov-pressure-title';
+    title.tabIndex = -1;
+    title.dataset.focusKey = 'pressure:heading';
+    hotspotHead.appendChild(title);
     hotspotHead.appendChild(el('span', 'ov-section-count', String(res.hotspots.length)));
     sec.appendChild(hotspotHead);
     const list = el('ul', 'ov-hotspot-list');
@@ -866,13 +1001,8 @@ export function renderResourcePressure(res) {
       });
       sec.appendChild(toggle);
     }
-  } else {
-    const complete = res.cpu.state === 'ready' && res.memory.state === 'ready';
-    const text = complete
-      ? 'All covered replicas are below the CPU and memory warning thresholds.'
-      : `No pressure alerts among ${Math.max(res.cpu.coverage.coveredReplicas, res.memory.coverage.coveredReplicas)} of ${res.runningReplicas} covered running replicas.`;
-    sec.appendChild(el('p', 'ov-res-clear', text));
   }
+  if (res.state === 'stale' || res.cpu.gaps.length || res.memory.gaps.length) sec.appendChild(renderCoverageGaps(res, canManageApp));
   return sec;
 }
 
@@ -884,53 +1014,228 @@ export function replaceOverviewContent(body, next) {
   const disclosures = expandedDisclosureKeys(body);
   body.replaceChildren(next);
   restoreDisclosures(body, disclosures);
+  revealFocusedRow(body, focusKey);
   if (!restoreFocus(body, focusKey) && focusKey && focusKey.startsWith('activity:')) {
     restoreFocus(body, 'activity:heading');
+  } else if (focusKey === 'usage:retry' && !body.contains(document.activeElement)) {
+    if (!restoreFocus(body, 'overview:retry')) restoreFocus(body, 'usage:heading');
   } else if (focusKey && !body.contains(document.activeElement)) {
     restoreFocus(body, 'overview:scope');
   }
 }
 
-function renderCapacityRow(label, metric, runningReplicas) {
-  const row = el('section', 'ov-capacity-row ov-capacity-row--' + metric.severity);
-  row.setAttribute('aria-label', `${label} ${metric.scale === 'limits' ? 'allocation pressure' : 'usage'}`);
+function revealFocusedRow(body, focusKey) {
+  // A new higher-priority gap can push the focused row into the overflow.
+  // Keep that still-present action visible before restoring its focus.
+  if (focusKey?.startsWith('coverage') || focusKey?.startsWith('pressure:')) {
+    const target = [...body.querySelectorAll('[data-focus-key]')].find((node) => node.dataset.focusKey === focusKey);
+    if (target?.closest('.ov-coverage-row[hidden]')) {
+      body.querySelector('[data-disclosure-key="coverage-gaps"]')?.click();
+    }
+    if (target?.closest('.ov-hotspot-row[hidden]')) {
+      body.querySelector('[data-disclosure-key="pressure-alerts"]')?.click();
+    }
+  }
+}
 
+function renderCapacityRow(label, metric, runningReplicas) {
+  const usage = metric.usage;
+  const row = el('section', 'ov-capacity-row ov-capacity-row--' + usage.severity);
+  row.setAttribute('aria-label', `${label} app usage and capacity`);
   const top = el('div', 'ov-capacity-top');
-  top.appendChild(el('h3', 'ov-capacity-label', label));
-  top.appendChild(el('span', 'ov-pressure-state ov-pressure-state--' + stateTone(metric), stateLabel(metric)));
+  top.appendChild(el('h3', 'ov-capacity-label', label === 'Memory' ? 'Memory (RSS)' : label));
+  const status = usage.state === 'idle' ? 'Idle' : usage.state === 'unavailable' ? 'Unavailable' : usage.state === 'stale' ? 'Stale'
+    : usage.state === 'partial' ? (usage.severity === 'critical' ? 'Near capacity · Partial' : usage.severity === 'warning' ? 'High usage · Partial' : 'Partial reporting')
+      : usage.severity === 'critical' ? 'Near capacity' : usage.severity === 'warning' ? 'High app usage' : 'Live';
+  top.appendChild(el('span', 'ov-pressure-state ov-pressure-state--' + (usage.state === 'ready' && usage.severity === 'normal' ? 'live' : stateTone(usage)), status));
   row.appendChild(top);
 
-  const values = el('div', 'ov-capacity-values');
-  values.appendChild(el('b', 'ov-capacity-value', capacityValue(metric)));
-  const context = el('span', 'ov-capacity-context');
-  // A percentage needs a denominator. Without one the value beside it already
-  // says everything that is known, so nothing stands in for the missing share.
-  if (metric.fraction != null) context.appendChild(el('strong', null, `${Math.round(metric.fraction * 100)}% of ${metric.scale === 'host' ? 'host' : 'limits'}`));
-  if (metric.peakFraction != null && metric.fraction != null && metric.peakFraction - metric.fraction >= 0.05) {
-    context.appendChild(el('span', 'ov-capacity-peak', `Peak replica ${Math.round(metric.peakFraction * 100)}%`));
-  }
-  context.appendChild(el('span', null, trendText(metric.trend, metric.kind)));
-  values.appendChild(context);
+  const values = el('dl', 'ov-resource-values');
+  const measured = el('div');
+  measured.appendChild(el('dt', null, usage.state === 'stale' ? 'Last reported app usage' : 'Measured app usage'));
+  measured.appendChild(el('dd', 'ov-capacity-value', usage.state === 'idle' ? '—' : usage.state === 'unavailable' ? 'Unavailable' : formatResource(metric.kind, usage.used)));
+  values.appendChild(measured);
+  const capacity = el('div');
+  capacity.appendChild(el('dt', null, capacitySourceLabel(metric.hostCapacity?.source)));
+  capacity.appendChild(el('dd', 'ov-capacity-value', metric.hostCapacity ? formatResource(metric.kind, metric.hostCapacity.value) : 'Unknown'));
+  values.appendChild(capacity);
   row.appendChild(values);
 
-  if (metric.fraction != null) {
+  if (usage.fraction != null) {
     const meter = document.createElement('meter');
-    if (metric.kind === 'cpu') updateCPUMeter(meter, metric.fraction, meterLabel(label, metric, runningReplicas));
+    const meterText = `${label} reported app usage, ${percentage(usage.fraction)} of ${capacitySourceLabel(metric.hostCapacity?.source).toLowerCase()}; ${usage.coverage.observedReplicas} of ${runningReplicas} replicas reporting`;
+    if (metric.kind === 'cpu') updateCPUMeter(meter, usage.fraction, meterText);
     else {
-      meter.className = 'ov-capacity-meter ov-capacity-meter--' + metric.severity;
+      meter.className = 'ov-capacity-meter ov-capacity-meter--' + usage.severity;
       meter.min = 0;
       meter.max = 1;
       meter.low = 0.85;
       meter.high = 0.95;
       meter.optimum = 0;
-      meter.value = Math.min(1, Math.max(0, metric.fraction));
-      meter.setAttribute('aria-label', meterLabel(label, metric, runningReplicas));
-      meter.textContent = `${Math.round(metric.fraction * 100)}%`;
+      meter.value = Math.min(1, Math.max(0, usage.fraction));
+      meter.setAttribute('aria-label', meterText);
     }
     row.appendChild(meter);
   }
-  row.appendChild(el('p', 'ov-capacity-coverage', coverageText(metric, runningReplicas)));
+  const reporting = runningReplicas === 0 ? 'No running replicas' : `${metric.coverage.observedReplicas} of ${runningReplicas} replicas reporting`;
+  row.appendChild(el('p', 'ov-capacity-coverage', `${reporting}${usage.fraction != null ? ` · ${percentage(usage.fraction)} of capacity` : ''}`));
+  if (usage.state === 'ready') row.appendChild(el('p', 'ov-capacity-basis', trendText(usage.trend, metric.kind)));
+  if (metric.scale === 'limits') {
+    const checks = el('div', 'ov-limit-summary');
+    checks.appendChild(el('b', null, 'App-limit checks'));
+    checks.appendChild(el('span', null, `${metric.coverage.coveredReplicas} of ${runningReplicas} replicas checked`));
+    if (metric.capacity > 0) {
+      checks.appendChild(el('span', 'ov-limit-values', `${capacityValue(metric)} · ${percentage(metric.fraction)} of combined app limits`));
+    }
+    row.appendChild(checks);
+  }
+  if (metric.kind === 'memory') row.appendChild(el('p', 'ov-capacity-basis ov-memory-definition', 'RSS is memory held in RAM by reporting apps.'));
   return row;
+}
+
+function percentage(fraction) {
+  return fraction > 0 && fraction < 0.01 ? '<1%' : `${Math.round(fraction * 100)}%`;
+}
+
+function capacitySourceLabel(source) {
+  if (source === 'cgroup-limit' || source === 'cgroup-quota' || source === 'cgroup-cpuset') return 'Container / service capacity';
+  if (source === 'config') return 'Configured capacity';
+  if (source === 'host-total') return 'Host capacity · OS total';
+  if (source === 'affinity') return 'Available CPU cores';
+  return 'Host capacity';
+}
+
+function disclosure(label, key, content) {
+  const wrap = el('div', 'ov-resource-disclosure');
+  const toggle = el('button', 'ov-res-toggle', label);
+  toggle.classList.add('ov-disclosure-toggle');
+  toggle.appendChild(activityIcon('chevron'));
+  toggle.type = 'button';
+  toggle.dataset.disclosureKey = key;
+  toggle.dataset.focusKey = key;
+  toggle.setAttribute('aria-expanded', 'false');
+  content.id = `ov-details-${encodeURIComponent(key)}`;
+  content.hidden = true;
+  toggle.setAttribute('aria-controls', content.id);
+  toggle.addEventListener('click', () => {
+    const expanded = toggle.getAttribute('aria-expanded') === 'true';
+    toggle.setAttribute('aria-expanded', String(!expanded));
+    content.hidden = expanded;
+  });
+  wrap.append(toggle, content);
+  return wrap;
+}
+
+function documentationLink(label, href, focusKey) {
+  const link = el('a', 'ov-resource-help-link', label);
+  link.href = href;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.dataset.focusKey = focusKey;
+  link.setAttribute('aria-label', `${label} (opens in a new tab)`);
+  return link;
+}
+
+function renderCapacityHelp(res) {
+  const help = el('div', 'ov-resource-help');
+  help.appendChild(el('p', null, 'Capacity is the host total, a container or service allowance, or a configured budget. It is not free memory or idle CPU. Usage includes reporting apps in this view; other host processes are not measured. Memory sums RSS and may count shared pages more than once.'));
+  for (const metric of [res.cpu, res.memory]) {
+    const source = metric.hostCapacity?.source;
+    const resource = metric.kind === 'cpu' ? 'CPU' : 'Memory';
+    const text = !metric.hostCapacity ? `${resource} capacity could not be detected. Check the ShinyHub startup log.`
+      : source === 'config' ? `${resource} capacity comes from server.host_capacity_${metric.kind === 'cpu' ? 'cores' : 'memory_mb'}.`
+        : source?.startsWith('cgroup-') ? `${resource} capacity is restricted by a container or service. Ask the host administrator to check its resource settings if this is lower than expected. Physical machine capacity is not reported separately here.`
+          : `${resource} capacity is ${source === 'host-total' ? 'the total reported by the operating system' : source === 'affinity' ? 'the CPU cores this process may run on' : 'reported by the server'}.`;
+    help.appendChild(el('p', null, text));
+  }
+  help.appendChild(documentationLink('Host capacity guide', 'https://shinyhub.dev/configuration/#host-capacity', 'capacity:guide'));
+  return disclosure('How capacity is measured', 'capacity:help', help);
+}
+
+function renderCoverageGaps(res, canManageApp) {
+  const section = el('section', 'ov-coverage');
+  const title = el('h3', 'ov-res-subhead', 'Resource coverage');
+  title.id = 'ov-coverage-title';
+  title.tabIndex = -1;
+  title.dataset.focusKey = 'coverage:heading';
+  section.appendChild(title);
+  const groups = new Map();
+  for (const metric of [res.cpu, res.memory]) {
+    for (const gap of metric.gaps || []) {
+      // Group by action identity, never by the changing count or replica index.
+      const key = `${gap.slug}:${gap.reason}`;
+      if (!groups.has(key)) groups.set(key, { ...gap, key, counts: [] });
+      groups.get(key).counts.push(`${metric.kind === 'cpu' ? 'CPU' : 'Memory'}: ${gap.replicas} ${gap.replicas === 1 ? 'replica' : 'replicas'}`);
+    }
+  }
+  if (!groups.size) {
+    section.appendChild(el('p', 'ov-capacity-basis', 'Live metrics could not be loaded. Check the ShinyHub service logs and connection. This page retries automatically.'));
+    return section;
+  }
+  section.appendChild(el('p', 'ov-capacity-basis', res.state === 'stale'
+    ? 'Last reported gaps. Live metrics are being retried.'
+    : [...groups.values()].every((gap) => gap.reason === 'unlimited')
+      ? 'All replicas are reporting. Setting app limits is optional.'
+      : 'Measurement gaps and app-limit checks.'));
+  const reasons = {
+    metrics: ['No measurement', 'Inspect the app’s replica health and recent worker logs. Check the ShinyHub service logs if several apps stop reporting. This page retries automatically.'],
+    unlimited: ['No limit set · optional', 'Usage is still included above when this replica reports. Set a limit in app configuration only if you want to check this replica against an enforced allocation.'],
+    unenforced: ['Limit not enforced · host action', 'Ask the host administrator to inspect runtime support and the ShinyHub startup warnings. Native Linux limits require cgroup v2 with the relevant controllers delegated to the service. Under systemd, check Delegate=cpu memory pids. Changing the limit alone cannot enable missing controllers.'],
+    unknown: ['Limit status unknown', 'Inspect the app’s replica health and resource settings. Check worker connectivity and the ShinyHub service logs to confirm the effective limit and whether it is enforced.'],
+  };
+  const list = el('ul', 'ov-coverage-list');
+  list.id = 'ov-coverage-gaps';
+  // Prioritize missing measurements and ineffective protection before optional limits.
+  const rank = { metrics: 0, unenforced: 1, unknown: 2, unlimited: 3 };
+  const ordered = [...groups.values()].sort((a, b) => rank[a.reason] - rank[b.reason] || a.name.localeCompare(b.name));
+  for (const [index, gap] of ordered.entries()) {
+    const row = el('li', 'ov-coverage-row');
+    if (index >= 4) row.hidden = true;
+    const main = el('div', 'ov-coverage-main');
+    main.appendChild(el('b', null, gap.name));
+    const [reason, baseAdvice] = reasons[gap.reason];
+    const advice = gap.reason === 'unlimited' && !canManageApp(gap.app)
+      ? 'Usage is still included above when this replica reports. Ask an app manager to set a limit if you want to check this replica against an enforced allocation.' : baseAdvice;
+    main.appendChild(el('p', 'ov-capacity-basis', reason));
+    main.appendChild(el('p', 'ov-coverage-counts', gap.counts.join(' · ')));
+    row.appendChild(main);
+    const actions = el('div', 'ov-coverage-actions');
+    const configure = ['unlimited', 'unknown'].includes(gap.reason) && canManageApp(gap.app);
+    if (gap.reason !== 'unenforced') {
+      const link = el('a', 'ov-btn', configure ? 'Review settings' : 'Inspect app');
+      link.href = `/apps/${encodeURIComponent(gap.slug)}${configure ? '/configuration' : ''}`;
+      link.setAttribute('data-nav', '');
+      link.setAttribute('aria-label', `${link.textContent} for ${gap.name}`);
+      link.dataset.focusKey = `coverage:${gap.key}`;
+      actions.appendChild(link);
+    }
+    const help = el('div', 'ov-resource-help');
+    help.appendChild(el('p', null, advice));
+    if (gap.reason === 'unenforced') help.appendChild(documentationLink('Resource enforcement guide', 'https://shinyhub.dev/scaling/#native-mode-under-systemd-requires-delegate', `coverage-guide:${gap.key}`));
+    const details = disclosure(gap.reason === 'unenforced' ? 'How to enable' : 'Details', `coverage-help:${gap.key}`, help);
+    details.querySelector('button').setAttribute('aria-label', `${gap.reason === 'unenforced' ? 'How to enable limits' : 'Coverage details'} for ${gap.name}`);
+    // Put the disclosure button with the actions, its content across the full row.
+    actions.appendChild(details.firstElementChild);
+    row.append(actions, help);
+    list.appendChild(row);
+  }
+  section.appendChild(list);
+  if (groups.size > 4) {
+    const toggle = el('button', 'ov-res-toggle', `View all ${groups.size} coverage gaps`);
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-controls', list.id);
+    toggle.dataset.disclosureKey = 'coverage-gaps';
+    toggle.dataset.focusKey = 'coverage:toggle';
+    toggle.addEventListener('click', () => {
+      const expanded = toggle.getAttribute('aria-expanded') === 'true';
+      toggle.setAttribute('aria-expanded', String(!expanded));
+      for (const [index, row] of [...list.children].entries()) if (index >= 4) row.hidden = expanded;
+      toggle.textContent = expanded ? `View all ${groups.size} coverage gaps` : 'Show fewer';
+    });
+    section.appendChild(toggle);
+  }
+  return section;
 }
 
 // renderTopConsumers attributes fleet usage to the apps behind it. It replaces
@@ -947,12 +1252,14 @@ function renderTopConsumers(top, scope = { key: 'all', label: 'All apps' }) {
   for (const item of top.items) {
     const li = el('li', 'ov-consumer-row');
     const link = el('a', 'ov-hotspot-name', item.name);
-    link.href = '/apps/' + encodeURIComponent(item.slug) + '/configuration';
+    link.href = '/apps/' + encodeURIComponent(item.slug);
+    link.setAttribute('aria-label', `${item.name} Inspect app usage`);
+    link.appendChild(el('span', 'ov-resource-link-hint', 'Inspect app'));
     link.setAttribute('data-nav', '');
     link.dataset.focusKey = `consumer:${item.slug}:${top.kind}`;
     const main = el('div', 'ov-consumer-main');
     main.appendChild(link);
-    if (scope.key === 'all') main.appendChild(el('span', 'ov-fleet-meta', item.fleetID ? `Fleet · ${item.fleetID}` : 'Outside fleets'));
+    if (scope.key === 'all' && item.fleetID) main.appendChild(el('span', 'ov-fleet-meta', `Fleet · ${item.fleetID}`));
     li.appendChild(main);
 
     const share = el('span', 'ov-consumer-share');
@@ -974,26 +1281,28 @@ function renderTopConsumers(top, scope = { key: 'all', label: 'All apps' }) {
 }
 
 function panelTitle(scale, scope) {
-  if (scale === 'limits') return 'App allocation pressure';
-  if (!scope || scope.key === 'all') return 'Hub resource usage';
+  if (!scope || scope.key === 'all') return 'App resource usage';
   return scope.key.startsWith('fleet:') ? 'Fleet resource usage' : 'App resource usage';
 }
 
 // The scope line says what the numbers are measured against, and on a fleet
 // with no limits it also says why the panel is answering a different question.
-function panelScope(scale, scope, mixed = false) {
-  const prefix = scope && scope.key !== 'all' ? `${scope.label} · ` : 'All apps · ';
-  if (mixed) return `${prefix}each resource shows its own capacity basis`;
-  if (scale === 'limits') return `${prefix}against enforced per-replica limits`;
-  if (scale === 'host') return `${prefix}app usage against shared host capacity`;
-  return `${prefix}measured app usage · host capacity unknown`;
+function panelScope(res) {
+  const { scope } = res;
+  const prefix = scope && scope.key !== 'all' ? scope.label : 'All apps';
+  const sources = [res.cpu.hostCapacity?.source, res.memory.hostCapacity?.source];
+  const capacity = sources.every((source) => source?.startsWith('cgroup-')) ? 'container / service capacity'
+    : sources.every((source) => source === 'config') ? 'configured capacity' : 'available capacity';
+  return `${prefix} · app usage against ${capacity}. Other host processes are not included.`;
 }
 
 function renderHotspot(item) {
   const li = el('li', 'ov-hotspot-row');
   const main = el('div', 'ov-hotspot-main');
   const link = el('a', 'ov-hotspot-name', item.name);
-  link.href = '/apps/' + encodeURIComponent(item.slug) + '/configuration';
+  link.href = '/apps/' + encodeURIComponent(item.slug);
+  link.setAttribute('aria-label', `${item.name} Inspect app ${item.metric === 'cpu' ? 'CPU' : 'memory'} pressure`);
+  link.appendChild(el('span', 'ov-resource-link-hint', 'Inspect app'));
   link.setAttribute('data-nav', '');
   link.dataset.focusKey = `pressure:${item.slug}:${item.metric}`;
   main.appendChild(link);
@@ -1052,41 +1361,6 @@ function stateTone(metric) {
   return metric.severity;
 }
 
-function stateLabel(metric) {
-  if (metric.state === 'unavailable') return 'Unavailable';
-  if (metric.state === 'stale') return 'Stale';
-  if (metric.state === 'partial') {
-    if (metric.severity === 'critical' || metric.severity === 'warning') return `${titleCase(metric.severity)} · Partial`;
-    return 'Partial';
-  }
-  if (metric.scale === 'none') return 'Live';
-  return titleCase(metric.severity === 'unknown' ? 'Unavailable' : metric.severity);
-}
-
-/**
- * coverageText says how much of the fleet the row's number actually covers.
- * What counts as covered depends on the scale: against enforced limits it is
- * the replicas that have one, and against the host (or against nothing) it is
- * the replicas that are reporting, since an unlimited replica is fully measured
- * on those scales.
- */
-function coverageText(metric, runningReplicas) {
-  const c = metric.coverage;
-  if (metric.scale !== 'limits') {
-    const total = runningReplicas ?? c.runningReplicas;
-    if (c.observedReplicas === total) {
-      return `Across ${total} running ${total === 1 ? 'replica' : 'replicas'}`;
-    }
-    return `${c.observedReplicas} of ${total} running replicas reporting`;
-  }
-  const parts = [`${c.coveredReplicas} of ${c.runningReplicas} running replicas covered`];
-  if (c.unlimitedReplicas) parts.push(`${c.unlimitedReplicas} unlimited`);
-  if (c.unenforcedReplicas) parts.push(`${c.unenforcedReplicas} not enforced`);
-  if (c.unknownCapacityReplicas) parts.push(`${c.unknownCapacityReplicas} capacity unknown`);
-  if (c.unavailableReplicas) parts.push(`${c.unavailableReplicas} metrics unavailable`);
-  return parts.join(' · ');
-}
-
 /**
  * trendText renders the direction in whichever unit the trend was measured in:
  * percentage points where there is a denominator, and the quantity itself where
@@ -1102,13 +1376,6 @@ function trendText(trend, kind) {
     ? `${Math.abs(Math.round(trend.deltaFraction * 100))} pts`
     : formatResource(kind, Math.abs(trend.deltaValue));
   return `${titleCase(trend.state)} ${delta} / ${window}`;
-}
-
-function meterLabel(label, metric, runningReplicas) {
-  const peak = metric.peakFraction != null && metric.peakFraction - metric.fraction >= 0.05
-    ? ` Hottest replica is ${Math.round(metric.peakFraction * 100)} percent.` : '';
-  const against = metric.scale === 'limits' ? 'enforced limits' : 'host capacity';
-  return `${label} allocation, ${Math.round(metric.fraction * 100)} percent of ${against}.${peak} ${stateLabel(metric).toLowerCase()}. ${coverageText(metric, runningReplicas)}.`;
 }
 
 function hotspotLabel(item) {
@@ -1192,7 +1459,9 @@ export function appendOverviewAnnouncement(live, message) {
 export function resourceLiveSignature(res) {
   const hotspots = res.hotspots.map((item) =>
     `${item.slug}:${item.metric}:${item.replicaIndex ?? 'x'}:${item.severity}`).sort().join(',');
-  return [res.state, res.cpu.state, res.cpu.severity, res.memory.state, res.memory.severity, hotspots].join(':');
+  const usage = [res.cpu, res.memory].map((metric) => `${metric.usage.state}:${metric.usage.severity}`).join(':');
+  const gaps = [res.cpu, res.memory].flatMap((metric) => metric.gaps.map((gap) => `${metric.kind}:${gap.slug}:${gap.reason}:${gap.replicas}`)).sort().join(',');
+  return [res.state, res.cpu.state, res.cpu.severity, res.memory.state, res.memory.severity, usage, gaps, hotspots].join(':');
 }
 
 export function resourceLiveSummary(res, previous = null) {
@@ -1203,7 +1472,9 @@ export function resourceLiveSummary(res, previous = null) {
     if (changed.cleared) return `Resource pressure cleared: ${hotspotDescription(changed.item)}.`;
     return `Resource pressure alert: ${hotspotDescription(changed.item)}.`;
   }
-  return `Resource coverage is ${res.state}. CPU ${stateLabel(res.cpu)}. Memory ${stateLabel(res.memory)}.`;
+  const highUsage = [res.memory, res.cpu].find((metric) => ['critical', 'warning'].includes(metric.usage.severity));
+  if (highUsage) return `Reported app ${highUsage.kind} usage is ${percentage(highUsage.usage.fraction)} of available capacity.`;
+  return `Resource coverage is ${res.state}. CPU: ${res.cpu.coverage.observedReplicas} of ${res.runningReplicas} replicas reporting. Memory: ${res.memory.coverage.observedReplicas} of ${res.runningReplicas} replicas reporting.`;
 }
 
 function changedHotspot(current, prior) {

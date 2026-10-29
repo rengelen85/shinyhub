@@ -39,6 +39,84 @@ async function eventually(predicate) {
   assert.fail('overview did not settle');
 }
 
+test('returning from app inspection restores fleet, disclosures and focus only for the same session', async () => {
+  setup();
+  const user = { id: 1 };
+  const ctx = {
+    state: { user, sessionIdentity: {}, apps: [], canReadAudit: false },
+    updateActiveNav() {}, syncSidebar() {}, onUnauthorized() {}, canManageApp() { return false; },
+    api: async (path) => ({ ok: true, status: 200, json: async () => path === '/api/apps' ? { items: apps }
+      : path === '/api/apps/metrics' ? metrics : { history: {} } }),
+  };
+  mounted = mountOverview(ctx);
+  await eventually(() => document.querySelector('#ov-scope-select'));
+  const select = document.querySelector('#ov-scope-select');
+  select.value = 'fleet:prod'; select.dispatchEvent(new dom.window.Event('change'));
+  document.querySelector('[data-disclosure-key="capacity:help"]').click();
+  document.querySelector('[data-focus-key="consumer:a:memory"]').focus();
+  mounted.unmount();
+  ctx.state.user = { id: 1 }; // A capability renewal replaces the user object.
+  mounted = mountOverview(ctx);
+  await eventually(() => document.querySelector('#ov-scope-select'));
+  assert.equal(document.querySelector('#ov-scope-select').value, 'fleet:prod');
+  assert.equal(document.querySelector('[data-disclosure-key="capacity:help"]').getAttribute('aria-expanded'), 'true');
+  assert.equal(document.activeElement.dataset.focusKey, 'consumer:a:memory');
+  mounted.unmount();
+  ctx.state.sessionIdentity = {}; // A new login for the same account is new context.
+  mounted = mountOverview(ctx);
+  await eventually(() => document.querySelector('#ov-scope-select'));
+  assert.equal(document.querySelector('#ov-scope-select').value, 'all');
+  const again = document.querySelector('#ov-scope-select');
+  again.value = 'fleet:prod'; again.dispatchEvent(new dom.window.Event('change'));
+  // Authentication can change before the old route's cleanup runs.
+  ctx.state.sessionIdentity = {};
+  ctx.state.user = { id: 2 };
+  mounted.unmount();
+  mounted = mountOverview(ctx);
+  await eventually(() => document.querySelector('#ov-scope-select'));
+  assert.equal(document.querySelector('#ov-scope-select').value, 'all');
+  assert.equal(document.querySelector('[data-disclosure-key="capacity:help"]').getAttribute('aria-expanded'), 'false');
+});
+
+for (const interaction of ['focus', 'scroll']) {
+  test(`return context respects ${interaction} changes during async loading`, async () => {
+    setup();
+    document.getElementById('overview-view').insertAdjacentHTML('afterbegin', '<h1 tabindex="-1">Overview</h1>');
+    document.body.insertAdjacentHTML('afterbegin', '<button id="sidebar-control">Apps</button>');
+    let release;
+    let pending = null;
+    const ctx = {
+      state: { user: { id: 1 }, sessionIdentity: {}, apps: [], canReadAudit: false },
+      updateActiveNav() {}, syncSidebar() {}, onUnauthorized() {}, canManageApp() { return false; },
+      api: async (path) => {
+        if (path === '/api/apps' && pending) await pending;
+        return { ok: true, status: 200, json: async () => path === '/api/apps' ? { items: apps }
+          : path === '/api/apps/metrics' ? metrics : { history: {} } };
+      },
+    };
+    mounted = mountOverview(ctx);
+    await eventually(() => document.querySelector('#ov-scope-select'));
+    const select = document.querySelector('#ov-scope-select');
+    select.value = 'fleet:prod'; select.dispatchEvent(new dom.window.Event('change'));
+    document.querySelector('[data-focus-key="capacity:help"]').click();
+    document.querySelector('[data-focus-key="consumer:a:memory"]').focus();
+    mounted.unmount();
+    pending = new Promise((resolve) => { release = resolve; });
+    mounted = mountOverview(ctx);
+    const heading = document.querySelector('h1');
+    heading.focus(); // The router's normal mount behavior.
+    const expected = interaction === 'focus' ? document.getElementById('sidebar-control') : heading;
+    if (interaction === 'focus') expected.focus();
+    else window.scrollY = 120;
+    release();
+    await eventually(() => document.querySelector('#ov-scope-select'));
+    assert.equal(document.activeElement, expected);
+    assert.equal(window.scrollY, interaction === 'scroll' ? 120 : 0);
+    assert.equal(document.querySelector('#ov-scope-select').value, 'fleet:prod');
+    assert.equal(document.querySelector('[data-focus-key="capacity:help"]').getAttribute('aria-expanded'), 'true');
+  });
+}
+
 test('named fleet selection recomputes health, usage, app shares and limit capacity', () => {
   const hub = buildOverviewWorkspace(apps, metrics);
   assert.equal(hub.fleetCount, 2);
@@ -72,14 +150,33 @@ test('fleet rendering identifies the share denominator and partial coverage with
   const panel = renderResourcePressure(prod.model.resources);
   assert.match(panel.textContent, /Fleet · prod/);
   assert.match(panel.textContent, /75% of measured usage/);
-  assert.match(panel.textContent, /shared host capacity/);
+  assert.match(panel.textContent, /available capacity/);
   assert.doesNotMatch(panel.textContent, /Delta|staging|of fleet/);
   assert.match(panel.querySelector('.ov-consumer-share').getAttribute('aria-label'), /measured memory usage in Fleet · prod/);
   const partial = structuredClone(metrics);
   partial.metrics.b.replicas.push({ ...replica(100), index: 1, metrics_available: false });
   const incomplete = renderResourcePressure(buildOverviewWorkspace(apps, partial, {}, 'fleet:prod').model.resources);
   assert.match(incomplete.textContent, /Partial reporting/);
-  assert.match(incomplete.textContent, /2 of 3 running replicas reporting/);
+  assert.match(incomplete.textContent, /2 of 3 replicas reporting/);
+});
+
+test('fleet summary shows measured usage when only unlimited replicas report', async () => {
+  setup();
+  const mixed = structuredClone(metrics);
+  mixed.metrics.a.replicas.push({ ...replica(0), index: 1, metrics_available: false,
+    effective_memory_limit_mb: 512, memory_limit_enforced: true, resource_enforcement_known: true });
+  mounted = mountOverview({
+    state: { apps: [], user: {}, canReadAudit: false },
+    updateActiveNav() {}, syncSidebar() {}, onUnauthorized() {}, canManageApp() { return false; },
+    async api(path) {
+      const body = path === '/api/apps' ? { items: apps }
+        : path === '/api/apps/metrics' ? mixed : { history: {} };
+      return { ok: true, status: 200, json: async () => body };
+    },
+  });
+  await eventually(() => document.querySelector('.ov-fleet-row'));
+  const prod = document.querySelector('[data-focus-key="overview:fleet:prod"]').closest('.ov-fleet-row');
+  assert.match(prod.querySelectorAll('.ov-fleet-usage')[1].textContent, /400 MBMemory · Partial/);
 });
 
 test('changing scope updates the mounted view immediately, preserves focus and keeps sidebar apps global', async () => {

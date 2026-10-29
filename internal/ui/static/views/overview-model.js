@@ -138,11 +138,6 @@ export function buildOverviewWorkspace(apps, metrics, history = {}, selectedKey 
   function modelFor(scope) {
     const model = buildOverviewModel(scope.apps, metrics, history);
     model.resources.scope = { key: scope.key, label: scope.label };
-    // A selected fleet's usage is a contribution to shared host capacity,
-    // rather than a measurement of everything occupying the host.
-    if (scope.key !== 'all' && model.verdict.headline.startsWith('Host ')) {
-      model.verdict.headline = 'Selected apps are nearing host capacity';
-    }
     return model;
   }
   return {
@@ -217,6 +212,11 @@ function buildResources(apps, metricsState, historyInput) {
   applyHostScale(memory, hostCapacityFor(metricsState.host, 'memory'), runningReplicas, metricsState.state);
   cpu.trend = trendFor(cpu, historyInput);
   memory.trend = trendFor(memory, historyInput);
+  // Keep total measured usage independent of allocation checks. A replica
+  // without a limit still consumes host capacity and must remain visible.
+  for (const metric of [cpu, memory]) {
+    metric.usage = usageFor(metric, metricsState.state, historyInput);
+  }
 
   hotspots.sort((a, b) => {
     const severity = { critical: 2, warning: 1 };
@@ -227,8 +227,9 @@ function buildResources(apps, metricsState, historyInput) {
   if (runningReplicas === 0) state = 'idle';
   else if (metricsState.state === 'unavailable') state = 'unavailable';
   else if (metricsState.state === 'stale') state = 'stale';
-  else if (cpu.state === 'unavailable' && memory.state === 'unavailable') state = 'unavailable';
-  else if (cpu.state !== 'ready' || memory.state !== 'ready') state = 'partial';
+  else if (cpu.usage.state === 'unavailable' && memory.usage.state === 'unavailable') state = 'unavailable';
+  else if ([cpu, memory].some((metric) => metric.usage.state !== 'ready'
+    || metric.gaps.some((gap) => gap.reason !== 'unlimited'))) state = 'partial';
 
   // The panel's scale is the strongest denominator any row has: one row on
   // enforced limits still makes this an allocation-pressure panel.
@@ -256,6 +257,30 @@ function buildResources(apps, metricsState, historyInput) {
   };
 }
 
+function usageFor(metric, metricsState, historyInput) {
+  const host = metric.hostCapacity;
+  const count = metric.coverage.observedReplicas;
+  const fraction = host && count > 0 ? metric.observedUsed / host.value : null;
+  const state = metric.coverage.runningReplicas === 0 ? 'idle'
+    : metricsState === 'unavailable' || count === 0 ? 'unavailable'
+    : metricsState === 'stale' ? 'stale'
+      : count < metric.coverage.runningReplicas ? 'partial' : 'ready';
+  const usage = {
+    kind: metric.kind,
+    scale: host ? 'host' : 'none',
+    used: metric.observedUsed,
+    capacity: host?.value || 0,
+    fraction,
+    state,
+    severity: fraction == null ? 'unknown' : severityFor(fraction, metric.kind),
+    coverage: metric.coverage,
+    usageInputs: metric.usageInputs,
+  };
+  usage.trend = trendFor(usage, historyInput);
+  delete usage.usageInputs;
+  return usage;
+}
+
 /**
  * applyHostScale re-bases a metric that has no enforced limit on any running
  * replica. Nothing changes for a metric that has one: a fleet with limits set
@@ -267,7 +292,11 @@ function buildResources(apps, metricsState, historyInput) {
  * size is unknown. In neither case does it invent a limit.
  */
 function applyHostScale(metric, host, runningReplicas, metricsState) {
+  metric.hostCapacity = host;
   if (metric.coverage.enforcedReplicas > 0) return;
+  // Unset limits are optional on the usage scale. Preserve unknown or
+  // unenforced limits: an entirely unprotected fleet still needs guidance.
+  metric.gaps = metric.gaps.filter((gap) => gap.reason !== 'unlimited');
   metric.scale = host ? 'host' : 'none';
   metric.used = metric.observedUsed;
   metric.capacity = host ? host.value : 0;
@@ -324,6 +353,7 @@ function newPressureMetric(kind) {
     // denominator). applyHostScale moves a metric off 'limits'.
     scale: 'limits',
     capacitySource: null,
+    gaps: [],
     coverage: {
       runningApps: 0,
       runningReplicas: 0,
@@ -386,9 +416,24 @@ function collectAppPressure(app, replicas, metric, hotspots) {
   let appLimitTotal = 0;
   let appObserved = 0;
   let appObservedUsed = 0;
+  const appGaps = new Map();
 
   for (const replica of replicas) {
     const facts = replicaFacts(app, replica, metric.kind);
+    const reason = !facts.observed ? 'metrics'
+      : facts.limit == null ? 'unknown'
+        : facts.limit === 0 ? 'unlimited'
+          : !facts.enforcementKnown ? 'unknown'
+            : !facts.enforced ? 'unenforced' : null;
+    if (reason) {
+      const gap = appGaps.get(reason);
+      if (gap) gap.replicas += 1;
+      else {
+        const entry = { slug: app.slug, name: app.name || app.slug, app, reason, replicas: 1 };
+        appGaps.set(reason, entry);
+        metric.gaps.push(entry);
+      }
+    }
     if (facts.observed) {
       metric.observedUsed += facts.used;
       metric.coverage.observedReplicas += 1;
@@ -475,13 +520,13 @@ function replicaFacts(app, replica, kind) {
   const rss = Number(replica.rss_bytes);
   const observed = kind === 'cpu'
     ? available && replica.cpu_percent != null && Number.isFinite(cpu)
-    : available && Number.isFinite(rss) && rss >= 0;
+    : available && replica.rss_bytes != null && Number.isFinite(rss) && rss >= 0;
   const used = observed ? (kind === 'cpu' ? Math.max(0, cpu) : rss) : 0;
   const limitKey = kind === 'cpu' ? 'effective_cpu_quota_percent' : 'effective_memory_limit_mb';
   const appLimit = app[limitKey];
   const rawLimit = replica[limitKey] ?? appLimit;
   const limitValue = Number(rawLimit);
-  const limit = Number.isFinite(limitValue) && limitValue >= 0
+  const limit = rawLimit != null && Number.isFinite(limitValue) && limitValue >= 0
     ? (kind === 'memory' ? limitValue * MIB : limitValue)
     : null;
   const enforcedKey = kind === 'cpu' ? 'cpu_quota_enforced' : 'memory_limit_enforced';
@@ -682,12 +727,15 @@ function verdictFor(total, counts, attention, resources) {
   if (total === 0) {
     return { tone: 'empty', headline: 'Fleet not configured', detail: 'Deploy your first Shiny app to begin monitoring.' };
   }
+  const criticalHost = resources.state !== 'stale' && resources.state !== 'unavailable'
+    ? hostScaleMetric(resources, 'critical') : null;
   if (attention.length > 0) {
     const n = attention.length;
     return {
       tone: 'critical',
       headline: n === 1 ? '1 app needs attention' : `${n} apps need attention`,
-      detail: attention.map((a) => a.slug).slice(0, 3).join(', ') + (n > 3 ? ` +${n - 3} more` : ''),
+      detail: attention.map((a) => a.name || a.slug).slice(0, 3).join(', ') + (n > 3 ? ` +${n - 3} more` : '')
+        + (criticalHost ? `. ${hostScaleDetail(criticalHost, resources.runningReplicas)}` : ''),
     };
   }
 
@@ -704,20 +752,19 @@ function verdictFor(total, counts, attention, resources) {
     };
   }
 
+  if (criticalHost) {
+    return {
+      tone: 'critical',
+      headline: 'App usage is nearing available capacity',
+      detail: hostScaleDetail(criticalHost, resources.runningReplicas),
+    };
+  }
   const critical = resources.hotspots.find((item) => item.severity === 'critical');
   if (critical) {
     return {
       tone: 'critical',
       headline: 'Resource limit critical',
       detail: `${critical.name} ${critical.metric} is at ${Math.round(critical.fraction * 100)}% on replica ${(critical.replicaIndex ?? 0) + 1}.`,
-    };
-  }
-  const criticalHost = hostScaleMetric(resources, 'critical');
-  if (criticalHost) {
-    return {
-      tone: 'critical',
-      headline: 'Host capacity is nearly exhausted',
-      detail: hostScaleDetail(criticalHost, resources.runningReplicas),
     };
   }
   const warning = resources.hotspots.find((item) => item.severity === 'warning');
@@ -732,7 +779,7 @@ function verdictFor(total, counts, attention, resources) {
   if (warningHost) {
     return {
       tone: 'warning',
-      headline: 'Host headroom is tightening',
+      headline: 'App usage is high against available capacity',
       detail: hostScaleDetail(warningHost, resources.runningReplicas),
     };
   }
@@ -752,19 +799,17 @@ function verdictFor(total, counts, attention, resources) {
   }
   return {
     tone: 'nominal',
-    headline: 'All systems nominal',
+    headline: 'App health is stable',
     detail: summaryLine(total, counts),
   };
 }
 
 /**
- * hostScaleMetric finds a row measured against the host that has reached the
- * given severity. Only a row on the host scale qualifies: a row with no
- * denominator has nothing to be near, and a row on enforced limits is already
- * covered by the hotspot list, which can name the replica.
+ * Check total app consumption as well as individual app limits. Even when
+ * limited replicas are cool, unlimited apps can consume the available budget.
  */
 function hostScaleMetric(resources, severity) {
-  return [resources.memory, resources.cpu].find(
+  return [resources.memory.usage, resources.cpu.usage].find(
     (metric) => metric.scale === 'host' && metric.severity === severity,
   ) || null;
 }
@@ -772,9 +817,9 @@ function hostScaleMetric(resources, severity) {
 // hostScaleDetail names the fleet-wide reading. There is no replica to point at
 // here, so it says how much of the fleet the number covers instead.
 function hostScaleDetail(metric, runningReplicas) {
-  const label = metric.kind === 'cpu' ? 'CPU' : 'Memory';
-  const scope = `${runningReplicas} running ${runningReplicas === 1 ? 'replica' : 'replicas'}`;
-  return `${label} is at ${Math.round(metric.fraction * 100)}% of host capacity across ${scope}.`;
+  const label = metric.kind === 'cpu' ? 'CPU' : 'memory';
+  const count = metric.coverage.observedReplicas;
+  return `Reported app ${label} is at ${Math.round(metric.fraction * 100)}% of available capacity (${count} of ${runningReplicas} replicas reporting).`;
 }
 
 // partialDetail says which kind of gap left coverage partial: replicas that are
@@ -784,9 +829,12 @@ function partialDetail(resources) {
   const silent = [resources.cpu, resources.memory].some(
     (metric) => metric.coverage.observedReplicas < resources.runningReplicas,
   );
-  return silent
-    ? 'Some running replicas are not reporting CPU or memory.'
-    : 'Some running replicas have unlimited or unenforced capacity.';
+  const reasons = new Set([resources.cpu, resources.memory].flatMap((metric) => metric.gaps.map((gap) => gap.reason)));
+  const details = [];
+  if (silent) details.push('Some running replicas are not reporting CPU or memory.');
+  if (reasons.has('unenforced')) details.push('Some configured app limits are not enforced.');
+  if (reasons.has('unknown')) details.push('Some app limits could not be verified.');
+  return details.join(' ');
 }
 
 function summaryLine(total, counts) {

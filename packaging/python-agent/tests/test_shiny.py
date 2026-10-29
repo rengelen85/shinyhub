@@ -1,5 +1,6 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -10,6 +11,9 @@ from shinyhub_agent._shiny import (
     CHAT_CAPABILITIES_MESSAGE,
     CHAT_EVENT_MESSAGE,
     CHAT_INPUT,
+    CHAT_DECISION_INPUT,
+    DISCOVER_INPUT,
+    REQUEST_INPUT,
 )
 
 SCHEMA = {"type": "object", "properties": {}, "additionalProperties": False}
@@ -23,6 +27,7 @@ class Session:
         self.ended = []
         self.messages = []
         self.updates = []
+        self.bookmark = SimpleNamespace(exclude=[])
 
     def on_flushed(self, fn, once):
         self.flushed.append(fn)
@@ -38,6 +43,37 @@ class Session:
 
     async def send_custom_message(self, name, message):
         self.messages.append((name, message))
+
+
+@pytest.mark.parametrize("chat", [None, object()])
+def test_agent_payloads_are_excluded_from_native_bookmarks(chat):
+    async def run():
+        session = Session()
+        session.bookmark.exclude = ["app_secret", CHAT_INPUT]
+        inputs = Inputs({
+            "period": reactive.Value("week"),
+            REQUEST_INPUT: reactive.Value({"tool": "read_view"}),
+            DISCOVER_INPUT: reactive.Value({"version": 1}),
+            CHAT_INPUT: reactive.Value({"message": "sensitive prompt"}),
+            CHAT_DECISION_INPUT: reactive.Value({"approved": True}),
+            "app_secret": reactive.Value("secret"),
+        })
+        register(
+            session=session,
+            input=inputs,
+            tools=[AgentTool("read_view", "Read view", SCHEMA, read_view)],
+            chat=chat,
+        )
+        try:
+            assert session.bookmark.exclude.count(CHAT_INPUT) == 1
+            assert await inputs._serialize(
+                exclude=session.bookmark.exclude, state_dir=None
+            ) == {"period": "week"}
+        finally:
+            for fn in session.ended:
+                fn()
+
+    asyncio.run(run())
 
 
 def test_registered_callbacks_read_update_flush_and_undo_without_app_plumbing(

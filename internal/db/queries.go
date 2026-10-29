@@ -58,13 +58,15 @@ func IsValidMemberRole(s string) bool {
 // --- Users ---
 
 type User struct {
-	ManualRole   string
-	RoleSource   string
-	ID           int64
-	Username     string
-	PasswordHash string
-	Role         string
-	DisplayName  string
+	ManualRole    string
+	RoleSource    string
+	ID            int64
+	Username      string
+	PasswordHash  string
+	Role          string
+	DisplayName   string
+	AvatarVersion string
+	AvatarColor   string
 	// Email is the address asserted by the identity provider on SSO login,
 	// persisted so native session requests can forward X-Shinyhub-Email. Empty
 	// for local username/password accounts and until the first SSO login sets it.
@@ -134,12 +136,12 @@ func (s *Store) CreateUser(p CreateUserParams) error {
 func (s *Store) GetUserByUsername(username string) (*User, error) {
 	row := s.db.QueryRow(
 		`SELECT id, username, password_hash, role, display_name, email, created_at, token_epoch,
-		        principal_type, service_account_key, managed_by, COALESCE(manual_role, ''), role_source FROM users WHERE username = ?`,
+		        principal_type, service_account_key, managed_by, COALESCE(manual_role, ''), role_source, avatar_version, avatar_color FROM users WHERE username = ?`,
 		username,
 	)
 	var u User
 	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.DisplayName, &u.Email, &u.CreatedAt, &u.TokenEpoch,
-		&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.ManualRole, &u.RoleSource); err != nil {
+		&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.ManualRole, &u.RoleSource, &u.AvatarVersion, &u.AvatarColor); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -151,12 +153,12 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 func (s *Store) GetUserByID(id int64) (*User, error) {
 	row := s.db.QueryRow(
 		`SELECT id, username, password_hash, role, display_name, email, created_at, token_epoch,
-		        principal_type, service_account_key, managed_by, COALESCE(manual_role, ''), role_source FROM users WHERE id = ?`,
+		        principal_type, service_account_key, managed_by, COALESCE(manual_role, ''), role_source, avatar_version, avatar_color FROM users WHERE id = ?`,
 		id,
 	)
 	var u User
 	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.DisplayName, &u.Email, &u.CreatedAt, &u.TokenEpoch,
-		&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.ManualRole, &u.RoleSource); err != nil {
+		&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.ManualRole, &u.RoleSource, &u.AvatarVersion, &u.AvatarColor); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -192,7 +194,7 @@ func (s *Store) ListUsers(limit, offset int) ([]*User, error) {
 	}
 	rows, err := s.db.Query(
 		`SELECT id, username, password_hash, role, display_name, email, created_at, token_epoch,
-		        principal_type, service_account_key, managed_by, COALESCE(manual_role, ''), role_source FROM users
+		        principal_type, service_account_key, managed_by, COALESCE(manual_role, ''), role_source, avatar_version, avatar_color FROM users
 		 ORDER BY username
 		 LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
@@ -203,7 +205,7 @@ func (s *Store) ListUsers(limit, offset int) ([]*User, error) {
 	for rows.Next() {
 		var u User
 		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.DisplayName, &u.Email, &u.CreatedAt, &u.TokenEpoch,
-			&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.ManualRole, &u.RoleSource); err != nil {
+			&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.ManualRole, &u.RoleSource, &u.AvatarVersion, &u.AvatarColor); err != nil {
 			return nil, err
 		}
 		users = append(users, &u)
@@ -236,7 +238,7 @@ func (s *Store) ListUsersExcludingServiceAccounts(limit, offset int) ([]*User, e
 	}
 	rows, err := s.db.Query(
 		`SELECT id, username, password_hash, role, display_name, email, created_at, token_epoch,
-		        principal_type, service_account_key, managed_by, COALESCE(manual_role, ''), role_source FROM users
+		        principal_type, service_account_key, managed_by, COALESCE(manual_role, ''), role_source, avatar_version, avatar_color FROM users
 		 WHERE principal_type <> 'service_account'
 		 ORDER BY username
 		 LIMIT ? OFFSET ?`, limit, offset)
@@ -248,7 +250,7 @@ func (s *Store) ListUsersExcludingServiceAccounts(limit, offset int) ([]*User, e
 	for rows.Next() {
 		var u User
 		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.DisplayName, &u.Email, &u.CreatedAt, &u.TokenEpoch,
-			&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.ManualRole, &u.RoleSource); err != nil {
+			&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.ManualRole, &u.RoleSource, &u.AvatarVersion, &u.AvatarColor); err != nil {
 			return nil, err
 		}
 		users = append(users, &u)
@@ -843,11 +845,11 @@ const DeployTokenCredentialName = "SHINYHUB_DEPLOY_TOKEN"
 
 func (s *Store) GetServiceAccount(key string) (*User, error) {
 	row := s.db.QueryRow(`SELECT id, username, password_hash, role, display_name, email, created_at, token_epoch,
-		principal_type, service_account_key, managed_by
+		principal_type, service_account_key, managed_by, avatar_version, avatar_color
 		FROM users WHERE principal_type = 'service_account' AND service_account_key = ?`, key)
 	var u User
 	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.DisplayName, &u.Email,
-		&u.CreatedAt, &u.TokenEpoch, &u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy); err != nil {
+		&u.CreatedAt, &u.TokenEpoch, &u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.AvatarVersion, &u.AvatarColor); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -858,7 +860,7 @@ func (s *Store) GetServiceAccount(key string) (*User, error) {
 
 func (s *Store) ListServiceAccounts() ([]*User, error) {
 	rows, err := s.db.Query(`SELECT id, username, password_hash, role, display_name, email, created_at, token_epoch,
-		principal_type, service_account_key, managed_by
+		principal_type, service_account_key, managed_by, avatar_version, avatar_color
 		FROM users WHERE principal_type = 'service_account' ORDER BY service_account_key`)
 	if err != nil {
 		return nil, err
@@ -868,7 +870,7 @@ func (s *Store) ListServiceAccounts() ([]*User, error) {
 	for rows.Next() {
 		var u User
 		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.DisplayName, &u.Email,
-			&u.CreatedAt, &u.TokenEpoch, &u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy); err != nil {
+			&u.CreatedAt, &u.TokenEpoch, &u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.AvatarVersion, &u.AvatarColor); err != nil {
 			return nil, err
 		}
 		accounts = append(accounts, &u)
@@ -4018,13 +4020,13 @@ func (s *Store) CreateOAuthAccount(p CreateOAuthAccountParams) error {
 func (s *Store) GetUserByOAuthAccount(provider, providerID string) (*User, error) {
 	row := s.db.QueryRow(`
 		SELECT u.id, u.username, u.password_hash, u.role, u.display_name, u.email, u.created_at, u.token_epoch,
-		       u.principal_type, u.service_account_key, u.managed_by
+		       u.principal_type, u.service_account_key, u.managed_by, u.avatar_version, u.avatar_color
 		FROM users u
 		JOIN oauth_accounts o ON o.user_id = u.id
 		WHERE o.provider = ? AND o.provider_id = ?`, provider, providerID)
 	var u User
 	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.DisplayName, &u.Email, &u.CreatedAt, &u.TokenEpoch,
-		&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy); err != nil {
+		&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.AvatarVersion, &u.AvatarColor); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -4075,7 +4077,7 @@ func (s *Store) ProvisionOAuthUser(p ProvisionOAuthUserParams) (*User, bool, err
 	scanUser := func(row *sql.Row) (*User, error) {
 		var u User
 		if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.DisplayName, &u.Email, &u.CreatedAt, &u.TokenEpoch,
-			&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy); err != nil {
+			&u.PrincipalType, &u.ServiceAccountKey, &u.ManagedBy, &u.AvatarVersion, &u.AvatarColor); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, ErrNotFound
 			}
@@ -4085,13 +4087,13 @@ func (s *Store) ProvisionOAuthUser(p ProvisionOAuthUserParams) (*User, bool, err
 	}
 	const linkedQuery = `
 		SELECT u.id, u.username, u.password_hash, u.role, u.display_name, u.email, u.created_at, u.token_epoch,
-		       u.principal_type, u.service_account_key, u.managed_by
+		       u.principal_type, u.service_account_key, u.managed_by, u.avatar_version, u.avatar_color
 		FROM users u
 		JOIN oauth_accounts o ON o.user_id = u.id
 		WHERE o.provider = ? AND o.provider_id = ?`
 	const userByIDQuery = `
 		SELECT id, username, password_hash, role, display_name, email, created_at, token_epoch,
-		       principal_type, service_account_key, managed_by
+		       principal_type, service_account_key, managed_by, avatar_version, avatar_color
 		FROM users WHERE id = ?`
 
 	if u, gerr := scanUser(tx.QueryRowContext(ctx, linkedQuery, p.Provider, p.ProviderID)); gerr == nil {
