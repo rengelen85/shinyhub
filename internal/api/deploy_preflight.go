@@ -69,9 +69,10 @@ type deployPreflightProblem struct {
 }
 
 type deployPreflightResponse struct {
-	Valid     bool                     `json:"valid"`
-	Isolation string                   `json:"isolation"`
-	Problems  []deployPreflightProblem `json:"problems"`
+	ScheduleChanges []ManifestScheduleResult `json:"schedule_changes,omitempty"`
+	Valid           bool                     `json:"valid"`
+	Isolation       string                   `json:"isolation"`
+	Problems        []deployPreflightProblem `json:"problems"`
 }
 
 // rOnFargateDeployMsg is the 400 body for an R bundle placed on a Fargate
@@ -208,6 +209,22 @@ func (s *Server) deployPreflight(app *db.App, req deployPreflightRequest) (deplo
 			reply.Problems = append(reply.Problems, deployPreflightProblem{Stage: "settings", Message: ve.Error()})
 		}
 	}
+	if app.ID != 0 {
+		existing, err := s.store.ListSchedulesByApp(app.ID)
+		if err != nil {
+			return reply, err
+		}
+		_, retirements, err := s.projectScheduleRetirements(app.ID, manifest, existing)
+		if err != nil {
+			return reply, err
+		}
+		for _, schedule := range retirements {
+			reply.ScheduleChanges = append(reply.ScheduleChanges, ManifestScheduleResult{Name: schedule.Name, Action: "retired", ScheduleID: schedule.ID})
+			if err := s.store.CheckScheduleRetirement(schedule.ID); err != nil {
+				reply.Problems = append(reply.Problems, deployPreflightProblem{Stage: "deploy", Message: err.Error()})
+			}
+		}
+	}
 	reply.Valid = len(reply.Problems) == 0
 	reply.Isolation = deploy.ResolveWorkerIsolation(projected.WorkerIsolation, s.cfg.Runtime.DefaultWorkerIsolation)
 	return reply, nil
@@ -215,9 +232,13 @@ func (s *Server) deployPreflight(app *db.App, req deployPreflightRequest) (deplo
 
 // targetHasRepairProducer mirrors the declaration overlay in
 // planPrestartSchedules without creating placeholder rows or scheduling work.
-// Schedules omitted by a manifest retain their stored declarations.
+// Only manually managed schedules and sparse overlays retain omitted declarations.
 func (s *Server) targetHasRepairProducer(appID int64, manifest *deploy.Manifest) (bool, error) {
 	schedules, err := s.store.ListSchedulesByApp(appID)
+	if err != nil {
+		return false, err
+	}
+	schedules, _, err = s.projectScheduleRetirements(appID, manifest, schedules)
 	if err != nil {
 		return false, err
 	}

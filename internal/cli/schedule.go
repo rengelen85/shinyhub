@@ -88,6 +88,8 @@ func newScheduleRetryConvergenceCmd() *cobra.Command {
 
 // scheduleDTO mirrors the server's JSON representation of a schedule.
 type scheduleDTO struct {
+	ManagedBy               string                  `json:"managed_by"`
+	Retired                 bool                    `json:"retired"`
 	ID                      int64                   `json:"id"`
 	Name                    string                  `json:"name"`
 	CronExpr                string                  `json:"cron_expr"`
@@ -275,6 +277,9 @@ func newScheduleLsCmd() *cobra.Command {
 				enabled := txt("true")
 				if b, ok := item["enabled"].(bool); ok && !b {
 					enabled = dimTxt("false")
+				}
+				if retired, _ := item["retired"].(bool); retired {
+					enabled = dimTxt("retired")
 				}
 				tzDisplay := fmt.Sprintf("%v", item["effective_timezone"])
 				if inherited, ok := item["timezone_inherited"].(bool); ok && inherited {

@@ -46,7 +46,7 @@ func verifyScheduleDeclarations(schedules []scheduleDTO, declared map[string]boo
 	}
 	var extra []string
 	for _, schedule := range schedules {
-		if schedule.Enabled && !declared[schedule.Name] {
+		if schedule.Enabled && schedule.ManagedBy != "manual" && !declared[schedule.Name] {
 			extra = append(extra, fmt.Sprintf("%q", schedule.Name))
 			res.freshnessGate = append(res.freshnessGate, scheduleGateOutcome{Schedule: schedule.Name, State: "undeclared"})
 		}

@@ -222,7 +222,7 @@ func (s *Store) CompleteScheduleRunAndEnqueueActivation(p CompleteScheduleRunPar
 			SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 			       overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
 			       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds,
-			       created_at, updated_at
+			       managed_by, retired, created_at, updated_at
 			FROM app_schedules WHERE id = ?`, scheduleID))
 		if err != nil {
 			return nil, fmt.Errorf("complete schedule run: reload schedule: %w", err)

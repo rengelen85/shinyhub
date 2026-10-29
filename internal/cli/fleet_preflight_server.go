@@ -47,6 +47,11 @@ type deployPreflightSettings struct {
 }
 
 type deployPreflightResponse struct {
+	ScheduleChanges []struct {
+		Name       string `json:"name"`
+		Action     string `json:"action"`
+		ScheduleID int64  `json:"schedule_id"`
+	} `json:"schedule_changes"`
 	Valid     bool   `json:"valid"`
 	Isolation string `json:"isolation"`
 	Problems  []struct {
@@ -107,7 +112,7 @@ func preflightsDeploy(action fleet.Action) bool {
 // ownershipOnlyAdopt must match rehearsal and execution: no bundle is uploaded
 // when adoption only transfers an already matching, settled declaration.
 func ownershipOnlyAdopt(d fleet.AppDiff, preconditions bool) bool {
-	return d.Action == fleet.ActionAdopt && preconditions && d.LocalDigest != "" &&
+	return !d.ScheduleDrift && d.Action == fleet.ActionAdopt && preconditions && d.LocalDigest != "" &&
 		d.LocalDigest == d.ServerDigest && len(d.ConfigDrift) == 0 && d.RecoveryReason == ""
 }
 
@@ -148,8 +153,9 @@ func fleetServerPreflight(cfg *cliConfig, caps serverCaps, m *fleet.Manifest, di
 		entries[m.Apps[i].Slug] = &m.Apps[i]
 	}
 	var problems []fleetServerPreflightProblem
-	for _, d := range diff {
-		if (m.ResolvedEnvironment == "" && (!preflightsDeploy(d.Action) || ownershipOnlyAdopt(d, caps.FleetPreconditions))) || d.Action == fleet.ActionDelete {
+	for i := range diff {
+		d := &diff[i]
+		if (!caps.ScheduleReconciliation && m.ResolvedEnvironment == "" && (!preflightsDeploy(d.Action) || ownershipOnlyAdopt(*d, caps.FleetPreconditions))) || d.Action == fleet.ActionDelete {
 			continue
 		}
 		entry, ok := entries[d.Slug]
@@ -169,6 +175,19 @@ func fleetServerPreflight(cfg *cliConfig, caps serverCaps, m *fleet.Manifest, di
 			reply, err := postDeployPreflight(cfg, d.Slug, req)
 			if err != nil {
 				return nil, err
+			}
+			for _, change := range reply.ScheduleChanges {
+				if change.Action != "retired" {
+					continue
+				}
+				d.ScheduleDrift = true
+				d.Warnings = append(d.Warnings, fmt.Sprintf("schedule %q will be retired; run history is retained", change.Name))
+				switch d.Action {
+				case fleet.ActionUnchanged:
+					d.Action = fleet.ActionUpdateSource
+				case fleet.ActionUpdateConfig:
+					d.Action = fleet.ActionUpdateSourceConfig
+				}
 			}
 			for _, p := range reply.Problems {
 				problems = append(problems, fleetServerPreflightProblem{Slug: d.Slug, Stage: p.Stage, Message: p.Message})

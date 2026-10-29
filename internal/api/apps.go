@@ -3153,14 +3153,18 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 				prestartPlan.deploymentRepairComplete = true
 			}
 		}
-		if err == nil && !generationHandoff && manifest != nil && len(manifest.Schedules) > 0 {
+		if err == nil && !generationHandoff && ((manifest != nil && len(manifest.Schedules) > 0) || len(prestartPlan.retirements) > 0 || len(prestartPlan.ownershipClaims) > 0) {
 			if err == nil {
 				deployResponse.event(deployevent.Phase("configuration", deployevent.StatusStarted, "Applying manifest configuration"))
 				targetDeployment := &db.Deployment{
 					ID: pendingDep.ID, AppID: app.ID, Version: version, BundleDir: bundleDir,
 					Status: db.DeploymentPending, ContentDigest: digest,
 				}
-				manifestSummary.Schedules, err = s.applyManifestSchedules(r, app, targetDeployment, manifest.Schedules, prestartPlan.placeholder)
+				var specs []deploy.ScheduleSpec
+				if manifest != nil {
+					specs = manifest.Schedules
+				}
+				manifestSummary.Schedules, err = s.applyManifestScheduleReconciliation(r, app, targetDeployment, specs, prestartPlan.retirements, prestartPlan.ownershipClaims, prestartPlan.placeholder)
 				if err != nil {
 					err = fmt.Errorf("manifest schedule apply: %w", err)
 				} else {
@@ -3568,6 +3572,10 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 			deployResponse.fail(http.StatusInternalServerError, "working route was preserved but deployment cutover requires startup repair", "", "commit")
 			return
 		}
+		for _, schedule := range prestartPlan.retirements {
+			s.audit(r, "schedule_retire", "schedule", fmt.Sprintf("%d", schedule.ID), fmt.Sprintf(`{"app":%q,"name":%q}`, app.Slug, schedule.Name))
+			manifestSummary.Schedules = append(manifestSummary.Schedules, ManifestScheduleResult{Name: schedule.Name, Action: "retired", ScheduleID: schedule.ID})
+		}
 		s.applyHandoffProxySettings(app)
 		if manifest != nil && !manifest.App.IsZero() {
 			s.audit(r, "update_app", "app", slug, manifestAppDetail(manifest.App))
@@ -3702,6 +3710,9 @@ func (s *Server) handleDeployApp(w http.ResponseWriter, r *http.Request) {
 	// reveal a roll that cannot currently fit.
 	if configuredSchedules, listErr := s.store.ListSchedulesByApp(app.ID); listErr == nil {
 		for _, schedule := range configuredSchedules {
+			if schedule.Retired {
+				continue
+			}
 			if advisory := s.rollFeasibilityAdvisory(app, schedule.OnSuccess, schedule.RollFallback); advisory != nil {
 				manifestSummary.Warnings = append(manifestSummary.Warnings,
 					fmt.Sprintf("schedule %q: %s", schedule.Name, *advisory))

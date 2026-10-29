@@ -95,7 +95,7 @@ func publishHandoffSettingsTx(tx writeTx, id int64, revert bool) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec("UPDATE app_schedules SET enabled=0, deploy_trigger='never', updated_at=CURRENT_TIMESTAMP WHERE app_id=?", app.ID); err != nil {
+	if _, err := tx.Exec("UPDATE app_schedules SET enabled=0, retired=CASE WHEN managed_by='bundle' THEN 1 ELSE retired END, deploy_trigger='never', updated_at=CURRENT_TIMESTAMP WHERE app_id=?", app.ID); err != nil {
 		return err
 	}
 	// A reverted schedule never ran while staged; remove newly introduced
@@ -114,13 +114,18 @@ func publishHandoffSettingsTx(tx writeTx, id int64, revert bool) error {
 		}
 	}
 	for _, schedule := range schedules {
-		_, err := tx.Exec(`INSERT INTO app_schedules (app_id,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds)
-  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(app_id,name) DO UPDATE SET
+		if !revert && schedule.Retired {
+			if err := retireScheduleTx(tx, app.ID, schedule.ID); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(`INSERT INTO app_schedules (app_id,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds,managed_by,retired)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(app_id,name) DO UPDATE SET
   cron_expr=excluded.cron_expr,command_json=excluded.command_json,inputs_json=excluded.inputs_json,enabled=excluded.enabled,timeout_seconds=excluded.timeout_seconds,
   overlap_policy=excluded.overlap_policy,missed_policy=excluded.missed_policy,deploy_trigger=excluded.deploy_trigger,timezone=excluded.timezone,on_success=excluded.on_success,
-  min_roll_interval_seconds=excluded.min_roll_interval_seconds,roll_fallback=excluded.roll_fallback,max_defer_age_seconds=excluded.max_defer_age_seconds,updated_at=CURRENT_TIMESTAMP`,
+  min_roll_interval_seconds=excluded.min_roll_interval_seconds,roll_fallback=excluded.roll_fallback,max_defer_age_seconds=excluded.max_defer_age_seconds,managed_by=excluded.managed_by,retired=excluded.retired,updated_at=CURRENT_TIMESTAMP`,
 			app.ID, schedule.Name, schedule.CronExpr, schedule.CommandJSON, schedule.InputsJSON, boolToInt(schedule.Enabled), schedule.TimeoutSeconds, schedule.OverlapPolicy, schedule.MissedPolicy,
-			schedule.DeployTrigger, schedule.Timezone, schedule.OnSuccess, schedule.MinRollIntervalSeconds, schedule.RollFallback, schedule.MaxDeferAgeSeconds)
+			schedule.DeployTrigger, schedule.Timezone, schedule.OnSuccess, schedule.MinRollIntervalSeconds, schedule.RollFallback, schedule.MaxDeferAgeSeconds, normalizeScheduleManager(schedule.ManagedBy), boolToInt(schedule.Retired))
 		if err != nil {
 			return err
 		}
@@ -129,8 +134,8 @@ func publishHandoffSettingsTx(tx writeTx, id int64, revert bool) error {
 		if _, err := tx.Exec("DELETE FROM deployment_schedule_snapshots WHERE deployment_id=?", id); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO deployment_schedule_snapshots (deployment_id,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds)
-  SELECT ?,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds FROM app_schedules WHERE app_id=?`, id, app.ID); err != nil {
+		if _, err := tx.Exec(`INSERT INTO deployment_schedule_snapshots (deployment_id,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds,managed_by,retired)
+  SELECT ?,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds,managed_by,retired FROM app_schedules WHERE app_id=?`, id, app.ID); err != nil {
 			return err
 		}
 		_, err := tx.Exec("UPDATE deployments SET schedule_snapshot_recorded=1 WHERE id=?", id)

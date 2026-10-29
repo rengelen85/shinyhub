@@ -715,6 +715,10 @@ func (m *Manager) runAdmitted(ctx context.Context, scheduleID int64, trigger str
 			return 0, errors.New("schedule producer requires explicit repair")
 		}
 	}
+	if sched.Retired {
+		gate.RUnlock()
+		return 0, fmt.Errorf("schedule %q is retired", sched.Name)
+	}
 	if refresh == nil {
 		sched, err = m.asExplicitRepairPublisher(sched, trigger)
 		if err != nil {
@@ -783,6 +787,10 @@ func (m *Manager) RunForDeployment(scheduleID int64, trigger string, userID *int
 	if err != nil {
 		gate.RUnlock()
 		return 0, fmt.Errorf("get schedule %d: %w", scheduleID, err)
+	}
+	if sched.Retired {
+		gate.RUnlock()
+		return 0, fmt.Errorf("schedule %q is retired", sched.Name)
 	}
 	sched, err = m.asExplicitRepairPublisher(sched, trigger)
 	if err != nil {
@@ -1997,7 +2005,7 @@ func (m *Manager) servingRunStillCurrent(sched *db.Schedule, app *db.App, deploy
 		return false
 	}
 	declaration, err := m.store.GetSchedule(sched.ID)
-	if err != nil || declaration.AppID != app.ID || (!declaration.Enabled && trigger != "manual") {
+	if err != nil || declaration.AppID != app.ID || declaration.Retired || (!declaration.Enabled && trigger != "manual") {
 		return false
 	}
 	_, admittedFingerprint, err := schedulespec.ProducerBundleIdentity(sched.CommandJSON, sched.InputsJSON, deployment.BundleDir)

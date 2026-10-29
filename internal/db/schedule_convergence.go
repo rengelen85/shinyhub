@@ -124,7 +124,7 @@ func (s *Store) ReconcileDeployObligationsForDeployment(appID, deploymentID int6
 		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
 		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds,
-		       created_at, updated_at
+		       managed_by, retired, created_at, updated_at
 		FROM app_schedules WHERE app_id = ? ORDER BY id`, appID)
 	if err != nil {
 		return nil, fmt.Errorf("reconcile deploy obligations: list schedules: %w", err)
@@ -160,6 +160,15 @@ func (s *Store) ReconcileDeployObligationsForDeployment(appID, deploymentID int6
 }
 
 func reconcileScheduleObligationTx(ctx context.Context, tx writeTx, schedule *Schedule, deploymentID int64, version, digest string) (*ScheduleDeployObligation, error) {
+	if schedule.Retired || !schedule.Enabled || schedule.DeployTrigger == schedulespec.DeployTriggerNever {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE schedule_deploy_obligations
+			SET status = 'superseded', updated_at = CURRENT_TIMESTAMP,
+			    finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)
+			WHERE schedule_id = ? AND status IN ('pending', 'dispatching', 'running')`, schedule.ID)
+		return nil, err
+	}
+
 	var bundleDir string
 	if schedule.InputsJSON != "" && schedule.InputsJSON != "[]" && schedule.InputsJSON != "null" {
 		if err := tx.QueryRowContext(ctx, "SELECT bundle_dir FROM deployments WHERE id=?", deploymentID).Scan(&bundleDir); err != nil {
@@ -168,15 +177,6 @@ func reconcileScheduleObligationTx(ctx context.Context, tx writeTx, schedule *Sc
 	}
 	canonical, fingerprint, err := schedulespec.ProducerBundleIdentity(schedule.CommandJSON, schedule.InputsJSON, bundleDir)
 	if err != nil {
-		return nil, err
-	}
-
-	if !schedule.Enabled || schedule.DeployTrigger == schedulespec.DeployTriggerNever {
-		_, err := tx.ExecContext(ctx, `
-			UPDATE schedule_deploy_obligations
-			SET status = 'superseded', updated_at = CURRENT_TIMESTAMP,
-			    finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)
-			WHERE schedule_id = ? AND status IN ('pending', 'dispatching', 'running')`, schedule.ID)
 		return nil, err
 	}
 
@@ -585,7 +585,8 @@ func (s *Store) InsertDeployScheduleRun(p InsertScheduleRunParams) (int64, error
 			producer_command_json, publishes_data, deploy_obligation_id, provenance_admission)
 		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1
 		WHERE EXISTS (SELECT 1 FROM schedule_deploy_obligations
-		              WHERE id = ? AND schedule_id = ? AND status = 'dispatching')
+		              WHERE id = ? AND schedule_id = ? AND status = 'dispatching'
+		                AND EXISTS (SELECT 1 FROM app_schedules sc WHERE sc.id=schedule_deploy_obligations.schedule_id AND sc.retired=0))
 		RETURNING id`, p.ScheduleID, p.Status, p.Trigger, triggeredBy, p.StartedAt, p.LogPath,
 		p.OnSuccess, p.MinRollIntervalSeconds, p.RollFallback, p.MaxDeferAgeSeconds,
 		p.DeploymentID, p.AppVersion, p.ContentDigest, p.ProducerFingerprint,

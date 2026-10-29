@@ -54,7 +54,7 @@ on_success = "roll"
 		{name: "malformed-previous-manifest", status: http.StatusConflict, refusal: manifestRefusal},
 		{name: "hooks", status: http.StatusConflict, refusal: manifestRefusal},
 		{name: "bundle-change", status: http.StatusConflict, refusal: producerRefusal},
-		{name: "omitted-producer", status: http.StatusConflict, refusal: "not in the manifest"},
+		{name: "omitted-producer", status: http.StatusOK, handoff: true},
 		{name: "missing-producer-state", status: http.StatusConflict, refusal: producerRefusal},
 		{name: "capacity", status: http.StatusConflict, refusal: "need 256 MiB for 16 parallel-generation replicas"},
 		{name: "provider", status: http.StatusConflict, refusal: "uses provider \"docker\""},
@@ -187,8 +187,11 @@ on_success = "roll"
 			beforeProducers := len(runtime.producerCommands)
 			runtime.mu.Unlock()
 			rec := upload("print('app') # v2", manifest, tc.allowDowntime)
-			if tc.name == "omitted-producer" && !strings.Contains(rec.Body.String(), "shinyhub schedule rm multiplex-manifest refresh") {
-				t.Fatalf("missing orphan removal guidance: %s", rec.Body.String())
+			if tc.name == "omitted-producer" {
+				schedule, err := store.GetScheduleByName(app.ID, "refresh")
+				if err != nil || !schedule.Retired || schedule.Enabled {
+					t.Fatalf("removed producer not retired: %+v %v", schedule, err)
+				}
 			}
 			if rec.Code != tc.status {
 				t.Fatalf("redeploy: %d, want %d: %s", rec.Code, tc.status, rec.Body.String())

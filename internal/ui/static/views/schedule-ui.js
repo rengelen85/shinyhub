@@ -38,6 +38,7 @@ export function dstAdvisoryMarkup(schedule) {
 // operators need on the list surface. It intentionally describes the job, not
 // whether a running app has consumed data the job may have written.
 export function scheduleState(schedule) {
+  if (schedule?.retired) return { key: 'retired', label: 'Retired', tone: 'quiet', attention: false };
   if (!schedule || schedule.enabled === false) {
     return { key: 'paused', label: 'Paused', tone: 'quiet', attention: false };
   }
@@ -96,6 +97,10 @@ export function deployTriggerLabel(trigger) {
 // Producer compatibility is deliberately separate from cron/job freshness.
 // A successful run can still have produced data for an older bundle.
 export function producerCompatibilityState(schedule) {
+  if (schedule?.retired) return {
+    key: 'retired', label: 'Retired', tone: 'quiet', attention: false,
+    detail: 'Removed from the bundle manifest. Run history is retained. Redeclare this name in shinyhub.toml to run it again.',
+  };
   if (!schedule || schedule.deploy_trigger === 'never' || !schedule.deploy_trigger) {
     return {
       key: 'not-tracked', label: 'Not tracked', tone: 'quiet', attention: false,
@@ -138,6 +143,8 @@ export function scheduleDetailSignature(schedule) {
     cron_expr: schedule.cron_expr,
     command: schedule.command,
     enabled: schedule.enabled,
+    retired: schedule.retired,
+    managed_by: schedule.managed_by,
     timeout_seconds: schedule.timeout_seconds,
     overlap_policy: schedule.overlap_policy,
     missed_policy: schedule.missed_policy,

@@ -140,7 +140,14 @@ func (s *Server) validateManifestActivationTopology(app *db.App, manifest *deplo
 		if err != nil {
 			return newValidationError("validate existing schedules: %v", err)
 		}
+		existing, _, err = s.projectScheduleRetirements(app.ID, manifest, existing)
+		if err != nil {
+			return newValidationError("validate schedule ownership: %v", err)
+		}
 		for _, schedule := range existing {
+			if schedule.Retired {
+				continue
+			}
 			policyOrder = append(policyOrder, schedule.Name)
 			policies[schedule.Name] = projectedPolicy{
 				name: schedule.Name, deployTrigger: schedule.DeployTrigger,
@@ -379,6 +386,10 @@ type DeployRunRef struct {
 // Returns one result entry per spec in input order. On error the slice
 // contains the results processed so far.
 func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment *db.Deployment, specs []deploy.ScheduleSpec, plannedCreates ...map[string]int64) ([]ManifestScheduleResult, error) {
+	return s.applyManifestScheduleReconciliation(r, app, deployment, specs, nil, nil, plannedCreates...)
+}
+
+func (s *Server) applyManifestScheduleReconciliation(r *http.Request, app *db.App, deployment *db.Deployment, specs []deploy.ScheduleSpec, retirements, ownershipClaims []*db.Schedule, plannedCreates ...map[string]int64) ([]ManifestScheduleResult, error) {
 	if deployment == nil || deployment.AppID != app.ID || deployment.ContentDigest == "" {
 		return nil, errors.New("manifest schedule apply requires the target deployment")
 	}
@@ -414,6 +425,7 @@ func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment
 		}
 		params = append(params, db.UpsertScheduleByNameParams{
 			AppID:                  app.ID,
+			ManagedBy:              db.ScheduleManagedByBundle,
 			Name:                   spec.Name,
 			CronExpr:               spec.Cron,
 			CommandJSON:            string(cmdJSON),
@@ -431,7 +443,7 @@ func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment
 		})
 		timezones = append(timezones, tzPtr)
 	}
-	upserts, err := s.store.UpsertSchedulesByName(params)
+	upserts, err := s.store.ReconcileManifestSchedules(app.ID, params, retirements, ownershipClaims)
 	if err != nil {
 		return nil, err
 	}
@@ -459,6 +471,13 @@ func (s *Server) applyManifestSchedules(r *http.Request, app *db.App, deployment
 	for i, spec := range specs {
 		if err := s.reloadScheduler(upserts[i].ID, app.Slug, spec.Name); err != nil {
 			return results, fmt.Errorf("scheduler reload (%s): %w", spec.Name, err)
+		}
+	}
+	for _, schedule := range retirements {
+		s.audit(r, "schedule_retire", "schedule", fmt.Sprintf("%d", schedule.ID), fmt.Sprintf(`{"app":%q,"name":%q}`, app.Slug, schedule.Name))
+		results = append(results, ManifestScheduleResult{Name: schedule.Name, Action: "retired", ScheduleID: schedule.ID})
+		if err := s.reloadScheduler(schedule.ID, app.Slug, schedule.Name); err != nil {
+			return results, err
 		}
 	}
 	return results, nil

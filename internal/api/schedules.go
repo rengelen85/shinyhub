@@ -26,6 +26,8 @@ import (
 )
 
 type scheduleDTO struct {
+	ManagedBy              string   `json:"managed_by"`
+	Retired                bool     `json:"retired"`
 	Inputs                 []string `json:"inputs,omitempty"`
 	ID                     int64    `json:"id"`
 	AppID                  int64    `json:"app_id"`
@@ -162,6 +164,7 @@ func toScheduleDTO(sc *db.Schedule, next *time.Time, serverDefaultLoc *time.Loca
 	loc := sc.EffectiveLocation(serverDefaultLoc)
 	inherited := sc.Timezone == nil || *sc.Timezone == ""
 	out := scheduleDTO{
+		ManagedBy: sc.ManagedBy, Retired: sc.Retired,
 		ID: sc.ID, AppID: sc.AppID, Name: sc.Name, CronExpr: sc.CronExpr,
 		Command: cmd, Inputs: inputs, Enabled: sc.Enabled, TimeoutSeconds: sc.TimeoutSeconds,
 		OverlapPolicy: sc.OverlapPolicy, MissedPolicy: sc.MissedPolicy,
@@ -331,6 +334,10 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, db.ErrScheduleNameExists.Error())
 				return
 			}
+			if existing.Retired {
+				writeError(w, http.StatusConflict, "schedule is retired; redeclare it in shinyhub.toml to revive it")
+				return
+			}
 			tzMatch := (storedTZ == nil && existing.Timezone == nil) ||
 				(storedTZ != nil && existing.Timezone != nil && *storedTZ == *existing.Timezone)
 			if existing.CronExpr == req.CronExpr &&
@@ -401,6 +408,10 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 	sc, err := s.store.GetSchedule(id)
 	if err != nil || sc.AppID != app.ID {
 		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if sc.Retired {
+		writeError(w, http.StatusConflict, "schedule is retired; redeclare it in shinyhub.toml before editing or running it")
 		return
 	}
 
@@ -927,6 +938,10 @@ func (s *Server) handleRunSchedule(w http.ResponseWriter, r *http.Request) {
 	sc, err := s.store.GetSchedule(id)
 	if err != nil || sc.AppID != app.ID {
 		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if sc.Retired {
+		writeError(w, http.StatusConflict, "schedule is retired; redeclare it in shinyhub.toml before editing or running it")
 		return
 	}
 	user := auth.UserFromContext(r.Context())

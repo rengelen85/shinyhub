@@ -20,6 +20,8 @@ type prestartSchedulePlan struct {
 	placeholder              map[string]int64
 	candidates               map[string]*db.Schedule
 	previousDeclarations     []*db.Schedule
+	retirements              []*db.Schedule
+	ownershipClaims          []*db.Schedule
 	deploymentRepairRequired bool
 	repairBlocker            *db.DeploymentSummary
 	deploymentRepairComplete bool
@@ -58,6 +60,22 @@ func (s *Server) planPrestartSchedules(app *db.App, manifest *deploy.Manifest, d
 		plan.previousDeclarations = append(plan.previousDeclarations, &previous)
 		byName[schedule.Name] = &candidate
 		plan.gateIDs = append(plan.gateIDs, schedule.ID)
+	}
+	projected, retirements, err := s.projectScheduleRetirements(app.ID, manifest, existing)
+	if err != nil {
+		return nil, err
+	}
+	plan.retirements = retirements
+	for _, schedule := range retirements {
+		if err := s.store.CheckScheduleRetirement(schedule.ID); err != nil {
+			return nil, fmt.Errorf("schedule %q: %w", schedule.Name, err)
+		}
+	}
+	for _, schedule := range projected {
+		if prior := byName[schedule.Name]; prior.ManagedBy != schedule.ManagedBy {
+			plan.ownershipClaims = append(plan.ownershipClaims, schedule)
+		}
+		byName[schedule.Name] = schedule
 	}
 	if manifest != nil {
 		for _, spec := range manifest.Schedules {
@@ -132,10 +150,10 @@ func (s *Server) planRollbackPrestartSchedules(app *db.App, deploymentID int64, 
 	for _, snapshot := range snapshots {
 		candidate := *snapshot
 		candidate.AppID = app.ID
-		if err := s.validateScheduleActivationForApp(app, candidate.OnSuccess); err != nil {
+		if err := s.validateScheduleActivationForApp(app, candidate.OnSuccess); !candidate.Retired && err != nil {
 			return nil, fmt.Errorf("rollback schedule %q activation topology: %w", candidate.Name, err)
 		}
-		if err := s.validateScheduleProducerTopology(app, candidate.DeployTrigger, candidate.OnSuccess); err != nil {
+		if err := s.validateScheduleProducerTopology(app, candidate.DeployTrigger, candidate.OnSuccess); !candidate.Retired && err != nil {
 			return nil, fmt.Errorf("rollback schedule %q producer topology: %w", candidate.Name, err)
 		}
 		if current := currentByName[candidate.Name]; current != nil {
@@ -304,6 +322,8 @@ func projectedManifestSchedule(appID int64, base *db.Schedule, spec deploy.Sched
 		out = *base
 	}
 	out.AppID = appID
+	out.ManagedBy = db.ScheduleManagedByBundle
+	out.Retired = false
 	out.Name = spec.Name
 	out.CronExpr = spec.Cron
 	command, err := json.Marshal(spec.Command)

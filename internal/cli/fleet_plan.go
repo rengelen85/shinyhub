@@ -214,6 +214,7 @@ type serverCaps struct {
 	ScheduleInputs            bool   `json:"schedule_inputs"`
 	ScheduleDeployConvergence bool   `json:"schedule_deploy_convergence"`
 	ScheduleRefreshStale      bool   `json:"schedule_refresh_stale"`
+	ScheduleReconciliation    bool   `json:"schedule_reconciliation"`
 	DeployPreflight           bool   `json:"deploy_preflight"`
 	StaleUVLockRefusal        bool   `json:"stale_uv_lock_refusal"`
 	RedeployOutcome           bool   `json:"redeploy_outcome"`

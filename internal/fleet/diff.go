@@ -134,6 +134,8 @@ type AppDiff struct {
 	// genuinely unmanaged app (no prior owner) and for non-adopt actions.
 	AdoptFrom     string
 	PruneEligible bool
+	// ScheduleDrift requires deployment reconciliation even with a matching digest.
+	ScheduleDrift bool
 	// Warnings are observations about the app's live state that the plan
 	// reports alongside its action, including recovery that needs manual action.
 	Warnings []string

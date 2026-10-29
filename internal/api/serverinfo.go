@@ -61,6 +61,7 @@ type serverCapabilities struct {
 	ServiceAccountCredentials bool `json:"service_account_credentials"`
 	ScheduleRefreshStale      bool `json:"schedule_refresh_stale"`
 	ScheduleDeployConvergence bool `json:"schedule_deploy_convergence"`
+	ScheduleReconciliation    bool `json:"schedule_reconciliation"`
 	DeployPreflight           bool `json:"deploy_preflight"`
 	// StaleUVLockRefusal: a deploy whose uv.lock no longer records what its
 	// pyproject.toml declares is refused with 422, so a CLI can run the same
@@ -104,6 +105,7 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 			ScheduleDeployConvergence: true,
 			BundleEnv:                 true,
 			ScheduleRefreshStale:      true,
+			ScheduleReconciliation:    true,
 			DeployPreflight:           true,
 			StaleUVLockRefusal:        true,
 			RedeployOutcome:           true,

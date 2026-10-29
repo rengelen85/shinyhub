@@ -120,8 +120,8 @@ func (s *Store) ActivationDeployment(activationID int64, source *Deployment) (*D
 	if err != nil {
 		return nil, err
 	}
-	_, err = tx.Exec(`INSERT INTO deployment_prior_schedule_snapshots (deployment_id,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds)
- SELECT ?,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds FROM app_schedules WHERE app_id=?`, id, source.AppID)
+	_, err = tx.Exec(`INSERT INTO deployment_prior_schedule_snapshots (deployment_id,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds, managed_by, retired)
+ SELECT ?,name,cron_expr,command_json,inputs_json,enabled,timeout_seconds,overlap_policy,missed_policy,deploy_trigger,timezone,on_success,min_roll_interval_seconds,roll_fallback,max_defer_age_seconds, managed_by, retired FROM app_schedules WHERE app_id=?`, id, source.AppID)
 	if err != nil {
 		return nil, err
 	}

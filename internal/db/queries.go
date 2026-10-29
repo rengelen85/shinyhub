@@ -2696,10 +2696,10 @@ func (s *Store) BeginDeploymentWithOrigin(appID int64, version, bundleDir, runID
 		INSERT INTO deployment_prior_schedule_snapshots
 			(deployment_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 			 overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-			 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds)
+			 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, managed_by, retired)
 		SELECT ?, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds
+		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, managed_by, retired
 		FROM app_schedules WHERE app_id = ?`, id, appID); err != nil {
 		return nil, fmt.Errorf("begin deployment: snapshot prior schedule declarations: %w", err)
 	}
@@ -2725,7 +2725,7 @@ func (s *Store) promoteDeployment(id int64, appStatus *UpdateAppStatusParams) er
 	// Reserve SQLite's writer before reading the target. Otherwise another
 	// connection can advance the WAL and make the later write upgrade fail
 	// immediately with SQLITE_BUSY(_SNAPSHOT), despite busy_timeout.
-	tx, err := s.d.beginWrite(context.Background(), s.rawDB(), 0)
+	tx, err := s.d.beginWrite(context.Background(), s.rawDB(), scheduleConvergenceLockKey)
 	if err != nil {
 		return fmt.Errorf("promote deployment %d: begin: %w", id, err)
 	}
@@ -2820,7 +2820,7 @@ func (s *Store) promoteDeployment(id int64, appStatus *UpdateAppStatusParams) er
 func (s *Store) RevertDeploymentActivation(failedID, previousID int64, reason string) error {
 	// Compensation also reads before writing; it needs the same eager writer
 	// reservation as promotion so contention cannot strand the active pointer.
-	tx, err := s.d.beginWrite(context.Background(), s.rawDB(), 0)
+	tx, err := s.d.beginWrite(context.Background(), s.rawDB(), scheduleConvergenceLockKey)
 	if err != nil {
 		return fmt.Errorf("revert deployment activation %d: begin: %w", failedID, err)
 	}

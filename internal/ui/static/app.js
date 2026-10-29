@@ -7392,18 +7392,18 @@ document.addEventListener('DOMContentLoaded', () => {
       const tz = s.effective_timezone || 'UTC';
       const lastRun = s.last_run_at ? scheduleDate(s.last_run_at, tz) : 'No completed run recorded';
       const lastSuccess = Number.isFinite(s.last_success_age_s) ? `Last success ${formatAge(s.last_success_age_s)}` : 'No successful run recorded';
-      const nextFire = s.enabled === false ? 'Paused' : scheduleDate(s.next_fire, tz);
+      const nextFire = s.retired ? 'Retired' : s.enabled === false ? 'Paused' : scheduleDate(s.next_fire, tz);
       const selected = String(s.id) === String(surface.options.selectedScheduleID);
       const actions = surface.options.canManage ? `
-        <button type="button" class="schedule-run-btn" data-action="run" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-schedule-focus="schedule-${s.id}-run">
+        ${s.retired ? '' : `<button type="button" class="schedule-run-btn" data-action="run" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-schedule-focus="schedule-${s.id}-run">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.25 3.5 12 8l-6.75 4.5z"/></svg><span>Run now</span>
-        </button>
+        </button>`}
         <div class="kebab-menu schedule-actions-menu">
           <button type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHtml(s.name)}">
             <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3" cy="8" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="13" cy="8" r="1.25"/></svg>
           </button>
           <ul class="kebab-list" role="menu" hidden>
-            <li role="none"><button type="button" role="menuitem" data-action="edit" data-schedule='${escapeHtml(JSON.stringify(s))}' data-schedule-focus="schedule-${s.id}-edit">Edit schedule</button></li>
+            ${s.retired ? '' : `<li role="none"><button type="button" role="menuitem" data-action="edit" data-schedule='${escapeHtml(JSON.stringify(s))}' data-schedule-focus="schedule-${s.id}-edit">Edit schedule</button></li>`}
             <li role="none" class="schedule-menu-danger"><button type="button" role="menuitem" data-action="delete" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-schedule-focus="schedule-${s.id}-delete">Delete schedule</button></li>
           </ul>
         </div>` : '';
@@ -7486,11 +7486,11 @@ document.addEventListener('DOMContentLoaded', () => {
         <div class="schedule-detail-title-row">
           <div><h2 id="schedule-detail-title">${escapeHtml(schedule.name)}</h2>${scheduleStatusMarkup(state)}</div>
           ${surface.options.canManage ? `<div class="schedule-detail-actions">
-            <button type="button" class="schedule-run-btn" data-detail-action="run" data-schedule-focus="schedule-${schedule.id}-detail-run"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.25 3.5 12 8l-6.75 4.5z"/></svg><span>Run now</span></button>
+            ${schedule.retired ? '' : `<button type="button" class="schedule-run-btn" data-detail-action="run" data-schedule-focus="schedule-${schedule.id}-detail-run"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.25 3.5 12 8l-6.75 4.5z"/></svg><span>Run now</span></button>`}
             <div class="kebab-menu schedule-actions-menu" data-schedule-actions-menu>
               <button type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHtml(schedule.name)}"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3" cy="8" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="13" cy="8" r="1.25"/></svg></button>
               <ul class="kebab-list" role="menu" hidden>
-                <li role="none"><button type="button" role="menuitem" data-detail-action="edit" data-schedule-focus="schedule-${schedule.id}-detail-edit">Edit schedule</button></li>
+                ${schedule.retired ? '' : `<li role="none"><button type="button" role="menuitem" data-detail-action="edit" data-schedule-focus="schedule-${schedule.id}-detail-edit">Edit schedule</button></li>`}
                 <li role="none" class="schedule-menu-danger"><button type="button" role="menuitem" data-detail-action="delete" data-schedule-focus="schedule-${schedule.id}-detail-delete">Delete schedule</button></li>
               </ul>
             </div>
@@ -7515,7 +7515,7 @@ document.addEventListener('DOMContentLoaded', () => {
       <dl class="schedule-definition-grid">
         <div><dt>Timing</dt><dd><code>${escapeHtml(schedule.cron_expr)}</code></dd></div>
         <div><dt>Timezone</dt><dd>${escapeHtml(timezone)}${schedule.timezone_inherited ? ' <span>(inherited)</span>' : ''}</dd></div>
-        <div><dt>Next run</dt><dd>${escapeHtml(schedule.enabled === false ? 'Paused' : scheduleDate(schedule.next_fire, timezone))}</dd></div>
+        <div><dt>Next run</dt><dd>${escapeHtml(schedule.retired ? 'Retired' : schedule.enabled === false ? 'Paused' : scheduleDate(schedule.next_fire, timezone))}</dd></div>
         <div><dt>After success</dt><dd>${escapeHtml(afterSuccessLabel(schedule))}<span>${escapeHtml(afterSuccessDetail(schedule))}</span></dd></div>
         <div><dt>Deploy trigger</dt><dd>${escapeHtml(deployTriggerLabel(schedule.deploy_trigger))}</dd></div>
         <div class="schedule-definition-command"><dt>Command</dt><dd><code>${escapeHtml((schedule.command || []).join(' '))}</code></dd></div>

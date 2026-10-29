@@ -49,6 +49,36 @@ shinyhub schedule add fetch \
 > `executable file not found` because `python` is not on `PATH`. The Docker
 > runtime runs the command inside the app image, where `python` is present.
 
+### Removing or renaming manifest schedules
+
+Schedules declared in `shinyhub.toml` are owned by the bundle. A successful
+full deployment retires any previously bundle-owned name that is no longer
+present, including when the last schedule or the entire manifest is removed.
+Renaming a schedule creates the new name and retires the old one. Retirement
+happens as part of deployment configuration, before the new serving generation
+is published; an omitted producer never runs against the new bundle.
+
+Retired schedules are disabled and keep their IDs, runs, logs, and producer
+history. The schedule API reports `managed_by: "bundle"` and `retired: true`;
+`schedule ls` labels them `retired`. They cannot be enabled, edited, or manually
+run until the same name is declared again in the manifest. Redeclaring it
+revives its existing ID and history. Explicit deletion still removes history.
+Failed deployment recovery and rollback restore the saved declaration state.
+
+Schedules created through the API or CLI have `managed_by: "manual"` and are
+preserved when omitted from a bundle. Declaring the same name in a manifest
+transfers ownership to that bundle. A `sparse = true` environment overlay
+preserves omitted schedule policy. During an upgrade, existing rows are adopted
+only when the currently serving manifest establishes ownership; older orphaned
+names with no such evidence remain manual and need explicit operator review.
+
+`fleet plan` previews retirements, and `fleet apply` reconciles them even when
+the source digest already matches. Retirement is refused while a run is active,
+an activation is unsettled, or a producer write remains uncertain. Resolve that
+work before retrying. The server advertises `schedule_reconciliation` for this
+behavior. Older servers retain their previous behavior; CLI verification still
+reports undeclared enabled schedules when ownership metadata is unavailable.
+
 Fields:
 
 | Field | Meaning |

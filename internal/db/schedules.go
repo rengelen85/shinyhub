@@ -21,7 +21,19 @@ var ErrScheduleNameExists = errors.New("schedule with that name already exists f
 
 // --- app_schedules ---
 
+const ScheduleManagedByBundle = "bundle"
+const ScheduleManagedByManual = "manual"
+
+func normalizeScheduleManager(value string) string {
+	if value == "" {
+		return ScheduleManagedByManual
+	}
+	return value
+}
+
 type Schedule struct {
+	ManagedBy              string
+	Retired                bool
 	ID                     int64
 	AppID                  int64
 	Name                   string
@@ -154,7 +166,7 @@ func (s *Store) GetSchedule(id int64) (*Schedule, error) {
 	row := s.db.QueryRow(`
 		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
-		       roll_fallback, max_defer_age_seconds, created_at, updated_at
+		       roll_fallback, max_defer_age_seconds, managed_by, retired, created_at, updated_at
 		FROM app_schedules WHERE id = ?`, id)
 	return scanSchedule(row)
 }
@@ -165,7 +177,7 @@ func (s *Store) GetScheduleByName(appID int64, name string) (*Schedule, error) {
 	row := s.db.QueryRow(`
 		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
-		       roll_fallback, max_defer_age_seconds, created_at, updated_at
+		       roll_fallback, max_defer_age_seconds, managed_by, retired, created_at, updated_at
 		FROM app_schedules WHERE app_id = ? AND name = ?`, appID, name)
 	return scanSchedule(row)
 }
@@ -174,7 +186,7 @@ func (s *Store) ListSchedulesByApp(appID int64) ([]*Schedule, error) {
 	rows, err := s.db.Query(`
 		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
-		       roll_fallback, max_defer_age_seconds, created_at, updated_at
+		       roll_fallback, max_defer_age_seconds, managed_by, retired, created_at, updated_at
 		FROM app_schedules WHERE app_id = ? ORDER BY name`, appID)
 	if err != nil {
 		return nil, err
@@ -195,7 +207,7 @@ func (s *Store) ListEnabledSchedules() ([]*Schedule, error) {
 	rows, err := s.db.Query(`
 		SELECT id, app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success, min_roll_interval_seconds,
-		       roll_fallback, max_defer_age_seconds, created_at, updated_at
+		       roll_fallback, max_defer_age_seconds, managed_by, retired, created_at, updated_at
 		FROM app_schedules WHERE enabled = 1`)
 	if err != nil {
 		return nil, err
@@ -417,12 +429,25 @@ type FinishScheduleRunParams struct {
 }
 
 func (s *Store) InsertScheduleRun(p InsertScheduleRunParams) (int64, error) {
+	tx, err := s.d.beginWrite(context.Background(), s.rawDB(), scheduleConvergenceLockKey)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var admitted int
+	// A pending deployment may revive a retired name through its immutable
+	// candidate declaration. Ordinary and queued runs must use the live policy.
+	err = tx.QueryRow(`SELECT 1 FROM app_schedules sc WHERE sc.id=? AND
+		(sc.retired=0 OR (?='deploy' AND EXISTS (SELECT 1 FROM deployments d WHERE d.id=? AND d.app_id=sc.app_id AND d.status='pending')))`, p.ScheduleID, p.Trigger, p.DeploymentID).Scan(&admitted)
+	if err != nil {
+		return 0, fmt.Errorf("schedule %d is retired or unavailable: %w", p.ScheduleID, err)
+	}
 	var uid sql.NullInt64
 	if p.TriggeredByUserID != nil {
 		uid = sql.NullInt64{Int64: *p.TriggeredByUserID, Valid: true}
 	}
 	var id int64
-	err := s.db.QueryRow(`
+	err = tx.QueryRow(`
 		INSERT INTO schedule_runs (schedule_id, status, trigger, triggered_by_user_id, started_at, log_path,
 		                           on_success, min_roll_interval_seconds, roll_fallback, max_defer_age_seconds,
 		                           deployment_id, app_version, content_digest,
@@ -438,6 +463,9 @@ func (s *Store) InsertScheduleRun(p InsertScheduleRunParams) (int64, error) {
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert schedule run: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -792,6 +820,8 @@ func (s *Store) LatestDeployRunID(scheduleID int64, contentDigest string) (int64
 }
 
 type UpsertScheduleByNameParams struct {
+	ManagedBy              string
+	Retired                bool
 	AppID                  int64
 	Name                   string
 	CronExpr               string
@@ -817,11 +847,59 @@ type UpsertScheduleByNameResult struct {
 // UpsertSchedulesByName atomically applies a complete manifest schedule batch.
 // No caller can observe a partially new declaration set if a later row fails.
 func (s *Store) UpsertSchedulesByName(params []UpsertScheduleByNameParams) ([]UpsertScheduleByNameResult, error) {
-	tx, err := s.db.Begin()
+	return s.ReconcileManifestSchedules(0, params, nil)
+}
+
+// ReconcileManifestSchedules commits declarations and retirements together.
+// The shared admission lock also serializes retirement with cross-process runs.
+func (s *Store) ReconcileManifestSchedules(appID int64, params []UpsertScheduleByNameParams, retire []*Schedule, ownershipClaims ...[]*Schedule) ([]UpsertScheduleByNameResult, error) {
+	tx, err := s.d.beginWrite(context.Background(), s.rawDB(), scheduleConvergenceLockKey)
 	if err != nil {
-		return nil, fmt.Errorf("begin schedule batch: %w", err)
+		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	for _, claims := range ownershipClaims {
+		for _, sc := range claims {
+			if sc.AppID != appID || sc.ManagedBy != ScheduleManagedByBundle {
+				return nil, errors.New("schedule ownership claim mismatch")
+			}
+			if _, err := tx.Exec("UPDATE app_schedules SET managed_by='bundle' WHERE id=? AND app_id=?", sc.ID, appID); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, p := range params {
+		if appID != 0 && p.AppID != appID {
+			return nil, errors.New("schedule declaration app mismatch")
+		}
+	}
+	for _, sc := range retire {
+		if sc.ManagedBy != ScheduleManagedByBundle {
+			return nil, errors.New("cannot retire a manually managed schedule")
+		}
+		for _, p := range params {
+			if p.Name == sc.Name {
+				return nil, errors.New("schedule cannot be declared and retired together")
+			}
+		}
+		if sc.AppID != appID {
+			return nil, fmt.Errorf("retire schedule: app mismatch")
+		}
+		if err := retireScheduleTx(tx, appID, sc.ID); err != nil {
+			return nil, err
+		}
+	}
+	results, err := upsertSchedulesByNameTx(tx, params)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func upsertSchedulesByNameTx(tx writeTx, params []UpsertScheduleByNameParams) ([]UpsertScheduleByNameResult, error) {
 	results := make([]UpsertScheduleByNameResult, 0, len(params))
 	for _, p := range params {
 		var tz sql.NullString
@@ -832,14 +910,14 @@ func (s *Store) UpsertSchedulesByName(params []UpsertScheduleByNameParams) ([]Up
 		scanErr := tx.QueryRow(`
 INSERT INTO app_schedules
   (app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds, overlap_policy, missed_policy, deploy_trigger, timezone,
-   on_success, min_roll_interval_seconds, roll_fallback, max_defer_age_seconds)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   on_success, min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, managed_by, retired)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(app_id, name) DO NOTHING
 RETURNING id`,
 			p.AppID, p.Name, p.CronExpr, p.CommandJSON, p.InputsJSON, boolToInt(p.Enabled),
 			p.TimeoutSeconds, p.OverlapPolicy, p.MissedPolicy, normalizeDeployTrigger(p.DeployTrigger), tz,
 			normalizeScheduleAction(p.OnSuccess), p.MinRollIntervalSeconds,
-			normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds).Scan(&id)
+			normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds, normalizeScheduleManager(p.ManagedBy), boolToInt(p.Retired)).Scan(&id)
 		created := scanErr == nil
 		if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 			return nil, fmt.Errorf("insert schedule %q: %w", p.Name, scanErr)
@@ -849,23 +927,59 @@ RETURNING id`,
 UPDATE app_schedules
    SET cron_expr = ?, command_json = ?, inputs_json = ?, enabled = ?, timeout_seconds = ?,
 	   overlap_policy = ?, missed_policy = ?, deploy_trigger = ?, timezone = ?, on_success = ?,
-	   min_roll_interval_seconds = ?, roll_fallback = ?, max_defer_age_seconds = ?, updated_at = CURRENT_TIMESTAMP
+	   min_roll_interval_seconds = ?, roll_fallback = ?, max_defer_age_seconds = ?, managed_by = ?, retired = ?, updated_at = CURRENT_TIMESTAMP
  WHERE app_id = ? AND name = ?
 RETURNING id`,
 				p.CronExpr, p.CommandJSON, p.InputsJSON, boolToInt(p.Enabled), p.TimeoutSeconds,
 				p.OverlapPolicy, p.MissedPolicy, normalizeDeployTrigger(p.DeployTrigger), tz,
 				normalizeScheduleAction(p.OnSuccess), p.MinRollIntervalSeconds,
-				normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds,
+				normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds, normalizeScheduleManager(p.ManagedBy), boolToInt(p.Retired),
 				p.AppID, p.Name).Scan(&id); err != nil {
 				return nil, fmt.Errorf("update schedule (app=%d, name=%q): %w", p.AppID, p.Name, err)
 			}
 		}
 		results = append(results, UpsertScheduleByNameResult{ID: id, Created: created})
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit schedule batch: %w", err)
-	}
 	return results, nil
+}
+
+// CheckScheduleRetirement is an advisory, read-only preflight. Publication
+// repeats the same checks under the admission lock in retireScheduleTx.
+func (s *Store) CheckScheduleRetirement(id int64) error {
+	var blocked int
+	err := s.db.QueryRow(`SELECT CASE WHEN
+ EXISTS (SELECT 1 FROM schedule_runs WHERE schedule_id=? AND status='running') OR
+ EXISTS (SELECT 1 FROM schedule_activations WHERE schedule_id=? AND status IN ('pending','deferred_interval','deferred_capacity','repairing','running')) OR
+ EXISTS (SELECT 1 FROM schedule_data_uncertainty WHERE schedule_id=?)
+ THEN 1 ELSE 0 END`, id, id, id).Scan(&blocked)
+	if err != nil {
+		return err
+	}
+	if blocked != 0 {
+		return fmt.Errorf("cannot retire schedule %d: finish or cancel its active run, settle its pending activation, and repair any unresolved producer write before retrying", id)
+	}
+	return nil
+}
+
+// Retirement retains stable IDs, run history and producer provenance. Never
+// erase or hide an active writer, pending activation, or uncertain data write.
+func retireScheduleTx(tx writeTx, appID, id int64) error {
+	res, err := tx.Exec(`UPDATE app_schedules SET enabled=0, retired=1, managed_by='bundle', updated_at=CURRENT_TIMESTAMP
+        WHERE id=? AND app_id=?
+        AND NOT EXISTS (SELECT 1 FROM schedule_runs WHERE schedule_id=? AND status='running')
+        AND NOT EXISTS (SELECT 1 FROM schedule_activations WHERE schedule_id=? AND status IN ('pending','deferred_interval','deferred_capacity','repairing','running'))
+        AND NOT EXISTS (SELECT 1 FROM schedule_data_uncertainty WHERE schedule_id=?)`, id, appID, id, id, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("cannot retire schedule %d: an active run, pending activation, or unresolved producer write requires attention", id)
+	}
+	return nil
 }
 
 // RecordDeploymentScheduleSnapshot stores the complete effective declaration
@@ -884,10 +998,10 @@ func (s *Store) RecordDeploymentScheduleSnapshot(deploymentID, appID int64) erro
 		INSERT INTO deployment_schedule_snapshots
 			(deployment_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 			 overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-			 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds)
+			 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, managed_by, retired)
 		SELECT ?, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds
+		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, managed_by, retired
 		FROM app_schedules WHERE app_id = ?`, deploymentID, appID); err != nil {
 		return fmt.Errorf("record deployment schedule snapshot rows: %w", err)
 	}
@@ -922,7 +1036,7 @@ func (s *Store) DeploymentScheduleSnapshot(deploymentID int64) ([]*Schedule, err
 	rows, err := s.db.Query(`
 		SELECT name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds
+		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, managed_by, retired
 		FROM deployment_schedule_snapshots WHERE deployment_id = ? ORDER BY name`, deploymentID)
 	if err != nil {
 		return nil, err
@@ -931,16 +1045,17 @@ func (s *Store) DeploymentScheduleSnapshot(deploymentID int64) ([]*Schedule, err
 	var out []*Schedule
 	for rows.Next() {
 		var schedule Schedule
-		var enabled int
+		var enabled, retired int
 		var timezone sql.NullString
 		if err := rows.Scan(&schedule.Name, &schedule.CronExpr, &schedule.CommandJSON, &schedule.InputsJSON, &enabled,
 			&schedule.TimeoutSeconds, &schedule.OverlapPolicy, &schedule.MissedPolicy,
 			&schedule.DeployTrigger, &timezone, &schedule.OnSuccess,
 			&schedule.MinRollIntervalSeconds, &schedule.RollFallback,
-			&schedule.MaxDeferAgeSeconds); err != nil {
+			&schedule.MaxDeferAgeSeconds, &schedule.ManagedBy, &retired); err != nil {
 			return nil, err
 		}
 		schedule.Enabled = enabled != 0
+		schedule.Retired = retired != 0
 		if timezone.Valid {
 			v := timezone.String
 			schedule.Timezone = &v
@@ -968,7 +1083,7 @@ func (s *Store) RestoreDeploymentPriorScheduleSnapshot(deploymentID, appID int64
 	rows, err := s.db.Query(`
 		SELECT name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 		       overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds
+		       min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, managed_by, retired
 		FROM deployment_prior_schedule_snapshots WHERE deployment_id = ? ORDER BY name`, deploymentID)
 	if err != nil {
 		return nil, err
@@ -977,16 +1092,17 @@ func (s *Store) RestoreDeploymentPriorScheduleSnapshot(deploymentID, appID int64
 	var snapshots []*Schedule
 	for rows.Next() {
 		var schedule Schedule
-		var enabled int
+		var enabled, retired int
 		var timezone sql.NullString
 		if err := rows.Scan(&schedule.Name, &schedule.CronExpr, &schedule.CommandJSON, &schedule.InputsJSON, &enabled,
 			&schedule.TimeoutSeconds, &schedule.OverlapPolicy, &schedule.MissedPolicy,
 			&schedule.DeployTrigger, &timezone, &schedule.OnSuccess,
 			&schedule.MinRollIntervalSeconds, &schedule.RollFallback,
-			&schedule.MaxDeferAgeSeconds); err != nil {
+			&schedule.MaxDeferAgeSeconds, &schedule.ManagedBy, &retired); err != nil {
 			return nil, err
 		}
 		schedule.Enabled = enabled != 0
+		schedule.Retired = retired != 0
 		if timezone.Valid {
 			v := timezone.String
 			schedule.Timezone = &v
@@ -1014,13 +1130,13 @@ func (s *Store) RestoreDeploymentScheduleSnapshot(deploymentID, appID int64) ([]
 // set from a caller-held pre-mutation snapshot. Deploy failure recovery uses it
 // while producer gates are held, including for an app with no prior deployment.
 func (s *Store) RestoreScheduleDeclarations(appID int64, snapshots []*Schedule) ([]*Schedule, error) {
-	tx, err := s.db.Begin()
+	tx, err := s.d.beginWrite(context.Background(), s.rawDB(), scheduleConvergenceLockKey)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
 	if _, err := tx.Exec(`
-		UPDATE app_schedules SET enabled = 0, deploy_trigger = 'never', updated_at = CURRENT_TIMESTAMP
+		UPDATE app_schedules SET enabled = 0, retired = CASE WHEN managed_by = 'bundle' THEN 1 ELSE retired END, deploy_trigger = 'never', updated_at = CURRENT_TIMESTAMP
 		WHERE app_id = ?`, appID); err != nil {
 		return nil, err
 	}
@@ -1033,8 +1149,8 @@ func (s *Store) RestoreScheduleDeclarations(appID int64, snapshots []*Schedule) 
 			INSERT INTO app_schedules
 				(app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds,
 				 overlap_policy, missed_policy, deploy_trigger, timezone, on_success,
-				 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				 min_roll_interval_seconds, roll_fallback, max_defer_age_seconds, managed_by, retired)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(app_id, name) DO UPDATE SET
 				cron_expr = excluded.cron_expr, command_json = excluded.command_json, inputs_json = excluded.inputs_json,
 				enabled = excluded.enabled, timeout_seconds = excluded.timeout_seconds,
@@ -1044,12 +1160,13 @@ func (s *Store) RestoreScheduleDeclarations(appID int64, snapshots []*Schedule) 
 				min_roll_interval_seconds = excluded.min_roll_interval_seconds,
 				roll_fallback = excluded.roll_fallback,
 				max_defer_age_seconds = excluded.max_defer_age_seconds,
+ managed_by = excluded.managed_by, retired = excluded.retired,
 				updated_at = CURRENT_TIMESTAMP`,
 			appID, schedule.Name, schedule.CronExpr, schedule.CommandJSON, schedule.InputsJSON, boolToInt(schedule.Enabled),
 			schedule.TimeoutSeconds, schedule.OverlapPolicy, schedule.MissedPolicy,
 			schedule.DeployTrigger, timezone, schedule.OnSuccess,
 			schedule.MinRollIntervalSeconds, schedule.RollFallback,
-			schedule.MaxDeferAgeSeconds); err != nil {
+			schedule.MaxDeferAgeSeconds, normalizeScheduleManager(schedule.ManagedBy), boolToInt(schedule.Retired)); err != nil {
 			return nil, fmt.Errorf("restore schedule %q: %w", schedule.Name, err)
 		}
 	}
@@ -1072,63 +1189,11 @@ func (s *Store) RestoreScheduleDeclarations(appID int64, snapshots []*Schedule) 
 // follow-up UPDATE...RETURNING runs in the same transaction under the
 // same write lock.
 func (s *Store) UpsertScheduleByName(p UpsertScheduleByNameParams) (int64, bool, error) {
-	tx, err := s.db.Begin()
+	results, err := s.UpsertSchedulesByName([]UpsertScheduleByNameParams{p})
 	if err != nil {
-		return 0, false, fmt.Errorf("begin: %w", err)
+		return 0, false, err
 	}
-	defer tx.Rollback() //nolint:errcheck
-
-	var tz sql.NullString
-	if p.Timezone != nil && *p.Timezone != "" {
-		tz = sql.NullString{String: *p.Timezone, Valid: true}
-	}
-
-	var insertedID int64
-	scanErr := tx.QueryRow(`
-INSERT INTO app_schedules
-  (app_id, name, cron_expr, command_json, inputs_json, enabled, timeout_seconds, overlap_policy, missed_policy, deploy_trigger, timezone,
-   on_success, min_roll_interval_seconds, roll_fallback, max_defer_age_seconds)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(app_id, name) DO NOTHING
-RETURNING id`,
-		p.AppID, p.Name, p.CronExpr, p.CommandJSON, p.InputsJSON,
-		boolToInt(p.Enabled), p.TimeoutSeconds, p.OverlapPolicy, p.MissedPolicy,
-		normalizeDeployTrigger(p.DeployTrigger), tz,
-		normalizeScheduleAction(p.OnSuccess), p.MinRollIntervalSeconds,
-		normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds,
-	).Scan(&insertedID)
-	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return 0, false, fmt.Errorf("insert schedule: %w", scanErr)
-	}
-	if scanErr == nil {
-		// Row was inserted; no conflict.
-		if err := tx.Commit(); err != nil {
-			return 0, false, fmt.Errorf("commit insert: %w", err)
-		}
-		return insertedID, true, nil
-	}
-
-	var id int64
-	err = tx.QueryRow(`
-UPDATE app_schedules
-   SET cron_expr = ?, command_json = ?, inputs_json = ?, enabled = ?, timeout_seconds = ?,
-	   overlap_policy = ?, missed_policy = ?, deploy_trigger = ?, timezone = ?, on_success = ?,
-	   min_roll_interval_seconds = ?, roll_fallback = ?, max_defer_age_seconds = ?, updated_at = CURRENT_TIMESTAMP
- WHERE app_id = ? AND name = ?
-RETURNING id`,
-		p.CronExpr, p.CommandJSON, p.InputsJSON, boolToInt(p.Enabled),
-		p.TimeoutSeconds, p.OverlapPolicy, p.MissedPolicy, normalizeDeployTrigger(p.DeployTrigger), tz,
-		normalizeScheduleAction(p.OnSuccess), p.MinRollIntervalSeconds,
-		normalizeRollFallback(p.RollFallback), p.MaxDeferAgeSeconds,
-		p.AppID, p.Name,
-	).Scan(&id)
-	if err != nil {
-		return 0, false, fmt.Errorf("update schedule (app=%d, name=%q): %w", p.AppID, p.Name, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, false, fmt.Errorf("commit update: %w", err)
-	}
-	return id, false, nil
+	return results[0].ID, results[0].Created, nil
 }
 
 // --- app_shared_data ---
@@ -1555,12 +1620,12 @@ type rowScanner interface {
 
 func scanSchedule(s rowScanner) (*Schedule, error) {
 	var sched Schedule
-	var enabled int
+	var enabled, retired int
 	var tz sql.NullString
 	err := s.Scan(&sched.ID, &sched.AppID, &sched.Name, &sched.CronExpr, &sched.CommandJSON, &sched.InputsJSON,
 		&enabled, &sched.TimeoutSeconds, &sched.OverlapPolicy, &sched.MissedPolicy,
 		&sched.DeployTrigger, &tz, &sched.OnSuccess, &sched.MinRollIntervalSeconds, &sched.RollFallback,
-		&sched.MaxDeferAgeSeconds, &sched.CreatedAt, &sched.UpdatedAt)
+		&sched.MaxDeferAgeSeconds, &sched.ManagedBy, &retired, &sched.CreatedAt, &sched.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -1568,6 +1633,7 @@ func scanSchedule(s rowScanner) (*Schedule, error) {
 		return nil, err
 	}
 	sched.Enabled = enabled != 0
+	sched.Retired = retired != 0
 	if tz.Valid {
 		sched.Timezone = &tz.String
 	}

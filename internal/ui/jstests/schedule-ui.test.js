@@ -205,3 +205,13 @@ test('age and duration formatting cover operator-scale intervals', () => {
   assert.equal(formatDuration(125), '2m 5s');
   assert.equal(formatDuration(null), '—');
 });
+
+test('retired schedules retain history without offering producer repair', () => {
+  const retired = { enabled: false, retired: true, deploy_trigger: 'bundle_change', last_run_status: 'failed' };
+  assert.deepEqual(scheduleState(retired), { key: 'retired', label: 'Retired', tone: 'quiet', attention: false });
+  const compatibility = producerCompatibilityState(retired);
+  assert.equal(compatibility.attention, false);
+  assert.equal(compatibility.key, 'retired');
+  assert.match(compatibility.detail, /history is retained/);
+  assert.notEqual(scheduleDetailSignature(retired), scheduleDetailSignature({ ...retired, retired: false }));
+});
