@@ -23,6 +23,7 @@ const ACTION_LABELS = new Map([
   ['cache.clear', 'Cache cleared'],
   ['schedule_create', 'Schedule created'],
   ['schedule_update', 'Schedule updated'],
+  ['schedule_retire', 'Schedule retired'],
   ['schedule_delete', 'Schedule deleted'],
   ['schedule_run_manual', 'Schedule started'],
   ['schedule_run_succeeded', 'Schedule succeeded'],

@@ -37,7 +37,7 @@ export const AUDIT_ACTIONS = [
   // Data (blue - config)
   'data.push', 'data.pull', 'data.delete', 'cache.clear',
   // Schedules (blue - config)
-  'schedule_refresh_stale', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_run_manual',
+  'schedule_refresh_stale', 'schedule_create', 'schedule_update', 'schedule_retire', 'schedule_delete', 'schedule_run_manual',
   'schedule_run_succeeded', 'schedule_run_failed', 'schedule_run_timed_out',
   'schedule_run_cancelled', 'schedule_run_interrupted',
   'schedule_activation_roll', 'schedule_activation_outcome',

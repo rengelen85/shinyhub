@@ -3,10 +3,14 @@ package ui_test
 import (
 	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1481,7 +1485,6 @@ func TestAuditActionListCoversEveryServerAction(t *testing.T) {
 		"schedule_run_": "prefix concatenated with the run status at emit time",
 	}
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?m)(?:^|[^A-Za-z0-9_])Action:\s*"([^"]+)"`),
 		regexp.MustCompile(`\.audit\(\s*\w+\s*,\s*"([^"]+)"`),
 		regexp.MustCompile(`(?m)^\s*Audit\w+\s*=\s*"([^"]+)"`),
 	}
@@ -1497,6 +1500,15 @@ func TestAuditActionListCoversEveryServerAction(t *testing.T) {
 			b, err := os.ReadFile(path)
 			if err != nil {
 				return err
+			}
+			actions, err := literalAuditRecordActions(path, b)
+			if err != nil {
+				return err
+			}
+			for _, action := range actions {
+				if _, skip := dynamic[action]; !skip {
+					emitted[action] = path
+				}
 			}
 			for _, re := range patterns {
 				for _, m := range re.FindAllStringSubmatch(string(b), -1) {
@@ -1537,6 +1549,63 @@ func TestAuditActionListCoversEveryServerAction(t *testing.T) {
 		if !listed[action] {
 			t.Errorf("%s records audit action %q, which AUDIT_ACTIONS omits: it cannot be selected in the Audit Log filter", path, action)
 		}
+	}
+}
+
+// Inspect the literal's type: deployment results also have an Action field,
+// but values such as "retired" are response labels, not audit event names.
+func literalAuditRecordActions(path string, source []byte) ([]string, error) {
+	file, err := parser.ParseFile(token.NewFileSet(), path, source, 0)
+	if err != nil {
+		return nil, err
+	}
+	var actions []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		literal, ok := node.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		name := ""
+		switch typ := literal.Type.(type) {
+		case *ast.Ident:
+			name = typ.Name
+		case *ast.SelectorExpr:
+			name = typ.Sel.Name
+		}
+		if name != "AuditEventParams" {
+			return true
+		}
+		for _, field := range literal.Elts {
+			pair, ok := field.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := pair.Key.(*ast.Ident)
+			if !ok || key.Name != "Action" {
+				continue
+			}
+			value, ok := pair.Value.(*ast.BasicLit)
+			if !ok || value.Kind != token.STRING {
+				continue
+			}
+			action, err := strconv.Unquote(value.Value)
+			if err == nil {
+				actions = append(actions, action)
+			}
+		}
+		return true
+	})
+	return actions, nil
+}
+
+func TestLiteralAuditRecordActionsIgnoresResponseActions(t *testing.T) {
+	actions, err := literalAuditRecordActions("fixture.go", []byte(`package fixture
+        var response = ManifestScheduleResult{Action: "retired"}
+        var event = db.AuditEventParams{Action: "schedule_retire"}
+        var local = AuditEventParams{Action: "schedule_update"}
+    `))
+	if err != nil || strings.Join(actions, ",") != "schedule_retire,schedule_update" {
+		t.Fatalf("audit actions = %v, err = %v", actions, err)
 	}
 }
 
