@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/rvben/shinyhub/compare/v0.21.5...v0.22.0) - 2026-10-30
+
+### Added
+
+- **ui**: refine workspaces and guard shared navigation consistency ([377e1cd](https://github.com/rvben/shinyhub/commit/377e1cd5de2961b8af0029b1406dd6563d2232f7))
+- **cli**: run every local schedule with --all-schedules (#31) ([5a6b15b](https://github.com/rvben/shinyhub/commit/5a6b15b5120efe27edf4ab7f1d6b63f20cf55676))
+
+### Fixed
+
+- **agent**: constrain Shiny to supported reactive semantics ([aa2ad1c](https://github.com/rvben/shinyhub/commit/aa2ad1c4ece49c7a1392d167d735c96a26612492))
+- **ui**: expose schedule retirement in audit history ([3ac3373](https://github.com/rvben/shinyhub/commit/3ac337319217308ebfc9ff8841e138a04de43c0a))
+- **schedules**: reconcile bundle-owned schedules on deployment ([4e5133e](https://github.com/rvben/shinyhub/commit/4e5133ed75fb96943d9843981bbd5154f655dd56))
+- **fleet**: detect schedules absent from app manifests ([69da094](https://github.com/rvben/shinyhub/commit/69da094ef49b9a6e26afad6d15c5a0dc1afaa913))
+- **security**: resolve advisories and refresh dependencies (#27) ([594571d](https://github.com/rvben/shinyhub/commit/594571d0351041a560a8f94aab940b480080117f))
+- **cli**: detect invalidated data after local schedule batches ([6099acf](https://github.com/rvben/shinyhub/commit/6099acf713c6f583f85d4a198bd6a04fa0f6203b))
+
 ## [0.21.5](https://github.com/rvben/shinyhub/compare/v0.21.4...v0.21.5) - 2026-10-28
 
 ### Added
