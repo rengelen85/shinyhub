@@ -228,6 +228,23 @@ jobs:
       - name: Zero-downtime handoff E2E
         run: make test-handoff
 
+  test-browser-shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: Install browser test dependencies
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm --prefix loadtest/render/driver ci --ignore-scripts --no-audit --no-fund
+          cd loadtest/render/driver
+          npx --no-install playwright install --with-deps chromium
+      - name: Verify shared shell across routes and display states
+        run: make test-browser-shell-e2e
+
   test-browser-agent-charts:
     runs-on: ubuntu-latest
     timeout-minutes: 10

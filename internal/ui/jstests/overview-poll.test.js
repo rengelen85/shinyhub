@@ -434,17 +434,21 @@ test('critical resource verdict leads to pressure alerts before secondary covera
   assert.equal(scrolled, true);
   apps.push({ slug: 'reports', name: 'Weekly reports', status: 'crashed' });
   poll();
-  await eventually(() => document.querySelector('[data-focus-key="attention:review"]'));
+  await eventually(() => document.querySelector('[data-focus-key="attention:reports:open"]'));
   const mixedActions = [...document.querySelectorAll('.ov-pulse-actions button')];
   assert.deepEqual(mixedActions.map((button) => button.textContent), [
-    'Review app issues', 'Review pressure alerts', 'Review resource coverage',
+    'Review pressure alerts', 'Review resource coverage',
   ]);
-  assert.equal(document.querySelector('.ov-pulse-detail').textContent, 'Weekly reports');
+  const incident = document.querySelector('.ov-pulse .ov-attention');
+  assert.match(incident.textContent, /Weekly reports/);
+  const inspect = incident.querySelector('.ov-attn-actions a');
+  assert.equal(inspect.textContent, 'Inspect app');
+  assert.equal(inspect.getAttribute('href'), '/apps/reports');
+  assert.equal(document.querySelectorAll('.ov-attention').length, 1);
   assert.equal(mixedActions[0].classList.contains('ov-primary-response'), true);
-  const attention = document.getElementById('ov-attention-title');
-  attention.scrollIntoView = () => {};
+  document.getElementById('ov-pressure-title').scrollIntoView = () => {};
   mixedActions[0].click();
-  assert.equal(document.activeElement, attention);
+  assert.equal(document.activeElement.id, 'ov-pressure-title');
 });
 
 test('critical total usage and replica pressure each have a correctly ordered jump action', async () => {

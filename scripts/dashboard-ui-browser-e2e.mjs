@@ -2,6 +2,8 @@
 // Render the production dashboard with synthetic API data; no live accounts or mutations.
 // Screenshots are opt-in local artifacts. Requires the render-driver Playwright install.
 import assert from 'node:assert/strict';
+import { checkShellConsistency } from './browser-shell-checks.mjs';
+const shellOnly = process.env.SHINYHUB_E2E_SHELL_ONLY === '1';
 import { createServer } from 'node:http';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
@@ -68,9 +70,15 @@ const browser=await chromium.launch({headless:true,executablePath:process.env.SH
 const routes=[['overview','/'],['apps','/apps'],['project','/projects/analytics'],['identity','/identity'],['services','/identity','#identity-services-tab'],['workers','/workers'],['audit','/audit-log'],['tokens','/tokens'],['announcements','/announcements'],...['overview','usage','logs','traces','deployments','schedules','configuration','data','access'].map(t=>['app-'+t,'/apps/forecast'+(t==='overview'?'':'/'+t)]),['viewer','/apps'],['login','/login'],['profile','/','#identity-card'],['new-app','/apps','#new-app-button'],['new-token','/tokens','#new-token-button'],['deploy','/apps/forecast','#app-detail-deploy'],['schedule-editor','/apps/forecast/schedules','#schedules-add-btn'],['announcement-editor','/announcements','[data-new]'],['project-editor','/projects/analytics','#project-detail-edit'],['about','/','#about-button']];
 const results=[];
 try{
-for(const theme of ['light','dark']) for(const width of [1440,390]){
+for(const theme of ['light','dark']) for(const width of (shellOnly ? [1440,900,390] : [1440,390])){
  const context=await browser.newContext({viewport:{width,height:1000},userAgent:'shinyhub-ui-audit'});await context.addInitScript(t=>localStorage.setItem('shinyhub-theme',t),theme);
  const page=await context.newPage();let errors=[];page.on('pageerror',e=>errors.push(e.message));
+ role='admin';mode='ready';
+ await checkShellConsistency(page,origin,{role,width,theme,extraRoutes:routes.filter(([name,,click])=>!click&&!['viewer','login'].includes(name)).map(([,path])=>path)});
+ role='viewer';
+ await checkShellConsistency(page,origin,{role,width,theme,extraRoutes:['/apps','/tokens']});
+ assert.deepEqual(errors,[],`${theme}/${width}: shell navigation page errors`);
+ if(shellOnly){await context.close();continue;}
  for(const [name,path,click]of routes.filter(r=>!process.env.SHINYHUB_E2E_PAGES_FILTER||process.env.SHINYHUB_E2E_PAGES_FILTER.split(',').includes(r[0]))){role=name==='viewer'?'viewer':name==='login'?'guest':'admin';mode='ready';errors=[];
  await page.goto(origin+path,{waitUntil:'domcontentloaded'});await page.locator(`body[data-auth="${role==='guest'?'out':'in'}"]`).waitFor();await page.waitForTimeout(350);await page.evaluate(()=>document.fonts.ready);
  if(click){if(['profile','about'].includes(name)&&width<760)await page.locator('#sidebar-toggle').click();await page.locator(click).click();}
@@ -86,6 +94,7 @@ for(const theme of ['light','dark']) for(const width of [1440,390]){
  }
  await context.close();
 }
+if (!shellOnly) {
 // Failure/empty states on list pages, captured separately for truthful state review.
 const context=await browser.newContext({viewport:{width:390,height:844},userAgent:'shinyhub-ui-audit'});const page=await context.newPage();role='admin';
 for(const state of ['empty','error'])for(const name of ['workers','tokens','identity','audit-log','projects/analytics']){mode=state;await page.goto(origin+'/'+name);await page.waitForTimeout(250);const key=`${name.replace('/','-')}-${state}`;if(out) await page.screenshot({path:`${out}/${key}.png`,animations:'disabled'});results.push({key,text:await page.locator('main').innerText()});}
@@ -115,5 +124,7 @@ assert.equal(await page.locator('[data-token-row]').count(),0);assert.equal(awai
 await context.close();
 if(out) await writeFile(out+'/results.json',JSON.stringify({results,unknown:[...unknown]},null,2));
 console.log('Page accessibility, responsive layouts, inventory recovery, and sign-out checks passed');
+}
+console.log('Cross-route shell consistency checks passed');
 
 }finally{await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));}

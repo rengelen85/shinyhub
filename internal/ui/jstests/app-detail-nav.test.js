@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { JSDOM } from 'jsdom';
 import {
   TAB_ROUTES,
   MANAGER_ONLY_TABS,
@@ -151,4 +153,13 @@ test('tabStripScrollTarget centers the active tab and clamps both edges', () => 
   assert.equal(tabStripScrollTarget({
     clientWidth: 760, scrollWidth: 760, tabLeft: 300, tabWidth: 90,
   }), 0);
+});
+
+test('app detail breadcrumb returns to the canonical Apps destination', () => {
+  const dom = new JSDOM(readFileSync(new URL('../static/index.html', import.meta.url), 'utf8'));
+  const link = dom.window.document.querySelector('#app-detail-view [aria-label="Breadcrumb"] a');
+  assert.equal(link.textContent.trim(), 'Apps');
+  assert.equal(link.getAttribute('href'), '/apps');
+  assert.equal(link.hasAttribute('data-nav'), true);
+  dom.window.close();
 });

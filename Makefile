@@ -669,3 +669,9 @@ test-browser-agent-charts-e2e:
 	@if [ ! -d node_modules/axe-core ]; then npm install --no-audit --no-fund --silent; fi
 	@if [ ! -d loadtest/render/driver/node_modules/playwright ]; then cd loadtest/render/driver && npm install --no-audit --no-fund --silent; fi
 	node scripts/agent-charts-browser-e2e.mjs
+
+.PHONY: test-browser-shell-e2e
+# Production shell and router with deterministic API fixtures; compares pages
+# in both themes, desktop/compact/mobile, and expanded/collapsed/drawer states.
+test-browser-shell-e2e:
+	SHINYHUB_E2E_SHELL_ONLY=1 node scripts/dashboard-ui-browser-e2e.mjs

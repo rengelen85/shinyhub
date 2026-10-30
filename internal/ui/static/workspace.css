@@ -1,0 +1,130 @@
+/* Overview and viewer Apps content layouts. Shared navigation lives in
+   style.css so its appearance stays consistent across every route. */
+:root[data-theme] body:where(:has(#overview-view:not([hidden]), #launchpad-view:not([hidden])))::before { background: var(--bg); }
+body:where(:has(#overview-view:not([hidden]), #launchpad-view:not([hidden]))) main { padding: 36px 32px 48px; max-width: 1400px; }
+
+#overview-view, #launchpad-view { position: relative; }
+#overview-view .toolbar { margin-bottom: 24px; padding-right: 45%; }
+.workspace-intro h1, #launchpad-heading { margin: 0; font-size: var(--fs-headline); font-weight: 700; letter-spacing: -.025em; }
+.workspace-intro p, .lp-sub { margin-top: 8px; color: var(--text-soft); font-size: var(--fs-body); }
+.ov-grid { max-width: none; gap: 20px; }
+.ov-scope { position: absolute; top: 4px; right: 0; max-width: 45%; }
+.ov-scope-field { min-width: 0; }
+.ov-scope-select { min-width: 0; max-width: 100%; text-overflow: ellipsis; }
+.ov-scope-field label { font-size: var(--fs-label); }
+.ov-pulse { background: var(--surface); border: 1px solid var(--line-2); padding: 22px 24px 0; }
+.ov-pulse-verdict { align-items: baseline; gap: 12px; }
+.ov-pulse-dot { width: 9px; height: 9px; margin: 0; box-shadow: none; }
+.ov-pulse-headline { font-size: var(--fs-title); font-weight: 650; }
+.ov-pulse-actions { margin-top: 12px; gap: 8px; }
+.ov-attention { background: none; border: 0; margin-top: 16px; }
+.ov-attn-list { gap: 0; }
+.ov-attn-row { padding: 0 0 20px; background: none; border: 0; border-radius: 0; gap: 20px; }
+.ov-attn-row + .ov-attn-row { border-top: 1px solid var(--line); padding-top: 20px; }
+.ov-attn-row:hover { background: none; }
+.ov-attn-main { gap: 6px; }
+.ov-attn-name { font-size: var(--fs-title); line-height: 1.5; max-width: 48ch; overflow-wrap: anywhere; }
+.ov-attn-reason { color: var(--red-text); font: var(--fs-label)/1.5 var(--font); white-space: normal; overflow-wrap: anywhere; }
+#overview-view .ov-btn { min-height: 44px; font: 600 var(--fs-label)/1.2 var(--font); padding: 10px 14px; }
+#overview-view .ov-inspect { color: var(--bg-deep); background: var(--cyan-bright); border-color: var(--cyan-bright); }
+#overview-view .ov-inspect:hover { background: var(--cyan); border-color: var(--cyan); }
+:root[data-theme=light] #overview-view .ov-inspect { color: #fff; }
+.ov-health-summary { margin: 0 -24px; padding: 12px 24px; border-top: 1px solid var(--line); }
+.ov-pulse-verdict + .ov-health-summary { margin-top: 20px; }
+.ov-legend { margin: 0; gap: 10px 28px; }
+.ov-legend-item { font-size: var(--fs-label); gap: 8px; }
+.ov-legend-count { order: -1; font-size: var(--fs-body); }
+.ov-legend-dot { width: 6px; height: 6px; }
+.ov-footer { grid-template-columns: minmax(0,1.65fr) minmax(280px,1fr); gap: 20px; align-items: start; }
+.ov-footer--single { grid-template-columns: minmax(0,1fr); }
+.ov-panel { padding: 22px; }
+.ov-section-title { font-size: var(--fs-title); font-weight: 650; }
+.ov-res-head { flex-wrap: wrap; gap: 8px; }
+.ov-res-heading { flex: 1 1 200px; }
+.ov-res-updated { font-size: var(--fs-label); padding-top: 4px; color: var(--text-soft); }
+.ov-res-scope { margin-top: 6px; line-height: 1.6; }
+.ov-capacity-label { font: 650 var(--fs-body) var(--font); }
+.ov-resource-values { margin-top: 20px; gap: 14px; }
+.ov-resource-values dt { font-size: var(--fs-label); }
+.ov-capacity-value { font: 600 var(--fs-headline)/1.3 var(--font); font-variant-numeric: tabular-nums; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.ov-resource-values > div + div dd { font-size: var(--fs-title); color: var(--text-soft); }
+.ov-capacity-meter { margin-top: 16px; }
+.ov-capacity-coverage { margin-top: 10px; line-height: 1.6; }
+.ov-measurement-disclosure { margin-top: 4px; }
+.ov-measurement-disclosure > .ov-res-toggle { display: flex; justify-content: space-between; width: 100%; min-height: 44px; padding: 10px 0; margin: 0; text-align: left; color: var(--text-soft); font-size: var(--fs-label); }
+.ov-measurement-details { display: grid; gap: 20px; padding: 12px 0 4px; border-top: 1px solid var(--line); }
+.ov-measurement-details[hidden] { display: none; }
+.ov-measurement-detail h3 { font-size: var(--fs-body); font-weight: 600; color: var(--text); }
+.ov-measurement-detail .ov-limit-summary, .ov-measurement-detail .ov-capacity-basis { margin-top: 8px; }
+.ov-measurement-detail .ov-capacity-basis { font-size: var(--fs-label); color: var(--text-soft); }
+.ov-measurement-details .ov-resource-help { margin-top: 0; }
+.ov-consumer-fill { background: var(--text-soft); }
+.ov-hotspot-name { color: var(--text); }
+.ov-activity-head { flex-wrap: wrap; gap: 12px; }
+.ov-activity-list { margin-top: 20px; }
+.ov-activity-operation { grid-template-columns: 18px minmax(0,1fr) auto; padding: 16px 0; gap: 12px; }
+.ov-activity-operation > .ov-activity-icon { width: 18px; height: 18px; border: 0; background: none; padding: 0; }
+.ov-activity-icon--change { color: var(--text-muted); }
+.ov-activity-item:not(:last-child)::after { left: 30px; right: 0; }
+.ov-activity-titleline { gap: 4px 10px; }
+.ov-activity-target { font-family: var(--font); font-size: var(--fs-body); font-weight: 600; color: var(--text); }
+.ov-activity-action { font-size: var(--fs-body); color: var(--text-soft); font-weight: 400; }
+.ov-activity-time { font-family: var(--font); font-size: var(--fs-label); }
+.ov-activity-meta { margin-top: 4px; }
+.ov-activity-children { margin-left: 30px; margin-right: 0; }
+
+#launchpad-view { max-width: 1100px; }
+#launchpad-heading { padding-right: 284px; }
+.lp { gap: 0; }
+.lp-head { align-items: center; margin: 0 0 24px; gap: 20px; }
+.lp-greeting { padding-right: 284px; }
+.lp-search { position: absolute; top: 0; right: 0; min-height: 44px; width: 260px; min-width: 0; max-width: 100%; font-family: var(--font); }
+.lp-search::placeholder { color: var(--text-soft); }
+.lp-group + .lp-group { margin-top: 24px; }
+.lp-group-header { margin-bottom: 8px; border: 0; }
+.lp-group-count { background: none; }
+.lp-grid { grid-template-columns: minmax(0,1fr); gap: 0; }
+.lp-tile { min-height: 78px; padding: 16px 12px; gap: 16px; background: transparent; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; box-shadow: none; }
+a.lp-tile:hover { background: var(--surface-2); border-color: var(--line); box-shadow: none; transform: none; }
+a.lp-tile:hover .lp-tile-name { color: var(--cyan); }
+.lp-tile-name { font-size: var(--fs-subtitle); white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; line-height: 1.5; }
+.lp-tile-desc { max-width: 65ch; margin-top: 4px; font-size: var(--fs-body); line-height: 1.6; }
+.lp-avatar { width: 36px; height: 36px; border-radius: var(--radius); font-size: var(--fs-label); box-shadow: none; }
+.lp-noresults { padding: 32px 0; }
+
+@container (min-width: 520px) {
+  .ov-capacity-list { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); border-bottom: 1px solid var(--line); }
+  .ov-capacity-row { padding: 20px 20px 20px 0; border-bottom: 0; }
+  .ov-capacity-row + .ov-capacity-row { padding: 20px 0 20px 20px; border-left: 1px solid var(--line); }
+}
+/* Keep a longer reading on one line when two metrics share a narrow panel. */
+@container (min-width: 520px) and (max-width: 620px) {
+  .ov-resource-values > div:first-child .ov-capacity-value { font-size: var(--fs-section); }
+}
+@media (max-width: 1150px) { .ov-footer { grid-template-columns: minmax(0,1fr); } }
+@media (max-width: 860px) {
+  body:where(:has(#overview-view:not([hidden]), #launchpad-view:not([hidden]))) main { padding: 24px 20px 40px; }
+  #overview-view .toolbar { padding-right: 0; margin-bottom: 20px; }
+  .ov-scope { position: static; max-width: none; }
+  .ov-scope-field { width: 100%; }
+  .ov-scope-select { flex: 1; width: 0; }
+  .ov-pulse { padding: 20px 20px 0; }
+  .ov-health-summary { margin-inline: -20px; padding-inline: 20px; }
+  .ov-attn-row { flex-wrap: wrap; gap: 16px; }
+  .ov-attn-main { flex-basis: 100%; }
+  .ov-attn-actions { width: 100%; }
+  .ov-attn-actions .ov-btn { flex: 1; }
+  .ov-panel { padding: 20px; }
+  .ov-res-heading { flex: 0 1 auto; }
+  .ov-legend { gap: 12px; justify-content: space-between; }
+  .ov-legend-item { gap: 5px; }
+  .ov-resource-values { margin-top: 14px; }
+  #launchpad-heading, .lp-greeting { padding-right: 0; }
+  .lp-head { flex-direction: column; align-items: stretch; }
+  .lp-search { position: static; width: 100%; }
+  .lp-tile { padding: 16px 0; gap: 14px; }
+}
+@media (max-width: 760px) {
+  .ov-activity-operation { grid-template-columns: 18px minmax(0,1fr); }
+  .ov-activity-target { white-space: normal; overflow-wrap: anywhere; }
+}

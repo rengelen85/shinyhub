@@ -103,7 +103,6 @@ test('a lifecycle-only run links to its audit run without offering an empty disc
   ] });
   assert.equal(node.querySelector('.ov-activity-disclosure'), null);
   assert.equal(node.querySelector('.ov-activity-action-link').getAttribute('aria-label'), 'Open audit run for Fleet apply');
-  assert.ok(node.querySelector('.ov-activity-action-link .ov-activity-link-icon--history'));
   assert.equal(node.querySelector('.ov-activity-target--static .ov-activity-link-icon'), null);
 });
 
@@ -198,11 +197,9 @@ test('activity renderer names the region and provides real audit and app links',
   const actionLink = node.querySelector('.ov-activity-action-link');
   assert.equal(actionLink.getAttribute('href'), '/audit-log?event=1');
   assert.equal(actionLink.getAttribute('aria-label'), 'Open audit event for Restarted');
-  assert.ok(actionLink.querySelector('.ov-activity-link-icon--history'));
   const targetLink = node.querySelector('.ov-activity-target');
   assert.equal(targetLink.getAttribute('href'), '/apps/observability/overview');
   assert.equal(targetLink.getAttribute('aria-label'), 'Open Overview for the observability app');
-  assert.ok(targetLink.querySelector('.ov-activity-link-icon--destination'));
   assert.equal(node.querySelector('.ov-activity-item').getAttribute('role'), null);
   assert.equal(node.querySelector('.ov-activity-item').getAttribute('tabindex'), null);
   assert.equal(node.querySelector('a a, a button, button a, button button'), null);
@@ -360,7 +357,6 @@ test('activity CSS keeps rows inert and gives coarse-pointer controls 44px targe
   assert.doesNotMatch(css, /\.ov-activity-item:hover/);
   assert.match(css, /\.ov-activity-action-link\s*\{[^}]*text-decoration: none/s);
   assert.match(css, /\.ov-activity-target\s*\{[^}]*text-decoration: none/s);
-  assert.match(css, /\.ov-activity-link-icon\s*\{[^}]*display: inline-grid/s);
   const touchRules = css.match(/@media \(hover: none\), \(pointer: coarse\), \(max-width: 760px\) \{[\s\S]*?\n\}/)?.[0] || '';
   for (const selector of ['.ov-activity-audit', '.ov-activity-disclosure', '.ov-activity-retry', '.ov-activity-action-link', 'a.ov-activity-target']) {
     assert.match(touchRules, new RegExp(selector.replace('.', '\\.')));

@@ -8,7 +8,6 @@ import { buildOverviewWorkspace, pulseMeta } from './overview-model.js';
 import { formatBytes, formatCoreCapacity, formatCoreCount } from './stat-format.js';
 import { updateCPUMeter } from './cpu-capacity.js';
 import { formatStatus } from './status-label.js';
-import { appCardBadge } from './app-card-badge.js';
 import { activityTime, buildActivityBrief } from './overview-activity.js';
 import { focusedKey, restoreFocus } from './focus-restore.js';
 import { startVisiblePoll } from './visible-poll.js';
@@ -339,7 +338,6 @@ export function mountOverview(ctx) {
     }
     root.appendChild(renderScope(workspace));
     root.appendChild(renderPulse(model));
-    if (model.attention.length > 0) root.appendChild(renderAttention(model.attention));
     root.appendChild(renderFooter(model, activity));
     if (workspace.groups.length > 0) root.appendChild(renderFleets(workspace.groups));
     return root;
@@ -362,22 +360,6 @@ export function mountOverview(ctx) {
     select.addEventListener('change', () => selectScope(select.value));
     field.append(label, select);
     wrap.appendChild(field);
-    const selected = workspace.scopes.find((scope) => scope.key === workspace.selectedKey);
-    const text = selected.key === 'all'
-      ? `${selected.total} ${selected.total === 1 ? 'app' : 'apps'} across the hub${workspace.fleetCount ? ` · ${workspace.fleetCount} named ${workspace.fleetCount === 1 ? 'fleet' : 'fleets'}` : ''}`
-      : `${selected.total} ${selected.total === 1 ? 'app' : 'apps'} · health and resources for ${selected.label}`;
-    wrap.appendChild(el('p', 'ov-scope-summary', text));
-    if (canReadAudit) {
-      const recent = el('button', 'ov-res-toggle ov-recent-jump', 'Recent changes');
-      recent.type = 'button';
-      recent.dataset.focusKey = 'activity:jump';
-      recent.addEventListener('click', () => {
-        const heading = document.getElementById('ov-activity-title');
-        heading?.focus();
-        heading?.scrollIntoView?.({ block: 'start' });
-      });
-      wrap.appendChild(recent);
-    }
     return wrap;
   }
 
@@ -414,7 +396,8 @@ export function mountOverview(ctx) {
     return sec;
   }
 
-  // ── Pulse: the fleet verdict + a proportional status bar (the signature). ──
+  // Health and recovery share one workspace; exceptional resource states still
+  // offer direct jumps to their explanation below.
   function renderPulse(model) {
     const sec = el('section', 'ov-pulse ov-pulse--' + model.verdict.tone);
     sec.setAttribute('aria-label', `${model.resources.scope.label} status`);
@@ -423,7 +406,9 @@ export function mountOverview(ctx) {
     verdict.appendChild(el('span', 'ov-pulse-dot'));
     const vtext = el('div', 'ov-pulse-text');
     vtext.appendChild(el('p', 'ov-pulse-headline', model.verdict.headline));
-    vtext.appendChild(el('p', 'ov-pulse-detail', model.verdict.detail));
+    if (!model.attention.length || overviewStale) {
+      vtext.appendChild(el('p', 'ov-pulse-detail', model.verdict.detail));
+    }
     const actions = el('div', 'ov-pulse-actions');
     const addJump = (label, key, targetID) => {
       const inspect = el('button', 'ov-btn ov-coverage-jump', label);
@@ -436,9 +421,6 @@ export function mountOverview(ctx) {
       });
       actions.appendChild(inspect);
     };
-    if (model.attention.length > 0) {
-      addJump(overviewStale ? 'Review last app issues' : 'Review app issues', 'attention:review', 'ov-attention-title');
-    }
     const highUsage = [model.resources.cpu, model.resources.memory].some((metric) => ['critical', 'warning'].includes(metric.usage.severity));
     if (highUsage && !['stale', 'unavailable'].includes(model.resources.state)) addJump('Review app usage', 'usage:review', 'ov-resources-title');
     if (model.resources.hotspots.length > 0 && model.resources.state !== 'stale') {
@@ -455,25 +437,10 @@ export function mountOverview(ctx) {
     }
     verdict.appendChild(vtext);
     sec.appendChild(verdict);
+    if (model.attention.length) sec.appendChild(renderAttention(model.attention));
 
     const active = model.segments.filter((s) => s.count > 0);
     if (model.total > 0) {
-      // A single status needs a count, not a full-width decorative bar.
-      // Mixed statuses retain the proportional overview at a quieter weight.
-      if (active.length > 1) {
-        const bar = el('div', 'ov-bar');
-        bar.setAttribute('role', 'img');
-        bar.setAttribute('aria-label',
-          active.map((s) => `${s.count} ${s.label.toLowerCase()}`).join(', '));
-        for (const seg of active) {
-          const s = el('span', 'ov-bar-seg');
-          s.style.flexGrow = String(seg.count);
-          s.style.setProperty('--seg', `var(${seg.cssVar})`);
-          bar.appendChild(s);
-        }
-        sec.appendChild(bar);
-      }
-
       const legend = el('ul', 'ov-legend');
       for (const seg of active) {
         const li = el('li', 'ov-legend-item');
@@ -484,18 +451,21 @@ export function mountOverview(ctx) {
         li.appendChild(el('b', 'ov-legend-count', String(seg.count)));
         legend.appendChild(li);
       }
-      sec.appendChild(legend);
+      const summary = el('div', 'ov-health-summary');
+      summary.appendChild(legend);
+      sec.appendChild(summary);
     }
     return sec;
   }
 
   // ── Attention: actionable rows for crashed / degraded apps. ──
   function renderAttention(items) {
-    const sec = el('section', 'ov-panel ov-attention');
+    const sec = el('section', 'ov-attention');
     const title = sectionTitle('Needs attention', items.length);
     title.id = 'ov-attention-title';
     title.tabIndex = -1;
     title.dataset.focusKey = 'attention:heading';
+    title.classList.add('sr-only');
     sec.setAttribute('aria-labelledby', title.id);
     sec.appendChild(title);
     const list = el('ul', 'ov-attn-list');
@@ -509,9 +479,6 @@ export function mountOverview(ctx) {
       main.appendChild(name);
       main.appendChild(el('span', 'ov-attn-reason', a.reason || formatStatus(a.status)));
       li.appendChild(main);
-
-      const bi = appCardBadge(a.app, formatStatus);
-      li.appendChild(el('span', bi.cls, bi.text));
 
       const actions = el('div', 'ov-attn-actions');
       // Restart is a management action: only offer it to users who can manage
@@ -534,11 +501,11 @@ export function mountOverview(ctx) {
         });
         actions.appendChild(restart);
       }
-      const open = el('a', 'ov-btn', 'Open');
+      const open = el('a', 'ov-btn ov-inspect', 'Inspect app');
       open.href = '/apps/' + encodeURIComponent(a.slug);
       open.setAttribute('data-nav', '');
       open.dataset.focusKey = `attention:${a.slug}:open`;
-      actions.appendChild(open);
+      actions.prepend(open);
       li.appendChild(actions);
 
       list.appendChild(li);
@@ -638,7 +605,7 @@ export function renderActivityBrief(snapshot, onRetry = null, options = {}) {
   title.dataset.focusKey = 'activity:heading';
   heading.appendChild(title);
   heading.appendChild(el('p', 'ov-res-scope', 'Across the hub'));
-  if ((state === 'ready' || state === 'stale') && snapshot.updatedAt) {
+  if (state === 'stale' && snapshot.updatedAt) {
     const freshness = el('p', 'ov-activity-freshness');
     const dot = el('span', 'ov-activity-freshness-dot');
     dot.setAttribute('aria-hidden', 'true');
@@ -793,7 +760,6 @@ function activityActionLink(label, href, focusKey, extraClass = '', auditScope =
   const destinationLabel = `Open audit ${auditScope} for ${label}`;
   link.setAttribute('aria-label', destinationLabel);
   link.title = destinationLabel;
-  link.appendChild(activityLinkIcon('history'));
   return link;
 }
 
@@ -812,7 +778,6 @@ function appendActivityTarget(parent, target, href, focusKey) {
     const destinationLabel = `Open ${titleCase(tab)} for the ${target} app`;
     link.setAttribute('aria-label', destinationLabel);
     link.title = destinationLabel;
-    link.appendChild(activityLinkIcon('destination'));
     parent.appendChild(link);
     return;
   }
@@ -833,11 +798,10 @@ function activitySeparator() {
 function renderActivityTime(createdAt, cls = 'ov-activity-time') {
   const formatted = activityTime(createdAt);
   if (!formatted.valid) return el('span', `${cls} ov-activity-time--unknown`, formatted.exact);
-  const time = el('time', cls, formatted.exact);
+  const time = el('time', cls, formatted.relative);
   time.dateTime = formatted.datetime;
   time.title = formatted.title;
   time.setAttribute('aria-label', `${formatted.title}, ${formatted.relative}`);
-  time.appendChild(el('span', null, formatted.relative));
   return time;
 }
 
@@ -878,20 +842,12 @@ function activityIcon(kind) {
   return span;
 }
 
-function activityLinkIcon(kind) {
-  const icon = activityIcon(kind);
-  icon.className = `ov-activity-link-icon ov-activity-link-icon--${kind}`;
-  return icon;
-}
-
 function activityIconPath(kind) {
   if (kind === 'restart') return 'M15.2 7.1A5.8 5.8 0 1 0 15.6 13M15.2 3.8v3.7h-3.7';
   if (kind === 'deploy') return 'M10 3v9m0 0 3-3m-3 3L7 9M4 14.5h12';
   if (kind === 'fleet') return 'm10 3 6 3-6 3-6-3 6-3Zm6 7-6 3-6-3m12 4-6 3-6-3';
   if (kind === 'attention') return 'M10 6.2v4.4m0 3v.1M3.4 15.5l5.2-10a1.57 1.57 0 0 1 2.8 0l5.2 10A1 1 0 0 1 15.7 17H4.3a1 1 0 0 1-.9-1.5Z';
   if (kind === 'security') return 'M10 2.8 15 5v4.1c0 3.4-2 6.3-5 8.1-3-1.8-5-4.7-5-8.1V5l5-2.2Z';
-  if (kind === 'history') return 'M3.8 6.5V3.4m0 3.1h3.1M4.2 6.1A6.5 6.5 0 1 1 3.7 12M10 6.4V10l2.4 1.5';
-  if (kind === 'destination') return 'M4.5 10h11m-4-4 4 4-4 4';
   if (kind === 'arrow') return 'M3 10h12m-4-4 4 4-4 4';
   if (kind === 'chevron') return 'm5 8 5 5 5-5';
   if (kind === 'info') return 'M10 9v5m0-8v.2M3.5 10a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z';
@@ -1047,7 +1003,7 @@ function renderCapacityRow(label, metric, runningReplicas) {
   const status = usage.state === 'idle' ? 'Idle' : usage.state === 'unavailable' ? 'Unavailable' : usage.state === 'stale' ? 'Stale'
     : usage.state === 'partial' ? (usage.severity === 'critical' ? 'Near capacity · Partial' : usage.severity === 'warning' ? 'High usage · Partial' : 'Partial reporting')
       : usage.severity === 'critical' ? 'Near capacity' : usage.severity === 'warning' ? 'High app usage' : 'Live';
-  top.appendChild(el('span', 'ov-pressure-state ov-pressure-state--' + (usage.state === 'ready' && usage.severity === 'normal' ? 'live' : stateTone(usage)), status));
+  if (status !== 'Live') top.appendChild(el('span', 'ov-pressure-state ov-pressure-state--' + stateTone(usage), status));
   row.appendChild(top);
 
   const values = el('dl', 'ov-resource-values');
@@ -1079,7 +1035,14 @@ function renderCapacityRow(label, metric, runningReplicas) {
   }
   const reporting = runningReplicas === 0 ? 'No running replicas' : `${metric.coverage.observedReplicas} of ${runningReplicas} replicas reporting`;
   row.appendChild(el('p', 'ov-capacity-coverage', `${reporting}${usage.fraction != null ? ` · ${percentage(usage.fraction)} of capacity` : ''}`));
-  if (usage.state === 'ready') row.appendChild(el('p', 'ov-capacity-basis', trendText(usage.trend, metric.kind)));
+  return row;
+}
+
+function renderMeasurementDetails(metric, runningReplicas) {
+  const block = el('section', 'ov-measurement-detail');
+  block.appendChild(el('h3', null, metric.kind === 'cpu' ? 'CPU' : 'Memory (RSS)'));
+  const usage = metric.usage;
+  if (usage.state === 'ready') block.appendChild(el('p', 'ov-capacity-basis', trendText(usage.trend, metric.kind)));
   if (metric.scale === 'limits') {
     const checks = el('div', 'ov-limit-summary');
     checks.appendChild(el('b', null, 'App-limit checks'));
@@ -1087,10 +1050,10 @@ function renderCapacityRow(label, metric, runningReplicas) {
     if (metric.capacity > 0) {
       checks.appendChild(el('span', 'ov-limit-values', `${capacityValue(metric)} · ${percentage(metric.fraction)} of combined app limits`));
     }
-    row.appendChild(checks);
+    block.appendChild(checks);
   }
-  if (metric.kind === 'memory') row.appendChild(el('p', 'ov-capacity-basis ov-memory-definition', 'RSS is memory held in RAM by reporting apps.'));
-  return row;
+  if (metric.kind === 'memory') block.appendChild(el('p', 'ov-capacity-basis ov-memory-definition', 'RSS is memory held in RAM by reporting apps.'));
+  return block;
 }
 
 function percentage(fraction) {
@@ -1137,6 +1100,8 @@ function documentationLink(label, href, focusKey) {
 }
 
 function renderCapacityHelp(res) {
+  const content = el('div', 'ov-measurement-details');
+  for (const metric of [res.cpu, res.memory]) content.appendChild(renderMeasurementDetails(metric, res.runningReplicas));
   const help = el('div', 'ov-resource-help');
   help.appendChild(el('p', null, 'Capacity is the host total, a container or service allowance, or a configured budget. It is not free memory or idle CPU. Usage includes reporting apps in this view; other host processes are not measured. Memory sums RSS and may count shared pages more than once.'));
   for (const metric of [res.cpu, res.memory]) {
@@ -1149,7 +1114,10 @@ function renderCapacityHelp(res) {
     help.appendChild(el('p', null, text));
   }
   help.appendChild(documentationLink('Host capacity guide', 'https://shinyhub.dev/configuration/#host-capacity', 'capacity:guide'));
-  return disclosure('How capacity is measured', 'capacity:help', help);
+  content.appendChild(help);
+  const details = disclosure('App limits and measurement details', 'capacity:help', content);
+  details.classList.add('ov-measurement-disclosure');
+  return details;
 }
 
 function renderCoverageGaps(res, canManageApp) {
@@ -1285,15 +1253,11 @@ function panelTitle(scale, scope) {
   return scope.key.startsWith('fleet:') ? 'Fleet resource usage' : 'App resource usage';
 }
 
-// The scope line says what the numbers are measured against, and on a fleet
-// with no limits it also says why the panel is answering a different question.
+// Keep the selected fleet explicit; each reading names its capacity source.
 function panelScope(res) {
   const { scope } = res;
   const prefix = scope && scope.key !== 'all' ? scope.label : 'All apps';
-  const sources = [res.cpu.hostCapacity?.source, res.memory.hostCapacity?.source];
-  const capacity = sources.every((source) => source?.startsWith('cgroup-')) ? 'container / service capacity'
-    : sources.every((source) => source === 'config') ? 'configured capacity' : 'available capacity';
-  return `${prefix} · app usage against ${capacity}. Other host processes are not included.`;
+  return `${scope && scope.key !== 'all' ? prefix + ' · ' : ''}Reporting apps only. Other host processes are excluded.`;
 }
 
 function renderHotspot(item) {

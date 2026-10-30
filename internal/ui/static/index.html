@@ -71,6 +71,7 @@
   <link rel="preload" href="/static/fonts/manrope-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/static/fonts/fonts.css">
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/workspace.css">
   <!-- Warm the module entry and its History-API router import so they fetch in
        parallel with the CSS instead of being discovered after app.js parses. -->
   <link rel="modulepreload" href="/static/app.js">
@@ -246,7 +247,10 @@
     <section id="announcements-view" hidden aria-label="Announcements"></section>
     <section id="overview-view" hidden aria-labelledby="overview-heading">
       <div class="toolbar">
-        <h1 id="overview-heading">Overview</h1>
+        <div class="workspace-intro">
+          <h1 id="overview-heading">Overview</h1>
+          <p>App health, capacity, and recent changes.</p>
+        </div>
       </div>
       <div id="overview-body"></div>
     </section>
@@ -486,7 +490,7 @@
 
     <section id="app-detail-view" hidden aria-labelledby="app-detail-heading">
       <nav class="breadcrumb" aria-label="Breadcrumb">
-        <a href="/" data-nav>
+        <a href="/apps" data-nav>
           <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 3.5 6 8l4.5 4.5"/></svg>
           Apps
         </a>

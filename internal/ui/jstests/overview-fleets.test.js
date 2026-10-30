@@ -150,7 +150,7 @@ test('fleet rendering identifies the share denominator and partial coverage with
   const panel = renderResourcePressure(prod.model.resources);
   assert.match(panel.textContent, /Fleet · prod/);
   assert.match(panel.textContent, /75% of measured usage/);
-  assert.match(panel.textContent, /available capacity/);
+  assert.match(panel.querySelector('.ov-resource-values').textContent, /Host capacity4\.0 cores/);
   assert.doesNotMatch(panel.textContent, /Delta|staging|of fleet/);
   assert.match(panel.querySelector('.ov-consumer-share').getAttribute('aria-label'), /measured memory usage in Fleet · prod/);
   const partial = structuredClone(metrics);

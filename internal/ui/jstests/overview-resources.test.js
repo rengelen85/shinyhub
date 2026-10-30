@@ -61,6 +61,11 @@ test('2 GB of app limits remains distinct from a 64 GB host and offers a coverag
   assert.match(node.textContent, /25% of combined app limits/);
   assert.equal(node.querySelectorAll('.ov-resource-values')[1].querySelector('dd').textContent, '640 MB');
   assert.match(node.querySelectorAll('.ov-resource-values')[1].textContent, /Host capacity · OS total64\.0 GB/);
+  const details = node.querySelector('.ov-measurement-details');
+  assert.equal(details.hidden, true);
+  assert.match(details.textContent, /25% of combined app limits/);
+  node.querySelector('[data-disclosure-key="capacity:help"]').click();
+  assert.equal(details.hidden, false);
   const gap = node.querySelector('.ov-coverage-row');
   assert.match(gap.textContent, /Free app.*No limit set.*CPU: 1 replica · Memory: 1 replica/);
   assert.equal(gap.querySelector('a').getAttribute('href'), '/apps/free/configuration');
@@ -175,6 +180,7 @@ test('documentation link focus survives a resource poll', () => {
     replaceOverviewContent(body, renderResourcePressure(resources));
     assert.equal(document.activeElement.dataset.focusKey, focusKey);
     assert.equal(document.activeElement.closest('.ov-resource-help').hidden, false);
+    assert.equal(document.activeElement.closest('[hidden]'), null);
   }
 });
 
@@ -301,7 +307,7 @@ test('a fleet with no limits is measured against the host, not reported as immea
   );
   const node = renderResourcePressure(resources);
   assert.match(node.textContent, /App resource usage/);
-  assert.match(node.textContent, /All apps · app usage against available capacity/);
+  assert.match(node.querySelector('.ov-res-scope').textContent, /Reporting apps only. Other host processes are excluded/);
   assert.match(node.textContent, /1\.5 coresAvailable CPU cores4\.0 cores/);
   assert.match(node.textContent, /2\.0 GBHost capacity · OS total8\.0 GB/);
   assert.match(node.textContent, /1 of 1 replicas reporting/);
@@ -323,7 +329,7 @@ test('an unmeasurable host reports live usage rather than an invented percentage
   assert.match(node.textContent, /Host capacityUnknown/);
   assert.match(node.textContent, /Measured app usage1\.5 cores/);
   assert.match(node.textContent, /Measured app usage2\.0 GB/);
-  assert.match(node.textContent, /Live/);
+  assert.match(node.querySelector('.ov-res-updated').textContent, /Updated just now/);
   assert.doesNotMatch(node.textContent, /Capacity unavailable/);
   // No denominator means no meter and no percentage: the value is the whole
   // truth, and a bar would need a full length it cannot justify.

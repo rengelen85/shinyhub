@@ -59,6 +59,8 @@ export function mountLaunchpad(ctx) {
     ctx.state.apps = apps;
     if (typeof ctx.syncSidebar === 'function') ctx.syncSidebar();
     model = buildLaunchpadModel(apps, getRecent(recentKey));
+    const subtitle = body.querySelector('.lp-sub');
+    if (subtitle) subtitle.textContent = workspaceText();
     // On the 20s background refresh, re-render only the results region so the
     // header search input keeps its focus, value, and caret while a viewer is
     // typing. A full render runs on first load and on any structural change:
@@ -87,14 +89,14 @@ export function mountLaunchpad(ctx) {
   function renderHeader() {
     const head = el('div', 'lp-head');
     const greeting = el('div', 'lp-greeting');
-    greeting.appendChild(el('p', 'lp-sub', welcomeText()));
+    greeting.appendChild(el('p', 'lp-sub', workspaceText()));
     head.appendChild(greeting);
 
     if (model.total > 0) {
       const search = document.createElement('input');
       search.type = 'search';
       search.className = 'lp-search';
-      search.placeholder = 'Search apps…';
+      search.placeholder = 'Find an app…';
       search.setAttribute('aria-label', 'Search apps');
       search.value = query;
       search.addEventListener('input', () => {
@@ -221,10 +223,8 @@ export function mountLaunchpad(ctx) {
     return sec;
   }
 
-  function welcomeText() {
-    const u = ctx.state && ctx.state.user;
-    const name = u && (u.display_name || u.username);
-    return name ? `Welcome, ${name}. Open one of your apps.` : 'Open one of your apps.';
+  function workspaceText() {
+    return `${model.total} ${model.total === 1 ? 'app' : 'apps'} in your workspace.`;
   }
 
   function skeleton() {

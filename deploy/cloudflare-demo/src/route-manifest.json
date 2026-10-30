@@ -715,6 +715,7 @@
     "views/visible-poll.js",
     "views/worker-isolation.js",
     "views/workers.js",
+    "workspace.css",
     "zip-writer.js"
   ],
   "apps": [

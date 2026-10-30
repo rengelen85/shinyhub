@@ -3294,7 +3294,7 @@ func TestSidebarLayoutCSS(t *testing.T) {
 		"mobile restoration must preserve the viewer's intentionally hidden Applications landmark")
 	assertContains(t, "style.css", "#sidebar-toggle { min-width: 44px; }",
 		"the mobile navigation trigger must meet the 44px touch-target width")
-	assertContains(t, "style.css", "body.sidebar-collapsed .nav-item { justify-content: flex-start; padding-left: 0.5rem; padding-right: 0.5rem; }",
+	assertContains(t, "style.css", "body.sidebar-collapsed .nav-item { justify-content: flex-start; padding-left: 12px; padding-right: 12px; }",
 		"mobile drawer navigation must restore expanded alignment and padding")
 	assertContains(t, "style.css", "#sidebar-toggle,\n  #sidebar .nav-item,\n  #sidebar .sidebar-app,\n  #sidebar .identity-card,\n  #sidebar .sidebar-about { min-height: 44px; }",
 		"mobile drawer controls must retain accessible touch targets")
