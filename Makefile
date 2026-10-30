@@ -120,7 +120,7 @@ test-py-bookmarks:
 # test-py-agent validates the session-bound adapter and browser protocol.
 test-py-agent:
 	@command -v uv >/dev/null 2>&1 || { echo "uv not found (needed for the Python agent helper tests)"; exit 1; }
-	cd packaging/python-agent && PYTHONPATH=src uv run --python '$(PYTHON_VERSION)' --with pytest --with jsonschema --with 'shiny>=1.8,<2' --with httpx --no-project python -m pytest tests/ -q
+	cd packaging/python-agent && PYTHONPATH=src uv run --python '$(PYTHON_VERSION)' --with pytest --with . --no-project python -m pytest tests/ -q
 	node packaging/python-agent/tests/bridge.test.cjs
 	@if [ ! -d node_modules/jsdom ]; then npm install --no-audit --no-fund --silent; fi
 	node --test packaging/python-agent/tests/chat.test.cjs packaging/python-agent/tests/charts.test.cjs packaging/python-agent/tests/bridge-approval.test.cjs
@@ -271,7 +271,7 @@ test-browser-agent-chat-e2e:
 test-browser-agent-shiny-e2e:
 	@command -v uv >/dev/null 2>&1 || { echo "uv is required"; exit 1; }
 	@if [ ! -d loadtest/render/driver/node_modules/playwright ]; then cd loadtest/render/driver && npm install --no-audit --no-fund --silent; fi
-	uv run --python '$(PYTHON_VERSION)' --with 'shiny>=1.8,<2' --with jsonschema --with httpx --no-project node scripts/agent-shiny-browser-e2e.mjs
+	uv run --python '$(PYTHON_VERSION)' --with ./packaging/python-agent --no-project node scripts/agent-shiny-browser-e2e.mjs
 
 # Real Python Shiny lifecycle contract in a disposable, extension-free Chromium.
 # Requires uv and system Python; uses the render driver's locked Playwright.

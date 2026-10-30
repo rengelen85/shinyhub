@@ -5,6 +5,9 @@ still below `1.0`; pin the package and review migration notes before upgrading.
 Browser WebMCP availability depends on the browser. The app remains responsible
 for tool permissions and for checking consequential results.
 
+The session adapter supports Shiny 1.8. Shiny 1.9 changes reactive locking and
+execution semantics and is excluded until the adapter supports that model.
+
 This helper lets an app declare a small, typed set of tools for the **current
 viewer session**. The app owns all data access and state changes. ShinyHub does
 not infer tools from visible inputs or let a model run arbitrary R/Python code.
